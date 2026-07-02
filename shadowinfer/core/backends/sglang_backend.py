@@ -55,9 +55,7 @@ class SGLangModelBackend(ModelBackend):
         """Return True when SGLang can be imported."""
         return _SGLANG_AVAILABLE
 
-    def load(
-        self, model_name: str, device: Optional[str] = None, **kwargs: Any
-    ) -> None:
+    def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         """Load the SGLang engine.
 
         The ``device`` argument is accepted for API compatibility; SGLang

@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import structlog
 
-
 # Global registry of StructuredLogger instances created in this process.
 # Used by configure_shadowinfer_logging() to update levels/rotation centrally.
 _LOGGERS: Dict[str, "StructuredLogger"] = {}
@@ -80,9 +79,15 @@ class StructuredLogger:
         self.name = name
         self.log_dir = log_dir
         self.level = _log_level_to_int(
-            level if level is not None else (_GLOBAL_LEVEL if _GLOBAL_LEVEL is not None else logging.INFO)
+            level
+            if level is not None
+            else (_GLOBAL_LEVEL if _GLOBAL_LEVEL is not None else logging.INFO)
         )
-        self.rotation = rotation if rotation is not None else (_GLOBAL_ROTATION if _GLOBAL_ROTATION is not None else {})
+        self.rotation = (
+            rotation
+            if rotation is not None
+            else (_GLOBAL_ROTATION if _GLOBAL_ROTATION is not None else {})
+        )
         self._records: List[Dict[str, Any]] = []
 
         os.makedirs(log_dir, exist_ok=True)
@@ -339,8 +344,7 @@ class StructuredLogger:
             filtered = [
                 r
                 for r in filtered
-                if r.get("level") == normalized
-                or r.get("alert_level", "").upper() == normalized
+                if r.get("level") == normalized or r.get("alert_level", "").upper() == normalized
             ]
 
         return filtered

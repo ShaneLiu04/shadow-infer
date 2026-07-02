@@ -241,9 +241,7 @@ class Orchestrator:
             "ffn_optimizer", builtin_cfgs["ffn_optimizer"]
         )
 
-        early_stop_cfg = EarlyStopConfig(
-            **dict(self.config.get("early_stop", {"enabled": False}))
-        )
+        early_stop_cfg = EarlyStopConfig(**dict(self.config.get("early_stop", {"enabled": False})))
         if early_stop_cfg.enabled:
             self.early_stopper = early_stop_cfg.build()
         else:
@@ -309,7 +307,9 @@ class Orchestrator:
 
         return callback
 
-    def _run_plugin_agents(self, step_config: StepConfig, state: StepState, inputs: Dict[str, Any]) -> None:
+    def _run_plugin_agents(
+        self, step_config: StepConfig, state: StepState, inputs: Dict[str, Any]
+    ) -> None:
         """执行所有非内置的插件 Agent。
 
         插件 Agent 可以观察当前 step 的内置 Agent 输出并产生附加结果，

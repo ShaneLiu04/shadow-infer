@@ -41,6 +41,7 @@ _HF_REACHABLE = _huggingface_reachable()
 
 class TestHuggingFaceModelBackend:
     """Unit tests for ``HuggingFaceModelBackend``."""
+
     """Unit tests for ``HuggingFaceModelBackend``."""
 
     @pytest.fixture
@@ -51,7 +52,6 @@ class TestHuggingFaceModelBackend:
         # touching the network.
         backend.load("__shadowinfer_tiny_test_model__", device="cpu")
         return backend
-
 
     def test_is_model_backend(self):
         assert issubclass(HuggingFaceModelBackend, ModelBackend)
@@ -274,7 +274,9 @@ class TestHuggingFaceModelBackend:
         assert cfg["num_layers"] > 0
         assert cfg["vocab_size"] > 0
 
-    @pytest.mark.skipif(_HF_REACHABLE, reason="HuggingFace Hub is reachable; online path already tested")
+    @pytest.mark.skipif(
+        _HF_REACHABLE, reason="HuggingFace Hub is reachable; online path already tested"
+    )
     def test_load_online_fallback_when_hub_unreachable(self):
         """If the Hub cannot be reached, loading falls back to the tiny model."""
         backend = HuggingFaceModelBackend(seed=0)
@@ -282,7 +284,6 @@ class TestHuggingFaceModelBackend:
         assert backend._model is not None
         cfg = backend.get_model_config()
         assert cfg["num_layers"] > 0
-
 
 
 class TestHuggingFaceBackendOptionalImport:

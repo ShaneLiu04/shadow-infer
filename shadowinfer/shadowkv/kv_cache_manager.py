@@ -147,9 +147,7 @@ class KVCacheManager:
     # Prefetch buffer
     # ------------------------------------------------------------------
 
-    def store_prefetched(
-        self, layer_id: int, tag: str, entry: KVCacheEntry
-    ) -> None:
+    def store_prefetched(self, layer_id: int, tag: str, entry: KVCacheEntry) -> None:
         """Store a prefetched KV entry for a future step."""
         self._prefetch_buffer[(layer_id, tag)] = entry
 

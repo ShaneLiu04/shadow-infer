@@ -23,9 +23,7 @@ class ModelBackend(abc.ABC):
     """
 
     @abc.abstractmethod
-    def load(
-        self, model_name: str, device: Optional[str] = None, **kwargs: Any
-    ) -> None:
+    def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         """加载模型。
 
         Args:
@@ -113,9 +111,7 @@ class MockModelBackend(ModelBackend):
         self._kv_cache: Dict[int, KVCacheEntry] = {}
         self._device = torch.device("cpu")
 
-    def load(
-        self, model_name: str, device: Optional[str] = None, **kwargs: Any
-    ) -> None:
+    def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         del kwargs  # unused
         self.model_config["name"] = model_name
         self._device = torch.device(

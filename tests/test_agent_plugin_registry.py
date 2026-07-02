@@ -121,9 +121,7 @@ def test_plugin_discovery(monkeypatch, registry: AgentPluginRegistry) -> None:
             return [_FakeEntryPoint()]
         return []
 
-    monkeypatch.setattr(
-        "shadowinfer.core.agent_plugin_registry.entry_points", _fake_entry_points
-    )
+    monkeypatch.setattr("shadowinfer.core.agent_plugin_registry.entry_points", _fake_entry_points)
     registry.discover_plugins()
 
     assert registry.is_registered("dummy_plugin")
@@ -146,9 +144,7 @@ def test_plugin_discovery_skips_invalid(monkeypatch, registry: AgentPluginRegist
             return [_BadEntryPoint()]
         return []
 
-    monkeypatch.setattr(
-        "shadowinfer.core.agent_plugin_registry.entry_points", _fake_entry_points
-    )
+    monkeypatch.setattr("shadowinfer.core.agent_plugin_registry.entry_points", _fake_entry_points)
     with pytest.warns(UserWarning, match="does not inherit from BaseAgent"):
         registry.discover_plugins()
 

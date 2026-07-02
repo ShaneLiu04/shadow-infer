@@ -91,11 +91,7 @@ def test_extra_agent_initialized_and_executed() -> None:
 
 def test_extra_agent_broadcasted_in_payload() -> None:
     """The STEP_RESULT broadcast payload includes plugin outputs."""
-    config = {
-        "extra_agents": [
-            {"name": "counter_2", "agent": "counter", "config": {}}
-        ]
-    }
+    config = {"extra_agents": [{"name": "counter_2", "agent": "counter", "config": {}}]}
     orch = Orchestrator(config=config)
     orch.agent_registry = _make_registry_with_counter()
     orch.initialize(model_config=_default_model_config())
@@ -133,11 +129,7 @@ def test_malformed_extra_agent_entries_are_skipped() -> None:
 
 def test_unknown_extra_agent_raises() -> None:
     """An unknown agent plugin name raises a clear error at init time."""
-    config = {
-        "extra_agents": [
-            {"name": "bad", "agent": "not_registered", "config": {}}
-        ]
-    }
+    config = {"extra_agents": [{"name": "bad", "agent": "not_registered", "config": {}}]}
     orch = Orchestrator(config=config)
     orch.agent_registry = _make_registry_with_counter()
     with pytest.raises(KeyError, match="Unknown agent plugin"):

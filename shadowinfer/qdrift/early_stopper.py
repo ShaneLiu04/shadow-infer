@@ -92,9 +92,7 @@ class UncertaintyEarlyStopper:
             similarity = 0.0
             self._stable_count = 0
         else:
-            similarity = _compute_similarity(
-                self._previous, output, metric=self.metric
-            )
+            similarity = _compute_similarity(self._previous, output, metric=self.metric)
             if _is_stable(similarity, self.similarity_threshold, self.metric):
                 self._stable_count += 1
             else:
@@ -105,14 +103,10 @@ class UncertaintyEarlyStopper:
         should_stop = False
         if step_id + 1 >= self.max_steps:
             should_stop = True
-        elif (
-            step_id + 1 >= self.min_steps
-            and self._stable_count >= self.stability_window
-        ):
+        elif step_id + 1 >= self.min_steps and self._stable_count >= self.stability_window:
             should_stop = True
             logger.info(
-                "Early stopping triggered at step %d (similarity=%.4f, "
-                "stable_count=%d)",
+                "Early stopping triggered at step %d (similarity=%.4f, " "stable_count=%d)",
                 step_id,
                 similarity,
                 self._stable_count,

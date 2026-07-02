@@ -58,9 +58,7 @@ class VLLMModelBackend(ModelBackend):
         """Return True when vLLM can be imported."""
         return _VLLM_AVAILABLE
 
-    def load(
-        self, model_name: str, device: Optional[str] = None, **kwargs: Any
-    ) -> None:
+    def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         """Load the vLLM engine.
 
         The ``device`` argument is accepted for API compatibility but vLLM

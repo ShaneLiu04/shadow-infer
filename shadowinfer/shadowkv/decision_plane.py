@@ -33,13 +33,9 @@ class KVPlaneCoordinate:
     memory_pressure: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "importance", float(max(0.0, min(1.0, self.importance)))
-        )
+        object.__setattr__(self, "importance", float(max(0.0, min(1.0, self.importance))))
         object.__setattr__(self, "drift", float(max(0.0, min(1.0, self.drift))))
-        object.__setattr__(
-            self, "memory_pressure", float(max(0.0, min(1.0, self.memory_pressure)))
-        )
+        object.__setattr__(self, "memory_pressure", float(max(0.0, min(1.0, self.memory_pressure))))
 
 
 @dataclass(frozen=True)
@@ -143,8 +139,7 @@ class KVDecisionPlane:
         """
         adjustment = self.mode_adjustment.get(mode, 0.0)
         thresholds = {
-            key: max(0.0, value + adjustment)
-            for key, value in self.importance_thresholds.items()
+            key: max(0.0, value + adjustment) for key, value in self.importance_thresholds.items()
         }
 
         if importance >= thresholds["fp32"]:
@@ -161,9 +156,7 @@ class KVDecisionPlane:
         The effective reuse threshold is lowered by high importance (important
         heads must see smaller drift to be reused) and by high drift.
         """
-        base = {"aggressive": 0.20, "balanced": 0.15, "conservative": 0.10}.get(
-            mode, 0.15
-        )
+        base = {"aggressive": 0.20, "balanced": 0.15, "conservative": 0.10}.get(mode, 0.15)
         # Sensitivity to current drift: the higher the drift, the tighter reuse.
         effective = base * (1.0 - 0.3 * coord.drift)
         # High-importance heads are held to a stricter standard.
@@ -171,9 +164,7 @@ class KVDecisionPlane:
         effective = max(effective, 1e-5)
         return coord.drift < effective
 
-    def decide_eviction(
-        self, coord: KVPlaneCoordinate
-    ) -> Tuple[bool, float]:
+    def decide_eviction(self, coord: KVPlaneCoordinate) -> Tuple[bool, float]:
         """Return ``(should_evict, eviction_priority)``.
 
         Eviction is only enabled when ``memory_budget_bytes`` is set.
@@ -241,9 +232,7 @@ class KVDecisionPlane:
         return ((delta_k + delta_v) / 2.0).detach().cpu().T  # [seq_len, num_heads]
 
     @staticmethod
-    def compute_memory_pressure(
-        current_bytes: int, budget_bytes: Optional[int]
-    ) -> float:
+    def compute_memory_pressure(current_bytes: int, budget_bytes: Optional[int]) -> float:
         """Return memory pressure in ``[0, 1]``.
 
         Returns 0.0 when no budget is configured.

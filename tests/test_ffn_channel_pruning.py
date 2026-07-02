@@ -61,7 +61,9 @@ class TestFFNChannelPruning:
         full = agent._full_compute(x, small_weights["up"], small_weights["down"])
         assert torch.allclose(pruned, full, atol=1e-5)
 
-    def test_on_step_channel_pruning_reduces_flops(self, mock_config, mock_ffn_weights, mock_ffn_inputs):
+    def test_on_step_channel_pruning_reduces_flops(
+        self, mock_config, mock_ffn_weights, mock_ffn_inputs
+    ):
         cfg = dict(mock_config)
         cfg.update(
             {

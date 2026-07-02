@@ -110,9 +110,7 @@ class TestPackedKVCacheEviction:
         seq_len, num_heads, head_dim = 4, 4, 32
         k = torch.randn(1, num_heads, seq_len, head_dim)
         v = torch.randn(1, num_heads, seq_len, head_dim)
-        precision_map = {
-            t: {h: "fp16" for h in range(num_heads)} for t in range(seq_len)
-        }
+        precision_map = {t: {h: "fp16" for h in range(num_heads)} for t in range(seq_len)}
         result = PackedKVCache.pack(k, v, precision_map)
         before = result["memory_bytes"]
         result["packed_kv"].evict({(0, 0), (1, 1)})
@@ -136,7 +134,9 @@ class TestKVCacheManagerEviction:
         v = torch.randn(1, num_heads, seq_len, head_dim)
         precision_map = {t: {h: "fp16" for h in range(num_heads)} for t in range(seq_len)}
         packed = PackedKVCache.pack(k, v, precision_map)
-        entry = KVCacheEntry(k_tensor=k, v_tensor=v, precision="fp16", packed_kv=packed["packed_kv"])
+        entry = KVCacheEntry(
+            k_tensor=k, v_tensor=v, precision="fp16", packed_kv=packed["packed_kv"]
+        )
 
         from shadowinfer.shadowkv.importance_model import TokenHeadScore
 

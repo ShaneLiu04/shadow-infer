@@ -75,9 +75,7 @@ class PyTorchModelBackend(ModelBackend):
         self._kv_cache: Dict[int, KVCacheEntry] = {}
         self._device = torch.device("cpu")
 
-    def load(
-        self, model_name: str, device: Optional[str] = None, **kwargs: Any
-    ) -> None:
+    def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         del kwargs  # unused
         self._device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")

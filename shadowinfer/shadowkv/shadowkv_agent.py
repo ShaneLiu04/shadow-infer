@@ -70,6 +70,7 @@ class ShadowKVAgent(BaseAgent):
         eviction_policy: Optional[EvictionPolicy] = None
         if eviction_policy_cfg == "age":
             from shadowinfer.shadowkv.eviction_policy import ImportanceAgeEvictionPolicy
+
             eviction_policy = ImportanceAgeEvictionPolicy()
         elif eviction_policy_cfg is not None:
             eviction_policy = LeastImportantEvictionPolicy()
@@ -930,9 +931,7 @@ class ShadowKVAgent(BaseAgent):
         staged = packed_kv  # start from current packed cache
         # Create a shallow copy by re-packing with the same precision map.
         precision_map = self.precision_map.get(layer_id, {})
-        staged_result = PackedKVCache.pack(
-            compressed_kv["k"], compressed_kv["v"], precision_map
-        )
+        staged_result = PackedKVCache.pack(compressed_kv["k"], compressed_kv["v"], precision_map)
         staged_packed = staged_result["packed_kv"]
         staged_packed.apply_reuse_mask(packed_kv, reuse_mask)
 
@@ -949,9 +948,7 @@ class ShadowKVAgent(BaseAgent):
 
     def set_memory_budget(self, memory_budget_mb: Optional[float]) -> None:
         """Runtime update of the KV cache memory budget."""
-        bytes_budget = (
-            int(memory_budget_mb * 1024 * 1024) if memory_budget_mb is not None else None
-        )
+        bytes_budget = int(memory_budget_mb * 1024 * 1024) if memory_budget_mb is not None else None
         self.cache_manager.memory_budget_bytes = bytes_budget
         if self.decision_plane is not None:
             self.decision_plane.memory_budget_bytes = bytes_budget

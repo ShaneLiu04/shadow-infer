@@ -216,18 +216,14 @@ class HuggingFaceModelBackend(ModelBackend):
         self._model.eval()
         self.model_config = _hf_config_to_model_config(model_name, self._model.config)
 
-    def _load_from_path(
-        self, path: str, local_files_only: bool = True
-    ) -> None:
+    def _load_from_path(self, path: str, local_files_only: bool = True) -> None:
         """Load a model from a local directory."""
         self._model = AutoModelForCausalLM.from_pretrained(
             path,
             local_files_only=local_files_only,
         )
         try:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                path, local_files_only=local_files_only
-            )
+            self._tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=local_files_only)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Tokenizer not available at %s: %s", path, exc)
             self._tokenizer = None

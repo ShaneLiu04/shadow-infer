@@ -45,9 +45,7 @@ class FFNOptimizerAgent(BaseAgent):
         self.channel_pruning_enabled: bool = config.get("channel_pruning_enabled", False)
         self.channel_pruning_ratio: float = config.get("channel_pruning_ratio", 0.0)
         self.channel_pruning_dynamic: bool = config.get("channel_pruning_dynamic", False)
-        self.channel_pruning_method: str = config.get(
-            "channel_pruning_method", "static_importance"
-        )
+        self.channel_pruning_method: str = config.get("channel_pruning_method", "static_importance")
         self._channel_mask: Optional[torch.Tensor] = None
         self._active_channels: int = 0
 
