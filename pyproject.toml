@@ -1,0 +1,122 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadowinfer"
+version = "3.2.2"
+description = "Edge-optimized Diffusion LLM inference and profiling framework"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "ShadowInfer Contributors" }
+]
+keywords = ["diffusion-llm", "inference", "optimization", "kv-cache", "quantization", "edge"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.24.0",
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.2.0",
+]
+benchmark = [
+    "matplotlib>=3.7.0",
+]
+web = [
+    "streamlit>=1.28.0",
+    "pandas>=2.0.0",
+]
+observability = [
+    "prometheus_client>=0.17.0",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+]
+models = [
+    "transformers>=4.30.0",
+]
+all = [
+    "shadowinfer[dev,benchmark,web,observability,models]",
+]
+
+[project.scripts]
+shadowinfer = "shadowinfer.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ftlxy/ShadowInfer"
+Repository = "https://github.com/ftlxy/ShadowInfer"
+Documentation = "https://github.com/ftlxy/ShadowInfer/tree/main/docs"
+Issues = "https://github.com/ftlxy/ShadowInfer/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shadowinfer*", "benchmarks*", "exporter*", "scripts*"]
+exclude = ["tests*", "docs*", "notebooks*", "outputs*", "logs*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = "\\.pyi?$"
+extend-exclude = "/(\\.git|\\.venv|\\.pytest_cache|__pycache__|build|dist)/"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["shadowinfer"]
+skip = [".venv", "__pycache__", ".pytest_cache", "build", "dist"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+show_error_codes = true
+exclude = [
+    "^\\.venv/",
+    "^__pycache__/",
+    "^\\.pytest_cache/",
+    "^build/",
+    "^dist/",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300
+addopts = "--cov=shadowinfer --cov-report=term-missing --cov-fail-under=75"
+markers = [
+    "slow: marks tests as slow (deselect with '-m not slow')",
+]
+
+[tool.coverage.run]
+source = ["shadowinfer"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true

@@ -1,0 +1,38 @@
+# model_fast_dllm_7b.yaml
+# Fast-dLLM-v2-7B 模型配置模板
+# 对应 TECHNICAL_SPEC.md §4.1 模型配置
+
+model:
+  name: "Fast-dLLM-v2-7B"
+  type: "diffusion_llm"
+  parameters: "7B"
+
+architecture:
+  num_layers: 32
+  hidden_dim: 4096
+  num_heads: 32
+  head_dim: 128
+  intermediate_dim: 11008
+  vocab_size: 32000
+  max_seq_len: 4096
+
+attention:
+  type: "grouped_query_attention"
+  num_kv_heads: 8
+  rope_theta: 10000.0
+
+ffn:
+  activation: "gelu"
+
+diffusion:
+  num_steps: 50
+  noise_schedule: "cosine"
+
+profiling:
+  warmup_steps: 5
+  profile_steps: 20
+  metrics:
+    - "latency"
+    - "memory"
+    - "flops"
+    - "accuracy"

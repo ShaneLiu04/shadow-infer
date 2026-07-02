@@ -1,0 +1,31 @@
+# profiler_full.yaml
+# Profiler 专用配置模板
+# 对应 TECHNICAL_SPEC.md §4 配置规范 — Profiler 输出与告警阈值
+
+profiling:
+  warmup_steps: 5
+  profile_steps: 20
+  metrics:
+    - "latency"
+    - "memory"
+    - "flops"
+    - "accuracy"
+    - "kv_reuse_rate"
+    - "q_drift_hit_rate"
+    - "ffn_sparse_update_ratio"
+    - "perplexity_delta"
+    - "bleu_drop"
+
+output:
+  format: "json"
+  directory: "outputs/profiling"
+
+thresholds:
+  accuracy_warning: 0.005
+  accuracy_critical: 0.01
+  memory_warning_mb: 6144
+  memory_critical_mb: 8192
+  latency_warning_ms: 80
+  latency_critical_ms: 100
+  perplexity_warning: 0.5
+  perplexity_critical: 1.0

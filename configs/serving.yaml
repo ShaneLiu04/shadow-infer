@@ -1,0 +1,25 @@
+# ShadowInfer serving runtime configuration
+# 对应文档：README.md §CLI 使用
+
+# Backend selection. CLI --backend takes precedence when explicitly set.
+backend:
+  type: pytorch
+  args: {}
+
+max_concurrent_requests: 4
+request_timeout: 120.0
+
+rate_limit_rps: 20.0
+rate_limit_burst: 40
+
+ab_weights:
+  baseline: 0.3
+  optimized: 0.7
+
+metrics_enabled: true
+
+hot_config_path: configs/serving.yaml
+hot_config_interval: 10.0
+
+default_num_steps: 20
+default_strategy: optimized

@@ -1,0 +1,114 @@
+# ShadowInfer default declarative policy.
+# See shadowinfer/core/policy.py for the DSL specification.
+
+version: "1.0"
+
+defaults:
+  # Q-drift dispatch matrix thresholds
+  qdrift:
+    sensitivity_high: 0.7
+    sensitivity_low: 0.3
+    drift_low: 0.2
+
+  # ShadowKV precision/reuse thresholds
+  shadowkv:
+    importance_high: 0.8
+    importance_medium: 0.5
+    importance_low: 0.2
+    reuse_threshold_aggressive: 0.20
+    reuse_threshold_balanced: 0.15
+    reuse_threshold_conservative: 0.10
+
+  # FFN compute-path thresholds
+  ffn:
+    delta_reuse: 0.02
+    delta_incremental: 0.05
+    delta_sparse: 0.15
+    high_precision_threshold: 0.7
+    low_precision_threshold: 0.3
+
+  # Profiler alert thresholds
+  profiler:
+    accuracy_warning: 0.005
+    accuracy_critical: 0.01
+    latency_warning_ratio: 1.5
+    memory_warning_ratio: 0.9
+    latency_consecutive_increase: 3
+    accuracy_jitter_threshold: 0.002
+
+  # Orchestrator global constraints
+  orchestrator:
+    accuracy_drop_critical: 0.01
+    default_latency_budget_ms: 100.0
+    default_memory_budget_mb: 8192.0
+
+rules:
+  - name: accuracy-drop-critical
+    priority: 1000
+    description: Accuracy drop above 1% forces the most conservative modes.
+    conditions:
+      - field: alert_accuracy_critical
+        op: "=="
+        value: true
+    actions:
+      - target: shadowkv.mode
+        value: conservative
+      - target: ffn.mode
+        value: full
+
+  - name: memory-budget-exceeded
+    priority: 900
+    description: When memory exceeds the budget, prefer aggressive compression.
+    conditions:
+      - field: alert_memory_warning
+        op: "=="
+        value: true
+    actions:
+      - target: shadowkv.mode
+        value: aggressive
+
+  - name: latency-overflow
+    priority: 800
+    description: When latency exceeds budget, use aggressive FFN and ShadowKV.
+    conditions:
+      - field: alert_latency_warning
+        op: "=="
+        value: true
+    actions:
+      - target: ffn.mode
+        value: sparse
+      - target: shadowkv.mode
+        value: aggressive
+
+  - name: high-memory-ratio
+    priority: 700
+    description: Gradual memory pressure also pushes toward aggressive compression.
+    conditions:
+      - field: memory_ratio
+        op: ">="
+        value: 0.9
+    actions:
+      - target: shadowkv.mode
+        value: aggressive
+
+  - name: high-latency-ratio
+    priority: 600
+    description: Gradual latency pressure pushes FFN to sparse.
+    conditions:
+      - field: latency_ratio
+        op: ">="
+        value: 1.5
+    actions:
+      - target: ffn.mode
+        value: sparse
+
+  - name: high-accuracy-drop
+    priority: 500
+    description: Any measurable accuracy drop steers toward balanced settings.
+    conditions:
+      - field: accuracy_drop
+        op: ">="
+        value: 0.005
+    actions:
+      - target: shadowkv.mode
+        value: conservative

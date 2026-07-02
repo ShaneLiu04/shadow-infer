@@ -1,0 +1,53 @@
+# optimize_full.yaml
+# 全局优化配置模板
+# 对应 TECHNICAL_SPEC.md §4.2 优化配置
+
+optimization:
+  enabled: true
+
+shadowkv:
+  enabled: true
+  compression_ratio: 0.5
+  precision_levels:
+    - "fp32"
+    - "fp16"
+    - "int8"
+    - "int4"
+  importance_thresholds:
+    fp32: 0.8
+    fp16: 0.5
+    int8: 0.2
+    int4: 0.0
+  reuse:
+    enabled: true
+    base_threshold: 0.15
+    adaptive: true
+
+qdrift:
+  enabled: true
+  noise_schedule: "cosine"
+  sensitivity_temperature: 1.0
+  drift_method: "relative_l2"
+  dispatch_matrix:
+    low_sensitivity_low_drift: "aggressive_sparse"
+    low_sensitivity_high_drift: "balanced_sparse"
+    mid_sensitivity_low_drift: "balanced_mixed"
+    mid_sensitivity_high_drift: "conservative_mixed"
+    high_sensitivity: "conservative_full"
+
+ffn:
+  enabled: true
+  mixed_precision: true
+  channel_importance_threshold: 0.7
+  sparse_update: true
+  delta_threshold: 0.05
+  compute_paths:
+    - "reuse"
+    - "incremental"
+    - "sparse"
+    - "full"
+
+constraints:
+  max_accuracy_drop: 0.01
+  max_latency_ms: 100
+  max_memory_mb: 8192

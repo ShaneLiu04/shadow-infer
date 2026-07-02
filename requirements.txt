@@ -1,0 +1,40 @@
+# ShadowInfer dependencies
+
+# Core
+torch>=2.2.0
+pyyaml>=6.0
+numpy>=1.24.0
+structlog>=24.0.0
+
+# Benchmarking (optional)
+matplotlib>=3.7.0
+
+# Web Profiler (optional)
+streamlit>=1.28.0
+pandas>=2.0.0
+
+# Observability (optional)
+prometheus_client>=0.17.0
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0
+
+# HuggingFace model backend (optional)
+transformers>=4.30.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-timeout>=2.2.0
+
+# Development
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Environment
+# Python 3.10+
+# PyTorch 2.2+ (CPU or CUDA)
+# Linux (recommended Ubuntu 22.04+) or Windows WSL2
+# NVIDIA GPU with >= 8GB VRAM for 7B model validation
