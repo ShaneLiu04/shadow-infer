@@ -57,6 +57,8 @@ Thumbs.db
 
 # Models and data
 models/
+!shadowinfer/models/
+!shadowinfer/models/**
 checkpoints/
 *.safetensors
 *.bin
