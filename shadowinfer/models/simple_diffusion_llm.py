@@ -188,9 +188,7 @@ class SimpleDiffusionLLM(nn.Module):
         hidden = hidden + self.pos_embed(positions).unsqueeze(0)
 
         if total_steps > 0:
-            ratio = torch.tensor(
-                [[step_t / total_steps]], device=hidden.device, dtype=hidden.dtype
-            )
+            ratio = torch.tensor([[step_t / total_steps]], device=hidden.device, dtype=hidden.dtype)
             hidden = hidden + self.time_embed(ratio).unsqueeze(1)
 
         updated_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
