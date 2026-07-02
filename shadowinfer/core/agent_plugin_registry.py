@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 try:
     from importlib.metadata import entry_points
@@ -29,7 +29,7 @@ class AgentPluginSpec:
     """Metadata for a registered agent plugin."""
 
     name: str
-    cls: Type[BaseAgent]
+    cls: Callable[..., BaseAgent]
     help: str = ""
     is_plugin: bool = False
 
