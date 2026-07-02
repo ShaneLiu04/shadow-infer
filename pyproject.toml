@@ -88,7 +88,7 @@ known_first_party = ["shadowinfer"]
 skip = [".venv", "__pycache__", ".pytest_cache", "build", "dist"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = false
 warn_unused_configs = false
 disallow_untyped_defs = false
