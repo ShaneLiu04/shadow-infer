@@ -13,13 +13,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .structs import (
-    AgentState,
-    ErrorRecord,
-    ProfileResult,
-    StepConfig,
-    StepStats,
-)
+from .structs import AgentState, ErrorRecord, ProfileResult, StepConfig, StepStats
 
 
 class BaseAgent(ABC):

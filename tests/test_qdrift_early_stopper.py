@@ -5,10 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from shadowinfer.qdrift.early_stopper import (
-    EarlyStopConfig,
-    UncertaintyEarlyStopper,
-)
+from shadowinfer.qdrift.early_stopper import EarlyStopConfig, UncertaintyEarlyStopper
 
 
 class TestUncertaintyEarlyStopper:

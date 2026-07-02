@@ -6,10 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from shadowinfer.core.agent_plugin_registry import (
-    AgentPluginRegistry,
-    get_agent_plugin_registry,
-)
+from shadowinfer.core.agent_plugin_registry import AgentPluginRegistry, get_agent_plugin_registry
 from shadowinfer.core.base_agent import BaseAgent
 from shadowinfer.core.structs import ProfileResult, StepConfig
 

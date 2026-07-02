@@ -11,21 +11,8 @@
 __version__ = "3.0"
 
 from .dashboard import DashboardData
-from .metrics import (
-    _PROMETHEUS_AVAILABLE,
-    Counter,
-    Gauge,
-    Histogram,
-    MetricsRegistry,
-    Summary,
-)
-from .tracing import (
-    _OTEL_AVAILABLE,
-    CriticalPath,
-    Span,
-    Tracer,
-    TracerProvider,
-)
+from .metrics import _PROMETHEUS_AVAILABLE, Counter, Gauge, Histogram, MetricsRegistry, Summary
+from .tracing import _OTEL_AVAILABLE, CriticalPath, Span, Tracer, TracerProvider
 
 __all__ = [
     "Counter",

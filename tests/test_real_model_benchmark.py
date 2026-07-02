@@ -5,12 +5,7 @@ Tests for real model benchmark module.
 import os
 import tempfile
 
-from benchmarks.real_model import (
-    BenchmarkConfig,
-    RealModelBenchmark,
-    RunResult,
-    StepMetrics,
-)
+from benchmarks.real_model import BenchmarkConfig, RealModelBenchmark, RunResult, StepMetrics
 
 
 class TestBenchmarkConfig:

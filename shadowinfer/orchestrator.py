@@ -17,10 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 
-from shadowinfer.core.agent_plugin_registry import (
-    AgentPluginRegistry,
-    get_agent_plugin_registry,
-)
+from shadowinfer.core.agent_plugin_registry import AgentPluginRegistry, get_agent_plugin_registry
 from shadowinfer.core.base_agent import AgentRegistry, BaseAgent
 from shadowinfer.core.bus import MESSAGE_TYPES, ProfilingBus
 from shadowinfer.core.config import Config
@@ -41,10 +38,7 @@ from shadowinfer.profiler.profiler_agent import ProfilerAgent
 from shadowinfer.qdrift.early_stopper import EarlyStopConfig, UncertaintyEarlyStopper
 from shadowinfer.qdrift.qdrift_agent import QDriftAgent
 from shadowinfer.shadowkv.shadowkv_agent import ShadowKVAgent
-from shadowinfer.utils.logging_utils import (
-    StructuredLogger,
-    configure_shadowinfer_logging,
-)
+from shadowinfer.utils.logging_utils import StructuredLogger, configure_shadowinfer_logging
 
 
 class InferenceResult:

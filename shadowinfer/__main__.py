@@ -422,10 +422,7 @@ def run_benchmark(args):
     """
     import json
 
-    from shadowinfer.benchmarking.regression import (
-        RegressionTracker,
-        record_from_pipeline_summary,
-    )
+    from shadowinfer.benchmarking.regression import RegressionTracker, record_from_pipeline_summary
     from shadowinfer.orchestrator import Orchestrator
 
     orch = Orchestrator(config_path=args.config)

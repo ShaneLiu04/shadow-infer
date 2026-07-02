@@ -9,12 +9,7 @@ Corresponds to: plan-v2.md Phase 2
 
 __version__ = "3.0"
 
-from .benchmark_suite import (
-    BenchmarkConfig,
-    BenchmarkReport,
-    BenchmarkResult,
-    BenchmarkRunner,
-)
+from .benchmark_suite import BenchmarkConfig, BenchmarkReport, BenchmarkResult, BenchmarkRunner
 from .roofline import RooflineAnalyzer, RooflinePoint
 
 __all__ = [

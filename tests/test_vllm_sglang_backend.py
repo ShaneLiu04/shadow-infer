@@ -7,10 +7,7 @@ adapters are importable, report availability correctly, and fail gracefully.
 import pytest
 import torch
 
-from shadowinfer.core.backends.sglang_backend import (
-    _SGLANG_AVAILABLE,
-    SGLangModelBackend,
-)
+from shadowinfer.core.backends.sglang_backend import _SGLANG_AVAILABLE, SGLangModelBackend
 from shadowinfer.core.backends.vllm_backend import _VLLM_AVAILABLE, VLLMModelBackend
 from shadowinfer.core.structs import StepConfig
 

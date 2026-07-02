@@ -8,9 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
-from shadowinfer.core.backends.huggingface_backend import (
-    HuggingFaceModelBackend,
-)
+from shadowinfer.core.backends.huggingface_backend import HuggingFaceModelBackend
 from shadowinfer.core.model_backend import ModelBackend
 from shadowinfer.core.structs import KVCacheEntry, StepConfig
 

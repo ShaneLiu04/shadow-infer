@@ -9,11 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from shadowinfer.core.policy import (
-    PolicyContext,
-    PolicyEngine,
-    load_policy,
-)
+from shadowinfer.core.policy import PolicyContext, PolicyEngine, load_policy
 
 
 def _sample_policy() -> dict:
