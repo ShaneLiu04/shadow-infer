@@ -65,10 +65,10 @@ all = [
 shadowinfer = "shadowinfer.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/ftlxy/ShadowInfer"
-Repository = "https://github.com/ftlxy/ShadowInfer"
-Documentation = "https://github.com/ftlxy/ShadowInfer/tree/main/docs"
-Issues = "https://github.com/ftlxy/ShadowInfer/issues"
+Homepage = "https://github.com/ShaneLiu04/ShadowInfer"
+Repository = "https://github.com/ShaneLiu04/ShadowInfer"
+Documentation = "https://github.com/ShaneLiu04/ShadowInfer#readme"
+Issues = "https://github.com/ShaneLiu04/ShadowInfer/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
