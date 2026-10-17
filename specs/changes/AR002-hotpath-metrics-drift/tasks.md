@@ -12,8 +12,8 @@
 | ID | 任务描述 | 依赖 | 状态 | 备注 |
 |----|---------|------|------|------|
 | T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | passing | 2026-10-17 完成（optimize_full.yaml 口径复测：baseline 3817.7ms / optimized 46295.7ms = 12.1× 倒挂；shadowkv 支线 48.1%、FFN unpack 33.7% 双热点；drift_score 0.0→恒 1.0 退化实录；证据存 baseline-profile.md） |
-| T002 | M6 指标真实化：step 真实 perf_counter 计时接入 perf_data；内存对账与告警；调度器真实延迟奖励；benchmarks 移除硬编码 mock 断言 | T001 | pending | FR3.1 |
-| T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | pending | FR3.1 验收 |
+| T002 | M6 指标真实化：step 真实 perf_counter 计时接入 perf_data；内存对账与告警；调度器真实延迟奖励；benchmarks 移除硬编码 mock 断言 | T001 | passing | 2026-10-17 完成；内存对账按 design 功能点 2 与 M5 合并实现（T006）；mock 源码诚实化（无伪造差分 + mode 标注） |
+| T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | passing | 2026-10-17 完成；全仓库 grep 无零值旧断言（仅新增正向断言）；墙钟一致性入 test_m6_metrics.py（宽松界）+ T008 严格 <2% 落档 |
 | T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | pending | FR3.2 |
 | T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | pending | FR3.2 验收 |
 | T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | pending | FR3.3 + design §7.2 |
@@ -66,3 +66,10 @@
 - 修订：design.md 新增 §7——M5 扩展「FFN 反量化结果缓存」（精度计划指纹校验，语义等价零风险）；可达性重估 1.47×（内部比）
 - 依据：baseline-profile.md §3；srs FR3.3 记忆化语义在 FFN 平面的应用，M7（channel_mask 行为）仍 Out of Scope
 - 决定：准予按修订后设计继续开发（T006 范围同步扩展）
+
+### 2026-10-17 T002/T003 会话记录
+
+- 完成任务：T002（M6 指标真实化）+ T003（语义测试更新）
+- 修改文件：orchestrator.py（step 计时接入 _run_profiler、global_state["latency_ms"] 数据源、_compute_total_latency 去 10.0 造假兜底、_aggregate_optimized_data per-step 真实值）、core/structs.py（StepState.to_dict 增 latency_ms）、profiler/profiler_agent.py（device 口径标注）、benchmarks/real_model/__init__.py（mock 无伪造差分 + summary.mode="mock"）
+- 测试：新增 test_m6_metrics.py（18 用例）+ test_benchmark_no_hardcoded_speedup.py（3 用例）；修订 test_real_model_benchmark.py（5 处断言按无差分契约改写）；基准测试 36 passed；相关模块回归 61 passed
+- 备注：TDD-Red 子代理另产出 test_m6_metrics_integrity.py（发明 run_step/_make_dummy_inputs 等不存在 API，违反 design 4.3 对外零变更），审查后删除；调度器奖励未改代码（数据源修复即生效，符合 design「不改语义，改数据源」）

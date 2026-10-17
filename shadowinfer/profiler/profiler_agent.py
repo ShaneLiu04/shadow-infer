@@ -157,11 +157,13 @@ class ProfilerAgent(BaseAgent):
         )
 
         # 记录关键指标到 logger
+        # AR002 M6：device 口径标注（实际执行设备；gpu_utilization 固定 0.0，不引入 nvml）
+        device_tag = str(perf_data.get("device", "cpu"))
         self.logger.log_metric(
             "step_latency_ms",
             perf_metrics.get("latency", {}).get("e2e_ms", 0.0),
             step_id=step_id,
-            tags={"model": self._model_name},
+            tags={"model": self._model_name, "device": device_tag},
         )
         self.logger.log_metric(
             "step_memory_mb",

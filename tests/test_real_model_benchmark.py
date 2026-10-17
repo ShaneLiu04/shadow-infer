@@ -5,6 +5,8 @@ Tests for real model benchmark module.
 import os
 import tempfile
 
+import pytest
+
 from benchmarks.real_model import BenchmarkConfig, RealModelBenchmark, RunResult, StepMetrics
 
 
@@ -75,23 +77,23 @@ class TestRealModelBenchmark:
         assert len(result.steps) == 10
         assert result.avg_step_latency_ms > 0
 
-    def test_optimized_faster_than_baseline(self):
-        config = BenchmarkConfig(num_steps=10, num_prompts=1)
+    def test_mock_has_no_fabricated_speedup(self):
+        """Mock 对比不得携带硬编码加速差分：speedup 应近似 1（契约 G）。"""
+        config = BenchmarkConfig(num_steps=10, num_prompts=2)
         benchmark = RealModelBenchmark(config)
 
-        baseline = benchmark.run_baseline(0)
-        optimized = benchmark.run_optimized(0)
+        result = benchmark.run_comparison()
 
-        assert optimized.avg_step_latency_ms < baseline.avg_step_latency_ms
+        assert abs(result.speedup - 1.0) < 0.05
 
     def test_optimized_uses_less_memory(self):
-        config = BenchmarkConfig(num_steps=10, num_prompts=1)
+        """Mock 对比不得携带硬编码内存差分：memory_savings 应近似 0（契约 G）。"""
+        config = BenchmarkConfig(num_steps=10, num_prompts=2)
         benchmark = RealModelBenchmark(config)
 
-        baseline = benchmark.run_baseline(0)
-        optimized = benchmark.run_optimized(0)
+        result = benchmark.run_comparison()
 
-        assert optimized.max_memory_mb < baseline.max_memory_mb
+        assert abs(result.memory_savings) < 0.05
 
     def test_comparison(self):
         config = BenchmarkConfig(num_steps=10, num_prompts=5)
@@ -99,8 +101,9 @@ class TestRealModelBenchmark:
 
         result = benchmark.run_comparison()
 
-        assert result.speedup > 1.0
-        assert result.memory_savings > 0.0
+        # AR002 M6 契约 G：mock 无优化差分，speedup/memory_savings 均应近似 1.0/0.0。
+        assert result.speedup == pytest.approx(1.0, abs=0.05)
+        assert abs(result.memory_savings) < 0.05
         assert result.accuracy_drop < 0.01
         assert result.latency_p50 > 0
         assert result.latency_p95 > 0
@@ -143,7 +146,10 @@ class TestRealModelBenchmark:
             assert "summary" in data
             assert "baseline" in data
             assert "optimized" in data
-            assert data["summary"]["speedup"] > 1.0
+            # AR002 M6 契约 G：mock 无优化差分，speedup 应近似 1.0。
+            assert data["summary"]["speedup"] == pytest.approx(1.0, abs=0.05)
+            # JSON 报告 summary 必须标注 mode 口径，避免 mock 数据被误读为实测。
+            assert data["summary"]["mode"] == "mock"
         finally:
             os.close(fd)
             os.unlink(path)
@@ -167,19 +173,27 @@ class TestRealModelBenchmark:
             os.unlink(path)
 
     def test_step_latency_variance(self):
-        """Test that step latency varies realistically."""
+        """Test mock step latency stays sane without fabricated per-step gaps."""
         config = BenchmarkConfig(num_steps=10, num_prompts=1)
         benchmark = RealModelBenchmark(config)
 
-        result = benchmark.run_optimized(0)
+        baseline = benchmark.run_baseline(0)
+        optimized = benchmark.run_optimized(0)
 
-        latencies = [s.latency_ms for s in result.steps]
+        latencies = [s.latency_ms for s in optimized.steps]
 
-        # Early steps should be faster (more aggressive optimization)
-        assert latencies[0] < latencies[-1] * 1.5
+        # AR002 M6 契约 G：无伪造差分，latency 仅有自然噪声/增长，全部为正
+        # 且处于合理上界内。
+        for value in latencies:
+            assert 0.0 < value < 100.0
 
-        # Memory should grow
-        memories = [s.memory_mb for s in result.steps]
+        # 优化前后同公式：任意 step 的 latency 比值不得出现伪造性偏离。
+        for b_step, o_step in zip(baseline.steps, optimized.steps):
+            ratio = o_step.latency_ms / b_step.latency_ms
+            assert 0.5 <= ratio <= 2.0
+
+        # Memory should still grow naturally
+        memories = [s.memory_mb for s in optimized.steps]
         assert memories[-1] > memories[0]
 
     def test_kv_cache_growth(self):

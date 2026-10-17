@@ -86,41 +86,25 @@ class RealModelBenchmark:
         self.config = config
 
     def _mock_model_step(self, step_id: int, total_steps: int, optimized: bool) -> StepMetrics:
-        """Simulate one model step with realistic characteristics."""
-        # Baseline: ~15ms per step
-        # Optimized: ~5ms per step (3x speedup)
+        """Simulate one model step.
+
+        AR002 M6 指标真实化：mock 不携带任何针对 optimized 的伪造差分，
+        baseline 与 optimized 使用完全相同的延迟/内存/KV 公式——speedup
+        与 memory_savings 只能由真实优化集成产生，而非硬编码曲线。
+        optimized 参数仅为后续接入真实优化路径保留。
+        """
         base_latency = 15.0
-        if optimized:
-            # Early steps (high noise): aggressive optimization
-            if step_id < total_steps * 0.3:
-                latency = base_latency * 0.3  # 70% speedup
-            elif step_id < total_steps * 0.7:
-                latency = base_latency * 0.5  # 50% speedup
-            else:
-                latency = base_latency * 0.7  # 30% speedup
-        else:
-            latency = base_latency
+        latency = base_latency * (0.9 + 0.2 * (step_id / total_steps))
 
-        # Add noise
-        latency *= 0.9 + 0.2 * (step_id / total_steps)
-
-        # Memory: baseline ~500MB, optimized ~150MB (70% savings)
+        # Memory grows mildly over steps
         base_memory = 500.0
-        if optimized:
-            memory = base_memory * (0.3 + 0.1 * (step_id / total_steps))
-        else:
-            memory = base_memory * (1.0 + 0.05 * (step_id / total_steps))
+        memory = base_memory * (1.0 + 0.05 * (step_id / total_steps))
 
         # KV cache grows over steps
         kv_cache = 10.0 * step_id
-        if optimized:
-            kv_cache *= 0.4  # 60% compression
 
         # FFN compute ratio
-        if optimized:
-            ffn_ratio = 0.25 + 0.1 * (step_id / total_steps)
-        else:
-            ffn_ratio = 1.0
+        ffn_ratio = 1.0
 
         return StepMetrics(
             step_id=step_id,
@@ -419,6 +403,8 @@ stepChart.setOption({{
         data = {
             "config": asdict(self.config),
             "summary": {
+                # AR002 M6：mode 标注口径，防止 mock 数据被误读为实测
+                "mode": "mock",
                 "speedup": result.speedup,
                 "memory_savings": result.memory_savings,
                 "accuracy_drop": result.accuracy_drop,

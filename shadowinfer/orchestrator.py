@@ -1106,6 +1106,9 @@ class Orchestrator:
         total_steps = state.total_steps
         inputs = state.inputs
 
+        # AR002 M6：step 真实计时起点（perf_counter 口径，供 Profiler 消费）
+        step_wall_start = time.perf_counter()
+
         # Step 1: QDrift Agent 评估
         qdrift_result = self._run_qdrift(step_id, total_steps, inputs)
         state.qdrift_result = qdrift_result
@@ -1174,12 +1177,14 @@ class Orchestrator:
         # Step 4: FFN Optimizer Agent 执行（逐层）
         state.ffn_result = self._run_ffn(step_config, inputs, sensitivity_score)
 
-        # Step 5: Profiler Agent 记录
+        # Step 5: Profiler Agent 记录（AR002 M6：真实实测延迟，替换硬编码 0.0）
+        step_latency_ms = (time.perf_counter() - step_wall_start) * 1000.0
         profiler_result = self._run_profiler(
             step_config,
             state.kv_result,
             state.qdrift_result,
             state.ffn_result,
+            latency_ms=step_latency_ms,
         )
         state.profiler_result = profiler_result
         alerts = list(profiler_result.get("alerts", []))
@@ -1196,6 +1201,8 @@ class Orchestrator:
         # Step 6: 全局状态更新与仲裁
         metrics = profiler_result.get("performance_metrics", {})
         self.global_state["memory_used_mb"] = metrics.get("memory", {}).get("total_mb", 0.0)
+        # AR002 M6：真实延迟写入全局状态（_build_policy_context 的 latency_ratio 数据源）
+        self.global_state["latency_ms"] = step_latency_ms
         acc_delta = (
             profiler_result.get("accuracy_metrics", {})
             .get("perplexity", {})
@@ -1451,15 +1458,27 @@ class Orchestrator:
         aggregated_kv: Dict[str, Any],
         qdrift_result: Dict[str, Any],
         aggregated_ffn: Dict[str, Any],
+        latency_ms: float = 0.0,
     ) -> Dict[str, Any]:
-        """执行 Profiler Agent 并返回结果。"""
+        """执行 Profiler Agent 并返回结果。
+
+        AR002 M6 指标真实化：latency_ms 为本 step 的真实实测耗时
+        （perf_counter 口径，来自 _execute_step 的 QDrift->FFN 执行窗口），
+        替换原硬编码 0.0；tokens_per_step / tokens_per_sec 由实测延迟派生。
+        """
+        tokens_per_step = float(
+            self._model_config.get("batch_size", 1) * self._model_config.get("seq_len", 128)
+        )
+        tokens_per_sec = tokens_per_step / (latency_ms / 1000.0) if latency_ms > 0.0 else 0.0
+        # gpu_utilization 固定 0.0：不引入 nvml 依赖；device 为实际执行设备（口径标注）
         perf_data = {
-            "latency_ms": 0.0,
+            "latency_ms": float(latency_ms),
             "memory_mb": aggregated_kv["memory_mb"],
             "gpu_utilization": 0.0,
-            "tokens_per_sec": 0.0,
-            "tokens_per_step": 1.0,
+            "tokens_per_sec": tokens_per_sec,
+            "tokens_per_step": tokens_per_step,
             "per_layer_ms": {},
+            "device": str(self._get_backend_device()),
         }
         accuracy_data = {
             "baseline_perplexity": 0.0,
@@ -1748,7 +1767,8 @@ class Orchestrator:
 
         for sr in self.step_results:
             sid = sr["step_id"]
-            latency_per_step[sid] = 0.0
+            # AR002 M6：per-step 延迟取真实实测值（原硬编码 0.0）
+            latency_per_step[sid] = float(sr.get("latency_ms", 0.0))
             kv = sr.get("shadowkv", sr.get("kv", {}))
             for lid, mem in kv.get("per_layer_memory", {}).items():
                 if lid not in kv_cache_data["memory_mb"]:
@@ -2140,13 +2160,22 @@ class Orchestrator:
         return sum(deltas) / len(deltas)
 
     def _compute_total_latency(self, result: InferenceResult) -> float:
-        """计算总延迟。"""
+        """计算总延迟。
+
+        AR002 M6：移除 0.0 -> 10.0 造假兜底——零实测值剔除并记 warning，
+        不再虚构延迟；非零 step 正常累加。
+        """
         total = 0.0
-        for step_result in result.step_results:
+        for idx, step_result in enumerate(result.step_results):
             perf = step_result.get("profiler", {}).get("performance_metrics", {})
             lat = perf.get("latency", {}).get("e2e_ms", 0.0)
-            if lat == 0.0:
-                lat = 10.0
+            if lat <= 0.0:
+                self.logger.log_alert(
+                    "warning",
+                    f"Step {idx} reported zero measured latency; "
+                    "excluded from total (no fabricated fallback).",
+                )
+                continue
             total += lat
         return total
 

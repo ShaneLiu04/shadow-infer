@@ -231,6 +231,7 @@ class StepState:
             "shadowkv": self.kv_result,
             "ffn": self.ffn_result,
             "profiler": self.profiler_result,
+            "latency_ms": self.latency_ms,
             "alerts": self.alerts,
             "conflicts": self.conflicts,
             "resolution": self.resolution,
