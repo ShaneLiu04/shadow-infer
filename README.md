@@ -1,10 +1,24 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="ShadowInfer — 面向端侧的 Diffusion LLM 推理优化框架" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/ShaneLiu04/ShadowInfer/actions/workflows/ci.yml"><img src="https://github.com/ShaneLiu04/ShadowInfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+"></a>
+  <img src="https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C.svg" alt="PyTorch 2.2+">
+  <img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black">
+</p>
+
 # ShadowInfer
 
-> 面向端侧的 Diffusion LLM 推理优化框架
->
-> 版本：v3.2.2 | License：MIT
+> 面向端侧的 Diffusion LLM 推理优化框架 —— 在 4-8 GB 显存约束下实现低延迟、低精度损失的推理。
 
-ShadowInfer 是一套用于 Diffusion LLM端侧/车端 GPU 推理的优化与评测框架。它通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 和多 Agent 协作架构，在 4-8 GB 显存约束下实现低延迟、低精度损失的推理。
+| 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
+|------|------|--------|----------|--------|
+| v3.3.0 | 581 passed / 1 skipped | 80.84% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+
+ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
 ---
 
@@ -12,7 +26,6 @@ ShadowInfer 是一套用于 Diffusion LLM端侧/车端 GPU 推理的优化与评
 
 - [项目简介](#项目简介)
 - [核心特性](#核心特性)
-- [技术亮点](#技术亮点)
 - [快速开始](#快速开始)
 - [架构设计](#架构设计)
 - [核心模块](#核心模块)
@@ -20,12 +33,14 @@ ShadowInfer 是一套用于 Diffusion LLM端侧/车端 GPU 推理的优化与评
 - [工程化与生产安全](#工程化与生产安全)
 - [CLI 使用](#cli-使用)
 - [模型后端](#模型后端)
+- [Agent 插件、异步执行与早停](#agent-插件异步执行与早停)
 - [可观测性与回归测试](#可观测性与回归测试)
 - [分布式与 A/B 测试](#分布式与-ab-测试)
 - [性能基准](#性能基准)
 - [设计决策](#设计决策)
 - [项目结构](#项目结构)
 - [开发贡献](#开发贡献)
+- [引用](#引用)
 - [版本历史](#版本历史)
 - [许可证](#许可证)
 
@@ -39,7 +54,7 @@ Diffusion LLM 与自回归 LLM 的关键差异在于：它通过 **固定步数�
 - 不同 denoising step 对计算误差的敏感度差异显著（早期噪声高、可激进优化，后期噪声低、需保持精度）；
 - 端侧 GPU 显存小、延迟敏感，需要算法与工程化手段结合。
 
-ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排器（Orchestrator）协调，提供从性能分析、策略优化到生产部署的完整链路。
+ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排器（Orchestrator）协调，并通过声明式策略 DSL、生产安全网与可观测性组件，把研究性优化变成可部署、可回滚、可审计的工程能力。
 
 ---
 
@@ -57,35 +72,12 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **Agent 插件系统** | 通过 `shadowinfer.agents` entry-point 注册第三方 Agent，Orchestrator 自动调度并收集输出。 |
 | **异步 Agent 执行** | `AsyncTaskExecutor` 将 Profiler 聚合、A/B 统计、面板渲染等任务放到后台线程池，带超时与取消。 |
 | **不确定性感知早停** | `UncertaintyAwareEarlyStopper` 根据相邻 step 输出变化动态停止 denoising，节省冗余计算。 |
+| **声明式策略 DSL** | YAML / JSON 规则控制优化阈值与 Orchestrator 仲裁，替代硬编码阈值。 |
 | **结构化日志** | 基于 `structlog` 的 JSON 行日志，支持按大小/时间轮转与运行时动态级别调整。 |
-| **生产安全网** | 热配置重载、熔断器、五级优雅降级、令牌桶限流、健康监控。 |
+| **生产安全网** | 热配置重载、熔断器、五级优雅降级、令牌桶限流、健康监控；安全网降级在同 step 内不可被策略仲裁覆盖。 |
 | **可观测性** | Prometheus 指标、OpenTelemetry 链路、Streamlit / Grafana 面板。 |
 | **A/B 测试与回归追踪** | 策略分流 + 统计显著性检验 + JSONL 历史性能回归检测。 |
 | **分布式脚手架** | Pipeline / Tensor 并行、多 GPU KV Cache 管理。 |
-
----
-
-## 技术亮点
-
-| 类别 | 技术 |
-|------|------|
-| 语言 | Python 3.10+，C++ / CUDA 扩展 |
-| 框架 | PyTorch 2.x，transformers |
-| 运行环境 | Linux（Ubuntu 22.04+）、Windows / WSL2 |
-| 模型 | Diffusion LLM（Fast-dLLM-v2、SimpleDiffusionLLM） |
-| KV 存储 | 字节级打包混合精度缓存（FP16 / INT8 / INT4） |
-| 优化 | 键值缓存压缩、量化、稀疏计算、通道剪枝 |
-| CUDA | 自定义逐通道 INT8 / INT4 算子、稀疏 GEMM、融合注意力（脚手架） |
-| 算子调优 | 持久化 shape-aware 自动调优缓存 + CPU / CUDA 统一分发 |
-| Backend 插件 | `ModelBackend` entry-point 注册表（含 vLLM / SGLang scaffolding） |
-| Agent 插件 | `BaseAgent` entry-point 注册表，支持自定义 Agent 热插拔 |
-| 异步执行 | 线程池任务执行器，支持超时、取消、结果查询 |
-| 不确定性感知早停 | 滑动窗口输出相似度检测，动态终止 denoising |
-| 策略 DSL | 声明式 YAML / JSON 规则控制优化阈值与仲裁 |
-| 可观测性 | Prometheus metrics、OpenTelemetry traces、Grafana / Streamlit dashboard |
-| 工程化 | 热配置重载、熔断、优雅降级、类型安全、限流 |
-| 分布式 | 流水线 / 张量并行脚手架 |
-| 回归测试 | 基于 JSONL 历史的性能回归框架 |
 
 ---
 
@@ -118,7 +110,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`543 passed`，测试覆盖率约 `80%`。
+当前主分支：`581 passed, 1 skipped`，测试覆盖率 `80.84%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -133,10 +125,12 @@ result = orch.run_full_pipeline(
     num_steps=20,
 )
 
-print(f"Baseline latency: {result['baseline']['latency_e2e_ms']:.1f} ms")
-print(f"Optimized latency: {result['optimized']['latency_e2e_ms']:.1f} ms")
-print(f"Speedup: {result['speedup']:.2f}x")
-print(f"Accuracy drop: {result['accuracy_drop']:.4f}")
+print(f"Baseline latency:  {result['baseline_latency_ms']:.1f} ms")
+print(f"Optimized latency: {result['optimized_latency_ms']:.1f} ms")
+print(f"Speedup:           {result['speedup']:.2f}x")
+print(f"Memory savings:    {result['memory_savings_ratio']:.1%}")
+print(f"Accuracy drop:     {result['accuracy_drop']:.4f}")
+print(f"Report:            {result['comparison_path']}")
 ```
 
 ### 单 Agent 使用示例
@@ -203,27 +197,24 @@ print(ff["compute_stats"]["flops_saved"])
 ShadowInfer 采用**模块化多 Agent 架构**，由中心化 Orchestrator 统一协调，所有 Agent 通过 Profiling Bus 共享数据。
 
 ```
-用户输入 / 配置
+用户输入 / 配置（YAML / JSON）
         │
         ▼
-┌─────────────────────┐
-│     Orchestrator    │
-│  (编排器 / 协调器)   │
-├─────────┬───────────┤
-│         │           │
-▼         ▼           ▼
-Profiler  ShadowKV   Q-drift   FFN Optimizer
-│         │           │         │
-└─────────┴───────────┴─────────┘
-            │
-            ▼
-      Profiling Bus
-            │
-            ▼
-   PyTorch / CUDA / 自定义算子
-            │
-            ▼
-      端侧 / 车端 GPU
+┌─────────────────────────────────────┐
+│             Orchestrator            │
+│       编排 · 仲裁 · 安全网集成       │
+└──┬─────────┬─────────┬─────────┬────┘
+   │         │         │         │
+   ▼         ▼         ▼         ▼
+Profiler  ShadowKV  Q-drift  FFN Optimizer
+   │         │         │         │
+   └─────────┴────┬────┴─────────┘
+                  ▼
+           Profiling Bus
+                  ▼
+      PyTorch / CUDA / 自定义算子
+                  ▼
+          端侧 / 车端 GPU
 ```
 
 端到端执行流程：
@@ -354,7 +345,6 @@ Profiler  ShadowKV   Q-drift   FFN Optimizer
 - 当 `sensitivity_score >= 0.7` 时自动禁用剪枝，避免精度敏感 step 受损；
 - FLOPs 按 `active_ratio` 重新核算。
 
-
 ---
 
 ## 工程化与生产安全
@@ -427,7 +417,7 @@ safety = ProductionSafetyNet()
 orch.enable_safety_net(safety)
 ```
 
-Orchestrator 在每次 step 前后自动调用 `check_before_inference()` 和 `report_after_inference()`，实现熔断、限流、降级、健康监控和性能预算跟踪。
+Orchestrator 在每次 step 前后自动调用 `check_before_inference()` 和 `report_after_inference()`，实现熔断、限流、降级、健康监控和性能预算跟踪。pre-flight 检查失败或抛异常时，本 step 自动降级到 conservative / full，且该安全降级在同 step 内不可被策略仲裁放宽。
 
 ---
 
@@ -647,6 +637,43 @@ print(ab.report())
 
 ## 性能基准
 
+### 复现方式
+
+```bash
+# 全量测试套件（含覆盖率）
+pytest
+
+# 端到端流水线（6 步参考配置）
+python -m shadowinfer optimize \
+    --model SimpleDiffusionLLM \
+    --backend pytorch \
+    --device cpu \
+    --num-steps 6 \
+    --config configs/optimize_full.yaml
+```
+
+### 实测数据（v3.3.0，2026-10-17，Windows / CPU fallback）
+
+**质量与测试**
+
+| 指标 | 实测值 | 说明 |
+|------|--------|------|
+| 测试通过率 | 581 passed / 1 skipped | 全量套件，38 个测试文件 |
+| 测试覆盖率 | 80.84% | pytest-cov（门禁 fail-under 75） |
+| 静态检查 | black / isort / flake8 / mypy 全部零告警 | 提交前强制门禁 |
+
+**端到端流水线（SimpleDiffusionLLM，6 steps，CPU）**
+
+| 指标 | 实测值 |
+|------|--------|
+| 基线端到端延迟 | 3571.4 ms |
+| KV 显存节省比例 | 8.6% |
+| 精度损失（perplexity delta） | 0.0000 |
+| BLEU 损失 | 0.0000 |
+| Q-drift 步调度命中率 | 100% |
+
+> **CPU fallback 说明：** 当前主机无可用 CUDA，内核走 CPU fallback。ShadowKV 决策 / 打包 / 驱逐路径当前为纯 Python 实现，在 CPU + 小规模参考模型上每步开销大于收益（优化运行耗时高于基线）。框架的目标收益场景是端侧 GPU + 真实 7B Diffusion LLM——GPU 环境启用 CUDA kernel 后收益兑现。CPU 路径的向量化与内核化已列入 [ROADMAP](ROADMAP.md)。
+
 完整基准套件：
 
 ```bash
@@ -659,22 +686,20 @@ python benchmarks/run_benchmarks.py --model Fast-dLLM-v2-7B --suite full
 - `latency.csv` / `roofline.png`：延迟曲线与屋顶线分析；
 - 回归历史 `benchmarks/results/regression_history.jsonl`。
 
-> 注：当前主机无可用 CUDA，内核使用 CPU fallback；真实 GPU 环境可启用 CUDA kernel 获得更优性能。
-
-
 ---
 
 ## 设计决策
 
-以下是项目关键架构决策的简要摘要，完整讨论已合并到本文档相关章节。
+以下是项目关键架构决策的摘要，完整讨论已合并到本文档相关章节。
 
 | ADR | 决策 | 理由 |
 |-----|------|------|
-| ADR-001 | 使用 ShadowKV 而非统一量化 | 关键 token 不可控损失 vs 动态 per-token-head 精度分配，压缩比 50-70% 且精度损失 < 1%。 |
+| ADR-001 | 使用 ShadowKV 而非统一量化 | 关键 token 不可控损失 vs 动态 per-token-head 精度分配，压缩比可控且精度损失可追踪。 |
 | ADR-002 | Q-drift 步感知调度 | Diffusion LLM 不同 step 误差敏感度不同，早期可激进、后期需保守。 |
 | ADR-003 | 基于 Entropy 的重要性评分 | Attention 权重分布 entropy 能反映 token-head 的信息覆盖范围，无需额外训练。 |
 | ADR-004 | 混合精度优于静态量化 | 静态量化固定压缩比、固定误差；混合精度按重要性自适应，可解释且与调度协同。 |
-| ADR-005 | 多 Agent 架构 | 将 Profiler / ShadowKV / Q-drift / FFN 解耦，通过 Profiling Bus 通信，便于独立迭代和扩展。 |
+| ADR-005 | 多 Agent 架构 + 声明式策略 DSL | 将 Profiler / ShadowKV / Q-drift / FFN 解耦，通过 Profiling Bus 通信；仲裁阈值用 YAML 策略描述，可热更新、可审计。 |
+| ADR-006 | 安全网降级优先级高于策略仲裁 | pre-flight 失败触发的 conservative 降级在同 step 内不可被仲裁放宽，保证生产安全机制的有效性。 |
 
 ---
 
@@ -687,8 +712,10 @@ ShadowInfer/
 │   │   └── ci.yml                  # CI/CD 流水线
 │   ├── ISSUE_TEMPLATE/             # Issue 模板
 │   └── PULL_REQUEST_TEMPLATE.md
+├── assets/
+│   └── banner.svg                  # 封面横幅（矢量）
 ├── LICENSE                         # MIT 许可证
-├── README.md                       # 本文档（唯一保留的文档）
+├── README.md                       # 本文档（主文档）
 ├── ROADMAP.md                      # 项目路线图
 ├── pyproject.toml                  # 包元数据与工具配置
 ├── requirements.txt                # 依赖列表
@@ -741,6 +768,7 @@ ShadowInfer/
 ├── dashboards/                     # Grafana 面板模板
 ├── exporter/                       # Prometheus 导出器
 ├── notebooks/                      # Jupyter 笔记本
+├── specs/                          # SDD 过程资产（AR 需求/设计/任务）
 ├── tests/                          # 单元与集成测试
 └── outputs/                        # 生成的报告（gitignore）
 ```
@@ -749,12 +777,14 @@ ShadowInfer/
 
 ## 开发贡献
 
-感谢你对 ShadowInfer 的兴趣！欢迎通过以下方式参与：
+感谢你对 ShadowInfer 的兴趣。欢迎通过以下方式参与：
 
 - 在 [GitHub Issues](https://github.com/ShaneLiu04/ShadowInfer/issues) 报告 bug 或提出需求；
 - 在 [Pull Requests](https://github.com/ShaneLiu04/ShadowInfer/pulls) 提交改进；
 - 改进文档、教程或翻译；
 - 分享你的使用场景与复现结果。
+
+优先贡献方向（详见 [ROADMAP](ROADMAP.md)）：CUDA kernel 实现与测试、真实 Diffusion LLM 适配器、CPU 优化路径向量化、端侧 GPU 基准测试。
 
 ### 开发环境
 
@@ -768,14 +798,14 @@ pip install -e ".[dev]"
 
 ### 代码规范
 
-提交 PR 前请运行：
+提交 PR 前请运行（全部通过才可合并）：
 
 ```bash
-black --check shadowinfer/ tests/ benchmarks/ exporter/
-isort --check-only shadowinfer/ tests/ benchmarks/ exporter/
-flake8 shadowinfer/ tests/ benchmarks/ exporter/
+black --check shadowinfer/ tests/ benchmarks/ exporter/ scripts/
+isort --check-only shadowinfer/ tests/ benchmarks/ exporter/ scripts/
+flake8 shadowinfer/ tests/ benchmarks/ exporter/ scripts/ --max-line-length=100 --extend-ignore=E203,W503
 mypy shadowinfer/ --ignore-missing-imports
-pytest tests/
+pytest
 ```
 
 ### PR 流程
@@ -789,7 +819,32 @@ pytest tests/
 
 ---
 
+## 引用
+
+如果 ShadowInfer 对你的研究或工程有帮助，欢迎引用：
+
+```bibtex
+@software{shadowinfer2026,
+  title  = {ShadowInfer: Edge-Optimized Inference Framework for Diffusion LLMs},
+  author = {ShadowInfer Contributors},
+  year   = {2026},
+  url    = {https://github.com/ShaneLiu04/ShadowInfer},
+  version = {3.3.0}
+}
+```
+
+---
+
 ## 版本历史
+
+### v3.3.0（2026-10）
+
+- 修复安全网 pre-flight 降级被策略仲裁覆盖的逻辑缺陷：安全降级在同 step 内不可被仲裁放宽（ADR-006）；
+- 清理 flake8 全部 20 处告警（未用导入、死代码、超长行）；
+- 统一清理 79 处已删除文档的失效引用，全部改指 README.md 对应章节；
+- README 全方位重塑：深色科技风 SVG 封面、徽章行、关键指标条、实测数据口径统一、架构图重绘、Citation 章节；
+- 新增本地开发契约 AGENTS.md（不入库）：创新完成即更新 README、AR 完成即推送 Gitee；
+- 质量门禁全绿：`581 passed, 1 skipped`，覆盖率 `80.84%`。
 
 ### v3.2.2（2026-07）
 
@@ -797,8 +852,7 @@ pytest tests/
 - Orchestrator 自动调度插件 Agent，输出写入 `step.outputs` 并随 STEP_RESULT 广播；
 - 新增 `AsyncTaskExecutor`，支持后台任务提交、超时、取消与结果查询；
 - 新增 `UncertaintyAwareEarlyStopper` 并接入 Orchestrator step 循环；
-- 修复 HuggingFace 后端 `local_files_only=True` 离线 fallback；
-- 全量测试达 `581 passed, 1 skipped`，覆盖率 `80.41%`。
+- 修复 HuggingFace 后端 `local_files_only=True` 离线 fallback。
 
 ### v3.2.1（2026-07）
 
@@ -808,12 +862,12 @@ pytest tests/
 - 迁移日志到 `structlog`，支持 JSON、轮转、动态级别；
 - 修复 HuggingFace 后端 `DynamicCache` 解包问题；
 - 合并并精简所有文档到 `README.md`。
+
+### v3.2.0（2026-07）
+
 - 新增 `BackendRegistry` 与 entry-point 插件发现；
-
 - 新增 vLLM / SGLang 后端 scaffolding；
-- 新增声明式 Policy DSL；
-- 策略引擎接入 Orchestrator 仲裁。
-
+- 新增声明式 Policy DSL，策略引擎接入 Orchestrator 仲裁；
 - 重构 `Orchestrator`，支持 `run_stream()`、`cancel()`、event-sourcing snapshots；
 - 新增 Kernel Auto-Tuning Cache 与 `KernelDispatcher`；
 - 新增 `StepState` / `PipelineContext`。

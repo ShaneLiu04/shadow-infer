@@ -19,7 +19,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 ### Strengths
 
 - Clean multi-agent architecture (Orchestrator + Profiler / ShadowKV / Q-drift / FFN Optimizer).
-- 566 passing tests with ~80% coverage.
+- 581 passing tests (1 skipped) with 80.84% coverage.
 - Comprehensive documentation (architecture, technical spec, engineering, ADRs, bilingual README, tutorials).
 - Built-in observability, benchmarking, and production-safety components.
 - CUDA kernel scaffold (INT8/INT4 quantization, sparse GEMM, fused quantized attention).
@@ -54,6 +54,10 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] Declarative Policy DSL — YAML/JSON rules for Q-drift, ShadowKV, FFN, Profiler, and Orchestrator arbitration (`configs/policy_default.yaml`).
 - [ ] Real Diffusion LLM model adapter (Fast-dLLM-v2 or equivalent).
 - [ ] Production serving integration with vLLM / SGLang adapter (full single-step diffusion forward).
+- [ ] **CPU optimization-path vectorization**: ShadowKV decision / packing / eviction paths are
+      pure Python today; on CPU fallback with small reference models the per-step overhead
+      exceeds the savings (v3.3.0 measured: 6-step optimized run ~343s vs ~3.6s baseline).
+      Vectorize / kernelize these paths so CPU fallback stays usable for development.
 - [x] Continuous benchmarking and performance regression tracking.
 - [x] English documentation and broader internationalization — all content consolidated into the Chinese README.md.
 
@@ -87,9 +91,9 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 
 - [x] Token-level reuse decisions.
 - [x] Packed KV cache storage (real byte-level compression).
-- [ ] Importance-aware eviction for long-context scenarios.
-- [ ] KV cache prefetching based on Q-drift sensitivity predictions.
-- [ ] Formalize ShadowKV as Importance / Precision / Reuse planes.
+- [x] Importance-aware eviction for long-context scenarios.
+- [x] KV cache prefetching based on Q-drift sensitivity predictions.
+- [x] Formalize ShadowKV as Importance / Precision / Reuse planes.
 
 ### 3.5 FFN Optimization
 
@@ -97,7 +101,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [ ] **Real Sparse FFN Kernel**: Use CSR/CSC formats and a production-grade sparse kernel.
 - **Packed Weight Storage**: Store weights as packed INT8/INT4 with on-the-fly dequantization.
 - **FFN-Compiler**: Lightweight compiler to generate fused kernels from FFN subgraphs.
-- **Dynamic Channel Pruning**: Zero out low-contribution channels at runtime.
+- [x] **Dynamic Channel Pruning**: Zero out low-contribution channels at runtime.
 
 ### 3.6 Production & Serving
 
@@ -112,7 +116,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 
 - [x] **Standard Backends**: Migrate metrics to `prometheus_client` and tracing to OpenTelemetry.
 - [x] **Live Dashboard**: Build a Streamlit interactive profiler.
-- **Structured Logging**: Adopt `structlog` with log rotation and dynamic levels.
+- [x] **Structured Logging**: Adopt `structlog` with log rotation and dynamic levels.
 
 ### 3.8 Testing & Quality
 
@@ -208,7 +212,7 @@ These directions can differentiate ShadowInfer on GitHub and in the research com
 | pip Installable | ✅ | ✅ | ✅ |
 | Real Model Support | Partial (`SimpleDiffusionLLM` + HuggingFace adapter) | 1 public Diffusion LLM | 3+ |
 | CUDA Kernel Completion | ~35% | 70% | 90%+ |
-| Test Coverage | ~79% | >80% | >85% |
+| Test Coverage | ~80.84% | >82% | >85% |
 | Docs Languages | Chinese + English intro | Bilingual core | Bilingual full |
 | Contributors | 1 | 5+ | 20+ |
 | Academic Output | 0 | 1 arXiv | 1 paper + artifact |
@@ -217,7 +221,7 @@ These directions can differentiate ShadowInfer on GitHub and in the research com
 
 ## 7. How to Contribute
 
-See the [开发贡献](../README.md#开发贡献) section in README.md for development setup, code style, and PR workflow.
+See the [开发贡献](README.md#开发贡献) section in README.md for development setup, code style, and PR workflow.
 
 Priority contribution areas:
 
