@@ -1,6 +1,6 @@
 """BaseAgent — 所有 Agent 的抽象基类与注册表。
 
-对应文档：AGENTS.md §5, TECHNICAL_SPEC.md §3.2
+对应文档：README.md《核心模块》Agent 接口规范
 版本：v3.0
 """
 
@@ -19,7 +19,7 @@ from .structs import AgentState, ErrorRecord, ProfileResult, StepConfig, StepSta
 class BaseAgent(ABC):
     """所有 Agent 的基类。
 
-    对应 AGENTS.md §5 和 TECHNICAL_SPEC.md §3.2。
+    对应 README.md《核心模块》Agent 接口规范。
     定义了 Agent 的标准生命周期：INIT → READY → RUNNING → PAUSED → SHUTDOWN。
 
     Args:
@@ -28,7 +28,7 @@ class BaseAgent(ABC):
     """
 
     # 合法状态转换表 (current_state -> {allowed_target_states})
-    # 对应 AGENTS.md §4 生命周期图
+    # 对应 README.md《核心模块》Agent 生命周期
     _TRANSITIONS: Dict[AgentState, set] = {
         AgentState.INIT: {AgentState.READY, AgentState.SHUTDOWN, AgentState.ERROR},
         AgentState.READY: {AgentState.RUNNING, AgentState.SHUTDOWN, AgentState.ERROR},
@@ -54,7 +54,7 @@ class BaseAgent(ABC):
     def on_init(self, model_config: Dict[str, Any]) -> None:
         """初始化 Agent，加载配置。
 
-        对应 TECHNICAL_SPEC.md §3.2。
+        对应 README.md《核心模块》Agent 接口规范。
 
         Args:
             model_config: 模型级配置字典（如层数、hidden_dim 等）。
@@ -65,7 +65,7 @@ class BaseAgent(ABC):
     def on_step(self, step_config: StepConfig, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """处理单个 step。
 
-        对应 TECHNICAL_SPEC.md §3.2。
+        对应 README.md《核心模块》Agent 接口规范。
 
         Args:
             step_config: 当前 step 的优化配置。
@@ -80,7 +80,7 @@ class BaseAgent(ABC):
     def on_shutdown(self) -> Optional[ProfileResult]:
         """关闭 Agent，返回汇总统计。
 
-        对应 TECHNICAL_SPEC.md §3.2。
+        对应 README.md《核心模块》Agent 接口规范。
 
         Returns:
             可选的 ProfileResult 汇总对象。
@@ -94,14 +94,14 @@ class BaseAgent(ABC):
     def get_status(self) -> AgentState:
         """返回当前状态。
 
-        对应 AGENTS.md §5 AgentState.status。
+        对应 README.md《核心模块》AgentState.status。
         """
         return self.state
 
     def set_state(self, state: AgentState) -> None:
         """状态转换。
 
-        实现 AGENTS.md §4 生命周期。
+        实现 Agent 生命周期（见 README.md《核心模块》）。
         直接设置状态，不检查转换合法性（用于内部恢复或强制状态）。
 
         Args:

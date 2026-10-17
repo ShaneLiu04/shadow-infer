@@ -4,14 +4,14 @@ Extracts per-token-head importance from attention scores and optionally from
 historical KV drift. The model is intentionally lightweight (entropy + layer
 factor + position factor) so it can run online inside the inference loop.
 
-对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1
+对应文档：README.md《核心模块》ShadowKV Agent
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F

@@ -6,8 +6,6 @@ import json
 import logging
 import tempfile
 
-import pytest
-
 from shadowinfer.utils.logging_utils import (
     StructuredLogger,
     configure_shadowinfer_logging,

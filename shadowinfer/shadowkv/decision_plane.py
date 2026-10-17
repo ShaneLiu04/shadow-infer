@@ -12,14 +12,14 @@ From this coordinate the plane derives three orthogonal decisions:
 * **Reuse**: whether the token-head can be copied from the previous step.
 * **Eviction**: whether the token-head should be dropped under memory pressure.
 
-对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1, ROADMAP.md §ShadowKV 2.0
+对应文档：README.md《核心模块》ShadowKV Agent
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 

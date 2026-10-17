@@ -1,6 +1,6 @@
 """FFN Optimizer Agent — FFN 层计算优化模块。
 
-对应文档：FFN_OPTIMIZER_AGENT.md, TECHNICAL_SPEC.md §2.3 / §3.2
+对应文档：README.md《核心模块》FFN Optimizer Agent
 版本：v3.0
 """
 

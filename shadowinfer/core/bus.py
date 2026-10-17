@@ -1,6 +1,6 @@
 """Profiling Bus — Agent 间通信总线。
 
-对应文档：AGENTS.md §3.1 通信协议
+对应文档：README.md《架构设计》Profiling Bus 通信协议
 版本：v3.0
 """
 
@@ -21,7 +21,7 @@ from .structs import Message
 class MESSAGE_TYPES:
     """Profiling Bus 消息类型常量。
 
-    对应 AGENTS.md §3.1 通信协议中的 message_type 字段。
+    对应 Profiling Bus 通信协议中的 message_type 字段（见 README.md）。
     """
 
     REQUEST = "REQUEST"
@@ -37,7 +37,7 @@ class MESSAGE_TYPES:
 class ProfilingBus:
     """Profiling Bus — Agent 间通信总线。
 
-    对应 AGENTS.md §3.1 通信协议。
+    对应 Profiling Bus 通信协议（见 README.md）。
     提供点对点发送、广播、日志记录和统计能力。
     使用 threading.Lock 保证线程安全。
 

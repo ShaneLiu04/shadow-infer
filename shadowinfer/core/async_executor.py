@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 

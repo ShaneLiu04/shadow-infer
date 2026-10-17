@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import tempfile
-
 import torch
 
-from shadowinfer.core.structs import KVCacheEntry, StepConfig
+from shadowinfer.core.structs import KVCacheEntry
 from shadowinfer.shadowkv import (
     ImportanceAgeEvictionPolicy,
     KVCacheManager,

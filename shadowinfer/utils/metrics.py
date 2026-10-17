@@ -1,6 +1,6 @@
 """ShadowInfer 精度计算工具模块。
 
-对应 PROFILER_AGENT.md 中的 accuracy 维度。
+对应 README.md《核心模块》Profiler Agent 的 accuracy 维度。
 """
 
 __version__ = "3.0"
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 
 class Metrics:
-    """精度计算工具。对应 PROFILER_AGENT.md 中的 accuracy 维度。"""
+    """精度计算工具。对应 README.md《核心模块》Profiler Agent 的 accuracy 维度。"""
 
     @staticmethod
     def compute_perplexity(

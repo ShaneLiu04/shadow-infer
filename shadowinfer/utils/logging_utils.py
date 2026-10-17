@@ -9,7 +9,7 @@
 * 向后兼容原 ``StructuredLogger`` 的 ``log_event`` / ``log_metric`` /
   ``log_alert`` / ``get_logs`` / ``export_json`` / ``export_csv`` API
 
-对应文档：ENGINEERING.md §可观测性、ROADMAP.md §Structured Logging
+对应文档：README.md《可观测性与回归测试》章节
 """
 
 from __future__ import annotations

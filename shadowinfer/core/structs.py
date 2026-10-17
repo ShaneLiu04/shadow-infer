@@ -1,15 +1,15 @@
 """ShadowInfer Core Data Structures.
 
-Implements all core dataclasses defined in TECHNICAL_SPEC.md §3.1.
+Implements all core dataclasses of ShadowInfer (see README.md).
 
 Version: 3.0
-Corresponds to: TECHNICAL_SPEC.md v2.0
+Corresponds to: ShadowInfer spec (README.md)
 """
 
 from __future__ import annotations
 
 __version__ = "3.0"
-__doc_version__ = "TECHNICAL_SPEC.md v2.0"
+__doc_version__ = "README.md v3"
 
 import threading
 from dataclasses import dataclass, field
@@ -22,7 +22,7 @@ from torch import Tensor
 class AgentState(str, Enum):
     """Agent 生命周期状态枚举。
 
-    定义在 TECHNICAL_SPEC.md §3.2 (BaseAgent 使用)
+    定义于 Agent 接口规范（BaseAgent 使用，见 README.md）
     """
 
     INIT = "INIT"
@@ -37,7 +37,7 @@ class AgentState(str, Enum):
 class KVCacheEntry:
     """单个 KV cache 条目。
 
-    对应 TECHNICAL_SPEC.md §3.1 核心数据结构 — KVCacheEntry。
+    对应 README.md 核心数据结构 — KVCacheEntry。
 
     Attributes:
         k_tensor: 存储的 key tensor（可能已量化）。
@@ -65,7 +65,7 @@ class KVCacheEntry:
 class StepConfig:
     """单 step 的优化配置。
 
-    对应 TECHNICAL_SPEC.md §3.1 核心数据结构 — StepConfig。
+    对应 README.md 核心数据结构 — StepConfig。
 
     Attributes:
         step_id: 当前 denoising step 的序号。
@@ -99,7 +99,7 @@ class StepConfig:
 class ProfileResult:
     """Profiling 结果汇总。
 
-    对应 TECHNICAL_SPEC.md §3.1 核心数据结构 — ProfileResult。
+    对应 README.md 核心数据结构 — ProfileResult。
 
     Attributes:
         model_name: 被测模型名称（如 "Fast-dLLM-v2-7B"）。
@@ -144,7 +144,7 @@ class Message:
     """Profiling Bus 通信消息。
 
     用于 ShadowInfer 多 Agent 之间的事件传递与状态同步。
-    定义在 TECHNICAL_SPEC.md §3.2 Agent 接口规范上下文（BaseAgent 通信）。
+    定义于 Agent 接口规范（BaseAgent 通信，见 README.md）。
 
     Attributes:
         version: 消息协议版本号。

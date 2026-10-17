@@ -1,6 +1,6 @@
 """ShadowKV Agent — KV Cache 压缩与复用优化模块。
 
-对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1 / §3.2
+对应文档：README.md《核心模块》ShadowKV Agent
 版本：v3.1
 """
 

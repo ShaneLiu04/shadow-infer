@@ -18,7 +18,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
-from shadowinfer.observability import _PROMETHEUS_AVAILABLE, MetricsRegistry
+from shadowinfer.observability import MetricsRegistry
 
 logger = logging.getLogger(__name__)
 

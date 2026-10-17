@@ -1,6 +1,6 @@
 """ShadowInfer 量化/反量化工具模块。
 
-对应 TECHNICAL_SPEC.md §2.1.2 和 §2.3.2 中的量化策略。
+对应 README.md《核心算法》中的量化策略。
 """
 
 __version__ = "3.0"
@@ -22,7 +22,7 @@ class Quantizer:
         """
         量化 tensor。
 
-        对应 TECHNICAL_SPEC.md §2.1.2:
+        对应 README.md《核心算法》量化策略:
         - FP32: 返回原 tensor
         - FP16: 转换为 half
         - INT8: per-channel 动态缩放

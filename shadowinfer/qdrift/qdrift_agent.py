@@ -1,6 +1,6 @@
 """QDrift Agent — Step-aware 调度策略专家。
 
-对应文档：QDRIFT_AGENT.md, TECHNICAL_SPEC.md §2.2 / §3.2
+对应文档：README.md《核心模块》Q-drift Agent
 版本：v3.0
 """
 
@@ -23,7 +23,7 @@ from shadowinfer.utils.metrics import Metrics
 class QDriftAgent(BaseAgent):
     """QDrift Agent — Step-aware 调度策略专家。
 
-    对应文档：QDRIFT_AGENT.md, TECHNICAL_SPEC.md §2.2 / §3.2
+    对应文档：README.md《核心模块》Q-drift Agent
     版本：v3.0
     """
 
@@ -265,7 +265,7 @@ class QDriftAgent(BaseAgent):
     ) -> float:
         """估计当前 step 对计算误差的敏感度。
 
-        算法（对应 QDRIFT_AGENT.md §核心算法 1）：
+        算法（对应 README.md《核心算法》Q-drift 调度矩阵 1）：
         1. progress = step_id / total_steps
         2. 基于 noise_schedule 计算基线敏感度：
            - linear: sensitivity = progress
@@ -336,7 +336,7 @@ class QDriftAgent(BaseAgent):
     ) -> float:
         """检测相邻 step 间的激活漂移。
 
-        算法（对应 QDRIFT_AGENT.md §核心算法 2）：
+        算法（对应 README.md《核心算法》Q-drift 调度矩阵 2）：
         - relative_l2:
             query_drift = ||Q_t - Q_{t-1}|| / ||Q_t||
             activation_drift = ||A_t - A_{t-1}|| / ||A_t||
@@ -408,7 +408,7 @@ class QDriftAgent(BaseAgent):
     ) -> Dict[str, str]:
         """生成调度决策。
 
-        对应 QDRIFT_AGENT.md 调度策略矩阵：
+        对应 README.md《核心算法》Q-drift 调度矩阵：
         | sensitivity | drift | shadowkv_mode | ffn_mode | 说明 |
         | < 0.3 | < 0.2 | aggressive | sparse | 低敏感度+低漂移 → 最大优化 |
         | < 0.3 | ≥ 0.2 | balanced | sparse | 低敏感度+漂移大 → 适度优化 |

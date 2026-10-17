@@ -7,12 +7,12 @@
 * 基于 ``EvictionPolicy`` 的显存预算强制（long-context 场景）
 * 基于 Q-drift 敏感度的预取缓冲区（prefetch buffer）
 
-对应文档：TECHNICAL_SPEC.md §3.1, SHADOWKV_AGENT.md, ROADMAP.md §ShadowKV
+对应文档：README.md《核心模块》《核心算法》章节
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -120,8 +120,6 @@ class KVCacheManager:
             return
 
         packed = entry.packed_kv
-        seq_len = packed.seq_len
-        num_heads = packed.num_heads
         head_dim = packed.head_dim
         batch_size = packed.batch_size
         # Rough per-token-head byte estimate (mixed precision average).
@@ -222,9 +220,12 @@ class KVCacheManager:
         return tensor.numel() * tensor.element_size()
 
     def __repr__(self) -> str:
+        budget_mb = (
+            self.memory_budget_bytes / (1024.0 * 1024.0) if self.memory_budget_bytes else None
+        )
         return (
             f"KVCacheManager(num_layers={self.num_layers}, "
             f"cached_layers={len(self.cache)}, "
             f"memory_mb={self.get_memory_usage_mb():.2f}, "
-            f"budget_mb={self.memory_budget_bytes / (1024.0 * 1024.0) if self.memory_budget_bytes else None})"
+            f"budget_mb={budget_mb})"
         )

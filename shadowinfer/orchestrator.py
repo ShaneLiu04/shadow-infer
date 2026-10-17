@@ -1,6 +1,6 @@
 """Orchestrator — 统一调度协调器。
 
-对应文档：AGENTS.md §2.1, ARCHITECTURE.md §4.1 / §4.2
+对应文档：README.md《架构设计》章节
 版本：v3.2.2
 """
 
@@ -56,7 +56,7 @@ class InferenceResult:
 class Orchestrator:
     """Orchestrator — 统一调度协调器。
 
-    对应文档：AGENTS.md §2.1, ARCHITECTURE.md §4.1 / §4.2, ROADMAP.md
+    对应文档：README.md《架构设计》章节, ROADMAP.md
     版本：v3.2.2
 
     职责：
@@ -543,7 +543,7 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         """运行基线推理（无优化）。
 
-        对应 ARCHITECTURE.md §4.2 的 Profiling Phase。
+        对应 README.md《架构设计》的 Profiling 阶段。
 
         Args:
             prompt: 输入提示文本（基线中仅用于记录）。
@@ -795,7 +795,7 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         """运行优化后的推理。
 
-        对应 ARCHITECTURE.md §4.2 的 Optimization Phase。
+        对应 README.md《架构设计》的 Optimization 阶段。
 
         Args:
             prompt: 输入提示文本。
@@ -1095,7 +1095,7 @@ class Orchestrator:
     ) -> None:
         """执行 StepState 所描述的单个 step。
 
-        对应 ARCHITECTURE.md §4.1 单 Step 执行流程。
+        对应 README.md《架构设计》单 Step 执行流程。
         """
         assert self.qdrift is not None
         assert self.shadowkv is not None
@@ -1117,6 +1117,7 @@ class Orchestrator:
         state.step_config = step_config
 
         # Safety net pre-flight check
+        safety_degraded = False
         if self.safety_net is not None:
             try:
                 can_proceed, reason = self.safety_net.pre_flight_check(
@@ -1131,6 +1132,7 @@ class Orchestrator:
                     )
                     step_config = self._degrade_to_conservative(step_config)
                     state.step_config = step_config
+                    safety_degraded = True
             except Exception as exc:
                 self.logger.log_alert(
                     "warning",
@@ -1140,6 +1142,7 @@ class Orchestrator:
                 )
                 step_config = self._degrade_to_conservative(step_config)
                 state.step_config = step_config
+                safety_degraded = True
 
         # 若使用真实后端，执行真实模型前向并将结果写回 inputs 供后续 Agent 使用
         if self._is_real_backend() and "_backend_input" in inputs:
@@ -1208,7 +1211,9 @@ class Orchestrator:
         conflicts = [a for a in alerts if a.get("level") in ("CRITICAL", "WARNING")]
 
         if any(a.get("level") == "CRITICAL" for a in alerts):
-            step_config = self._arbitrate_step_config(step_config, alerts)
+            step_config = self._arbitrate_step_config(
+                step_config, alerts, safety_degraded=safety_degraded
+            )
             state.step_config = step_config
 
         # Safety net post-flight check
@@ -1526,13 +1531,30 @@ class Orchestrator:
             }
         )
 
-    def _arbitrate_step_config(self, step_config: StepConfig, alerts: List[Dict]) -> StepConfig:
-        """冲突仲裁（对应 AGENTS.md §3.3）。
+    def _arbitrate_step_config(
+        self,
+        step_config: StepConfig,
+        alerts: List[Dict],
+        safety_degraded: bool = False,
+    ) -> StepConfig:
+        """冲突仲裁（对应 README.md《设计决策》Policy DSL）。
 
         Arbitration is driven by the declarative policy loaded in ``self.policy``.
         The bundled default policy replicates the previous hard-coded rules;
         users can override it via ``policy_path`` in their config.
+
+        当本 step 已被安全网降级（``safety_degraded=True``）时，安全网是最高优先级
+        机制，保守配置即为最保守可达状态，仲裁不得将其放宽，直接原样返回。
         """
+        if safety_degraded:
+            self.logger.log_alert(
+                "info",
+                f"Step {step_config.step_id}: Safety degradation active; "
+                "skip policy arbitration for this step.",
+                step_id=step_config.step_id,
+            )
+            return step_config
+
         shadowkv_mode = step_config.shadowkv_mode
         ffn_mode = step_config.ffn_mode
         modified = False
@@ -1897,7 +1919,7 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         """完整流水线：基线 + 优化 + 对比报告。
 
-        对应 ARCHITECTURE.md §4.2 端到端推理流程：
+        对应 README.md《架构设计》端到端推理流程：
         1. 初始化 Agent
         2. 运行基线（可选）
         3. 运行优化

@@ -5,7 +5,7 @@
     python -m shadowinfer optimize --model Fast-dLLM-v2-7B --config configs/optimize_full.yaml
     python -m shadowinfer serve --model Fast-dLLM-v2-7B --config configs/optimize_full.yaml
 
-对应文档：ARCHITECTURE.md §4.2 端到端推理流程
+对应文档：README.md《架构设计》端到端推理流程
 版本：v3.1
 """
 
@@ -291,7 +291,7 @@ def main():
 def run_profiler(args):
     """运行性能分析。
 
-    对应 ARCHITECTURE.md §4.2 Profiling Phase。
+    对应 README.md《架构设计》Profiling 阶段。
 
     Args:
         args: argparse 解析后的参数对象。
@@ -312,7 +312,7 @@ def run_profiler(args):
 def run_optimize(args):
     """运行优化推理。
 
-    对应 ARCHITECTURE.md §4.2 Optimization Phase。
+    对应 README.md《架构设计》Optimization 阶段。
 
     Args:
         args: argparse 解析后的参数对象。
@@ -334,7 +334,7 @@ def run_optimize(args):
 def run_compare(args):
     """对比基线和优化结果。
 
-    对应 ARCHITECTURE.md §4.2 对比验证阶段。
+    对应 README.md《架构设计》对比验证阶段。
 
     Args:
         args: argparse 解析后的参数对象。

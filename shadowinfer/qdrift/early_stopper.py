@@ -11,9 +11,8 @@ Version: 3.2.2
 from __future__ import annotations
 
 import logging
-import math
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F

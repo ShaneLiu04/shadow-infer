@@ -1,6 +1,6 @@
 """HTML 报告生成器。
 
-对应 PROFILER_AGENT.md 输出格式要求，生成包含图表和表格的可视化对比报告。
+对应 README.md《核心模块》Profiler Agent 输出格式要求，生成包含图表和表格的可视化对比报告。
 """
 
 import json

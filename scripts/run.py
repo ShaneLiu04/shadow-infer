@@ -7,7 +7,7 @@ run directly from the repository root without installing the package:
     python scripts/run.py optimize --model Fast-dLLM-v2-7B --config configs/optimize_full.yaml
     python scripts/run.py serve --model Fast-dLLM-v2-7B --config configs/optimize_full.yaml
 
-对应文档：ARCHITECTURE.md §4.2 端到端推理流程
+对应文档：README.md《架构设计》端到端推理流程
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 # Allow running scripts/run.py directly from the repo root without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shadowinfer.__main__ import main
+from shadowinfer.__main__ import main  # noqa: E402  (requires the sys.path tweak above)
 
 if __name__ == "__main__":
     main()

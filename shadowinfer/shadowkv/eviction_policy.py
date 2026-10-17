@@ -3,7 +3,7 @@
 When a ``KVCacheManager`` is configured with a ``memory_budget_bytes`` limit,
 an ``EvictionPolicy`` decides which ``(layer, token, head)`` entries to drop.
 
-对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1, ROADMAP.md §Importance-aware eviction
+对应文档：README.md《核心模块》ShadowKV Agent
 """
 
 from __future__ import annotations

@@ -1,11 +1,11 @@
 """ShadowInfer Core Module.
 
 Version: 3.0
-Corresponds to: TECHNICAL_SPEC.md v2.0
+Corresponds to: ShadowInfer spec (README.md)
 """
 
 __version__ = "3.0"
-__doc_version__ = "TECHNICAL_SPEC.md v2.0"
+__doc_version__ = "README.md v3"
 
 from .base_agent import AgentRegistry, BaseAgent
 from .bus import MESSAGE_TYPES, ProfilingBus

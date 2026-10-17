@@ -1,6 +1,6 @@
 """ShadowKV Agent — KV Cache 压缩与复用专家。
 
-对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1 / §3.2
+对应文档：README.md《核心模块》ShadowKV Agent
 版本：v3.0
 """
 
@@ -31,7 +31,7 @@ from .packed_kv_cache import PackedKVCache
 class ShadowKVAgent(BaseAgent):
     """ShadowKV Agent — KV Cache 压缩与复用专家。
 
-    对应文档：SHADOWKV_AGENT.md, TECHNICAL_SPEC.md §2.1 / §3.2
+    对应文档：README.md《核心模块》ShadowKV Agent
     版本：v3.0
     """
 
@@ -368,7 +368,7 @@ class ShadowKVAgent(BaseAgent):
         """
         计算 per-token-head 重要性分数。
 
-        算法（对应 SHADOWKV_AGENT.md §核心算法 1）：
+        算法（对应 README.md《核心算法》ShadowKV 分层压缩 1）：
         1. 取该 token 在当前 head 上的 attention 权重分布
         2. 计算 entropy（高 entropy → 关注范围广 → 高重要性）
         3. 层深度因子（浅层关注局部，深层关注语义）
@@ -401,7 +401,7 @@ class ShadowKVAgent(BaseAgent):
         """
         分配精度。
 
-        对应 SHADOWKV_AGENT.md 精度映射策略：
+        对应 README.md《核心算法》精度映射策略：
         - ≥ 0.8: FP32
         - 0.5 - 0.8: FP16
         - 0.2 - 0.5: INT8
@@ -468,7 +468,7 @@ class ShadowKVAgent(BaseAgent):
         """
         判断 KV 是否可复用。
 
-        算法（对应 SHADOWKV_AGENT.md §核心算法 3）：
+        算法（对应 README.md《核心算法》ShadowKV 分层压缩 3）：
         1. 计算 L2 变化幅度: delta_k = ||k_current - k_previous|| / ||k_current||
         2. 阈值动态调整：
            - aggressive: base=0.20, balanced: base=0.15, conservative: base=0.10
@@ -903,13 +903,7 @@ class ShadowKVAgent(BaseAgent):
             layer_id=layer_id,
         )
 
-        # Compute drift proxy: if no previous KV, assume low drift.
-        if kv_previous is not None:
-            drift_map = KVDecisionPlane.compute_drift_map(
-                kv_current["k"], kv_current["v"], kv_previous["k"], kv_previous["v"]
-            )
-        else:
-            drift_map = torch.zeros_like(importance_map)
+        # Reuse decisions rely on the Q-drift predicted drift score below.
 
         # Force conservative reuse under high predicted drift.
         if predicted_drift > 0.5:
@@ -927,8 +921,7 @@ class ShadowKVAgent(BaseAgent):
             importance_map=importance_map,
         )
 
-        # Copy reused token-heads into a staging PackedKVCache.
-        staged = packed_kv  # start from current packed cache
+        # Build a staging PackedKVCache for the prefetched entry.
         # Create a shallow copy by re-packing with the same precision map.
         precision_map = self.precision_map.get(layer_id, {})
         staged_result = PackedKVCache.pack(compressed_kv["k"], compressed_kv["v"], precision_map)

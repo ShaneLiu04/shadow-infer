@@ -1,16 +1,16 @@
 """ShadowInfer Configuration Management.
 
 Implements YAML configuration loader and nested access manager.
-Corresponds to TECHNICAL_SPEC.md §4 配置规范。
+Corresponds to the config spec in README.md.
 
 Version: 3.0
-Corresponds to: TECHNICAL_SPEC.md v2.0
+Corresponds to: ShadowInfer spec (README.md)
 """
 
 from __future__ import annotations
 
 __version__ = "3.0"
-__doc_version__ = "TECHNICAL_SPEC.md v2.0"
+__doc_version__ = "README.md v3"
 
 import os
 from typing import Any, Dict, Optional
@@ -21,7 +21,7 @@ import yaml
 def load_config(path: str) -> dict:
     """加载 YAML 配置文件并返回原始字典。
 
-    对应 TECHNICAL_SPEC.md §4 配置规范 — 配置加载基础函数。
+    对应 README.md 配置规范 — 配置加载基础函数。
 
     Args:
         path: YAML 配置文件的绝对路径或相对路径。
@@ -41,7 +41,7 @@ def load_config(path: str) -> dict:
 class Config:
     """配置管理类，支持嵌套属性访问与字典式访问。
 
-    对应 TECHNICAL_SPEC.md §4 配置规范 — 统一配置访问接口。
+    对应 README.md 配置规范 — 统一配置访问接口。
 
     特性：
         - 支持点号属性访问：``config.shadowkv.enabled``
@@ -106,7 +106,7 @@ class Config:
     def get(self, key: str, default: Any = None) -> Any:
         """支持带默认值的字典式访问，包括点号分隔的嵌套访问。
 
-        对应 TECHNICAL_SPEC.md §4 配置规范 — 字典式访问接口。
+        对应 README.md 配置规范 — 字典式访问接口。
 
         支持点号分隔键：``config.get("shadowkv.enabled", False)`` 会遍历
         嵌套 Config 并返回 ``enabled`` 的值。若任意中间键不存在，返回 default。
@@ -135,15 +135,15 @@ class Config:
         return current
 
     def keys(self):
-        """返回所有顶层键名。对应 TECHNICAL_SPEC.md §4 配置规范。"""
+        """返回所有顶层键名。对应 README.md 配置规范。"""
         return self._data.keys()
 
     def values(self):
-        """返回所有顶层值。对应 TECHNICAL_SPEC.md §4 配置规范。"""
+        """返回所有顶层值。对应 README.md 配置规范。"""
         return self._data.values()
 
     def items(self):
-        """返回所有顶层键值对。对应 TECHNICAL_SPEC.md §4 配置规范。"""
+        """返回所有顶层键值对。对应 README.md 配置规范。"""
         return self._data.items()
 
     # ------------------------------------------------------------------
@@ -184,7 +184,7 @@ class Config:
     def to_dict(self) -> Dict[str, Any]:
         """将 Config 递归展开为原始字典。
 
-        对应 TECHNICAL_SPEC.md §4 配置规范 — 配置序列化接口。
+        对应 README.md 配置规范 — 配置序列化接口。
 
         Returns:
             完全展开后的普通 Python 字典，可用于序列化或外部库消费。
@@ -205,7 +205,7 @@ class Config:
     def from_yaml(cls, path: str) -> "Config":
         """从 YAML 文件加载并返回 Config 实例。
 
-        对应 TECHNICAL_SPEC.md §4 配置规范 — YAML 配置加载入口。
+        对应 README.md 配置规范 — YAML 配置加载入口。
 
         Args:
             path: YAML 文件路径。
@@ -220,7 +220,7 @@ class Config:
     def load_defaults(cls, configs_dir: Optional[str] = None) -> Dict[str, "Config"]:
         """预先加载 ``configs/`` 目录下的默认配置模板。
 
-        对应 TECHNICAL_SPEC.md §4.1 ~ §4.3 中定义的默认配置。
+        对应 README.md 中定义的默认配置。
 
         默认加载以下文件：
             - ``configs/model_fast_dllm_7b.yaml``
@@ -262,7 +262,7 @@ class Config:
     def get_default(cls, name: str) -> "Config":
         """获取已加载的默认配置。
 
-        对应 TECHNICAL_SPEC.md §4 配置规范 — 默认配置访问接口。
+        对应 README.md 配置规范 — 默认配置访问接口。
 
         Args:
             name: 默认配置标识（如 ``model_fast_dllm_7b``、``optimize_full``、
@@ -279,5 +279,5 @@ class Config:
         return cls._default_configs[name]
 
     def __repr__(self) -> str:
-        """返回 Config 实例的 repr 字符串。对应 TECHNICAL_SPEC.md §4 配置规范。"""
+        """返回 Config 实例的 repr 字符串。对应 README.md 配置规范。"""
         return f"{type(self).__name__}({self._data!r})"

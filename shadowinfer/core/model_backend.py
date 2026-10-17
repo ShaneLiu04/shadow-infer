@@ -1,6 +1,6 @@
 """ModelBackend — Diffusion LLM 推理后端抽象。
 
-对应文档：ARCHITECTURE.md §5.2, ROADMAP.md §3.2
+对应文档：README.md《模型后端》章节, ROADMAP.md §3.2
 版本：v3.1
 """
 

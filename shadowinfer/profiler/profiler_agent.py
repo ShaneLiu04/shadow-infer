@@ -1,6 +1,6 @@
 """Profiler Agent — 性能分析专家。
 
-对应文档：PROFILER_AGENT.md, TECHNICAL_SPEC.md §3.2
+对应文档：README.md《核心模块》Profiler Agent
 版本：v3.0
 """
 
@@ -27,7 +27,7 @@ from .reporter import HTMLReporter
 class ProfilerAgent(BaseAgent):
     """Profiler Agent — 性能分析专家。
 
-    对应文档：PROFILER_AGENT.md, TECHNICAL_SPEC.md §3.2
+    对应文档：README.md《核心模块》Profiler Agent
     版本：v3.0
     """
 
@@ -580,7 +580,7 @@ class ProfilerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _check_alerts(self, metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检查告警条件。对应 PROFILER_AGENT.md 中告警规则。
+        """检查告警条件。对应 README.md《核心模块》Profiler Agent 告警规则。
 
         检查项：
         1. accuracy_warning (>0.5%)
@@ -928,7 +928,7 @@ class ProfilerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _aggregate_step_data(self) -> Dict[str, Any]:
-        """聚合所有 step 数据为优化数据字典（匹配 ARCHITECTURE.md §2.1 输出格式）。"""
+        """聚合所有 step 数据为优化数据字典（匹配 README.md《核心模块》Profiler 输出格式）。"""
         all_alerts = []
         for alerts in self._alerts_per_step.values():
             all_alerts.extend(alerts)
