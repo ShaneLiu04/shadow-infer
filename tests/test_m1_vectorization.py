@@ -264,8 +264,18 @@ class TestM1Vectorization:
         self._assert_compress_results_equal(result_vec, result_ref)
 
     def test_compress_kv_fallback(self, mock_config, monkeypatch):
-        """向量化路径抛异常时 compress_kv 回退 reference 且结果正确。"""
+        """向量化路径抛异常时 compress_kv 回退 reference 且结果正确。
+
+        异常回退须记录 error 级告警（design 6.4 异常场景：张量路径
+        失败 → log_alert error + reference 兜底）。
+        """
         agent = ShadowKVAgent(config=mock_config)
+        alerts = []
+        monkeypatch.setattr(
+            agent.logger,
+            "log_alert",
+            lambda level, msg, **kw: alerts.append((level, msg)),
+        )
         torch.manual_seed(5)
         heads, seq_len, head_dim = 4, 8, 64
         k_current = torch.randn(1, heads, seq_len, head_dim)
@@ -284,6 +294,10 @@ class TestM1Vectorization:
         assert set(result["scale_k_map"].keys()) == set(expected["scale_k_map"].keys())
         assert result["compression_ratio"] == expected["compression_ratio"]
         assert result["memory_mb"] == expected["memory_mb"]
+        # 异常回退记录 error 级告警
+        assert len(alerts) == 1
+        assert alerts[0][0] == "error"
+        assert "vectorized" in alerts[0][1] or "fallback" in alerts[0][1].lower()
 
     def test_packed_pack_golden(self):
         """_do_pack 打包结构、内存字节数与 unpack 还原一致性。

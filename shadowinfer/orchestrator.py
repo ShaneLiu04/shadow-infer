@@ -668,7 +668,11 @@ class Orchestrator:
             }
 
             perf_data = {
-                "latency_ms": 0.0,
+                # AR002 M6：喂给 profiler 的基线延迟为真实测量值
+                # （step 截至此的真实耗时，含张量仿真与指标构建；
+                # profiler.on_step 自身耗时计入报告的 step_latency，
+                # 不计入喂给它的 perf_data，避免自引用）
+                "latency_ms": (time.perf_counter() - step_start) * 1000.0,
                 "memory_mb": kv_metrics["memory_mb"],
                 "gpu_utilization": 0.0,
                 "tokens_per_sec": 0.0,

@@ -47,10 +47,12 @@ AR001 审计与端到端实测（6-step CPU：基线 31.3ms、优化 1782.8ms，
 **期望行为：**
 - step 执行路径以 `time.perf_counter` 计量真实延迟并写入 perf_data.latency_ms（替换 orchestrator.py:1456-1463 的零值）；
 - memory_mb 与进程 RSS（或 torch 内存统计，取可行者）对账，偏差超过阈值时记录告警日志；
+  - 口径修订（design 门控已批准，T010 Review 补记）：对账口径收窄为**张量级字节对账**——compress_kv 输出 `uncompressed_bytes`/`compressed_bytes`，memory_mb = (未压缩-压缩后)/MB，可与 `_estimate_compressed_bytes` 估算直接对账；进程 RSS 对账不可行（分配器缓存/碎片/同进程其他张量使 RSS 偏差远超任何有意义阈值，Windows 工作集语义亦不同），阈值告警列为 M7/AR003 候选；
 - 调度器奖励函数消费真实 latency_ms（零延迟吃奖励的缺陷修复，scheduler.py:70-72 附近）；
 - benchmarks 中硬编码的 ~3x mock 加速断言改为以实测数据断言（或删除该断言并注明原因）。
 
 **异常处理：** 计时器异常时回退为 0.0 并记录 warning 级结构化日志（不中断推理）。
+（T010 Review 豁免论证：`time.perf_counter` 为单调计数器读取，无异常失败模式，try/except 防护无实际可达路径；张量路径异常已有 error 告警 + reference 兜底并测试覆盖。）
 
 **验收标准：**
 - Given 一次 6-step CPU 流水线, When 运行完成, Then 报告中 step_latency_ms > 0 且与外部墙钟测量误差 < 2%；调度器奖励随真实延迟变化。

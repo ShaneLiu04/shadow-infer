@@ -20,7 +20,7 @@
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | passing | 2026-10-17 完成；详见进度记录 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | passing | 2026-10-17 完成：4 次实测 1.585-1.639（中位 1.61），落入 design 4.1 授权兜底区 (1.5, 2.5]，按兜底路径结案（杠杆已全部在下限，残余瓶颈为 FFN 支线 AR003 范围）；详见 baseline-profile.md §8 |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | passing | 2026-10-17 完成；详见进度记录 |
-| T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | pending | |
+| T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | in_progress | Review PASS（2026-10-17，2 项 Minor 当轮处置）；ST 待执行 |
 | T011 | 按 Runbook 推送 Gitee（小批量多次；三核验；远端无 AGENTS.md 确认） | T010 | pending | FR3.6 |
 
 ## 状态说明
@@ -138,3 +138,19 @@
   - 结构与口径：核心算法章节补张量化与混合公式口径；TOC 无新增章节；测试数以当次实跑为准；无 emoji；失效引用零残留（v3.3.0 历史条目自身数字属正确历史记录保留）
 - ROADMAP 同步：Current State 测试数更新（630/81.68%）；CPU 向量化项标记完成（v3.4.0 数据）；新增 FFN unpack 向量化缺口条目（残余瓶颈，§2 与 §3.5）；Success Metrics 覆盖率更新
 - 质量门禁：五件套复跑全绿（630 passed / 1 skipped / 81.68%）
+
+## Review 记录
+
+### 2026-10-17 审查记录（T010 前半）
+
+- 审查方式：独立只读子代理，S/D/C 三维度全量审查（S1-S5 / D1-D4 / C1-C3）
+- 审查结果：PASS（第 1 轮，无 Critical/Important；2 项 Minor 当轮处置）
+- S 维度：S2/S3/S4 全部通过（FR→测试映射完备：FR3.1→test_m6_metrics+benchmark 契约、FR3.2→test_m1_vectorization、FR3.3→test_m5_memoization、FR3.4→test_qdrift TestComputeSensitivity、FR3.5→README 四检查点）；S1/S5 的 Minor 缺口当轮修复/豁免（见下）
+- D 维度：全部通过（接口签名/混合公式/缓存策略/memory_mb 口径/f64 精度/int4 预存缺陷 bug-for-bug 记录在案；参数顺序无害偏差为新增可选关键字参数）
+- C 维度：全部通过（__all__ 零删除、签名未变、分层未破坏、版本三处同步）
+- Minor 处置（confirm_mode=auto）：
+  1. FR3.1「RSS 对账告警」未落地 → srs.md §3.1 补记口径修订（张量级字节对账已实现：uncompressed_bytes/compressed_bytes 可与估算直接对账；RSS 不可行性论证；阈值告警列 M7/AR003 候选）——豁免
+  2. run_baseline perf_data.latency_ms 仍为 0.0 → 已修复（orchestrator.py run_baseline 计次喂真实耗时，profiler 不再吃零值）
+  3. compress_kv 回退分支 log_alert("error") 无断言 → 已修复（test_compress_kv_fallback 增补告警级别与内容断言）
+  4. design 6.4「计时器异常回退」→ 豁免论证补记于 srs.md §3.1（perf_counter 为单调计数器，无异常失败路径；张量路径异常已有 error 告警 + reference 兜底并测试覆盖）
+- 修复后复验：630 passed / 1 skipped，五件套全绿
