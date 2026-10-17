@@ -6,12 +6,30 @@ import json
 import logging
 import tempfile
 
+import pytest
+
+import shadowinfer.utils.logging_utils as _logging_utils_module
 from shadowinfer.utils.logging_utils import (
     StructuredLogger,
     configure_shadowinfer_logging,
     get_structured_loggers,
     set_default_shadowinfer_processors,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_global_logging_state():
+    """快照并恢复模块级全局日志状态。
+
+    configure_shadowinfer_logging 会写入 _GLOBAL_LEVEL / _GLOBAL_ROTATION
+    且 level=None 不复位；不恢复会污染同进程后续测试创建的 logger
+    （如 test_m6_metrics 依赖 INFO 级 metric 记录）。
+    """
+    saved_level = _logging_utils_module._GLOBAL_LEVEL
+    saved_rotation = _logging_utils_module._GLOBAL_ROTATION
+    yield
+    _logging_utils_module._GLOBAL_LEVEL = saved_level
+    _logging_utils_module._GLOBAL_ROTATION = saved_rotation
 
 
 class TestStructuredLogger:

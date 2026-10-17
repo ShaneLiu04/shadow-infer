@@ -50,6 +50,41 @@ class Quantizer:
             raise ValueError(f"Unsupported precision: {precision}")
 
     @staticmethod
+    def quantize_batch(
+        tensor_2d: torch.Tensor,
+        precision: str,
+        group_size: int = 64,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        批量量化 2D 张量（AR002 M1 热路径向量化）。
+
+        语义与逐行调用 quantize_tensor(tensor_2d[i:i+1], precision) 完全一致：
+        - FP32: 返回原 tensor
+        - FP16: 转换为 half
+        - INT8: 每行 per-channel 缩放，scale 形状 (N, 1)
+        - INT4: 每行分组量化，scale 形状 (N, num_groups, 1)
+
+        Args:
+            tensor_2d: 待量化张量，形状 (N, D)。
+            precision: 目标精度，"fp32" / "fp16" / "int8" / "int4"。
+            group_size: INT4 分组大小，默认 64。
+
+        Returns:
+            (quantized_tensor, scale)，scale 仅在 int8 / int4 时非 None。
+        """
+        p = precision.lower()
+        if p == "fp32":
+            return tensor_2d, None
+        elif p == "fp16":
+            return tensor_2d.half(), None
+        elif p == "int8":
+            return Quantizer.quantize_int8(tensor_2d)
+        elif p == "int4":
+            return Quantizer.quantize_int4(tensor_2d, group_size=group_size)
+        else:
+            raise ValueError(f"Unsupported precision: {precision}")
+
+    @staticmethod
     def dequantize_tensor(
         quantized: torch.Tensor,
         scale: Optional[torch.Tensor],

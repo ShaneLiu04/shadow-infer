@@ -170,15 +170,11 @@ class ShadowKVAgent(BaseAgent):
             # 增加压缩率但保留 top 20% head 为 FP16
             mode = "balanced"
 
-        # Step 2: 计算重要性分数
+        # Step 2: 计算重要性分数（AR002 M1：向量化整矩阵计算）
         batch_size, num_heads, seq_len, _ = attention_scores.shape
-        importance_map = torch.zeros((seq_len, num_heads), device=attention_scores.device)
-
-        for token_idx in range(seq_len):
-            for head_idx in range(num_heads):
-                importance_map[token_idx, head_idx] = self.compute_importance_score(
-                    attention_scores, token_idx, head_idx, layer_id, self.num_layers
-                )
+        importance_map = self._compute_importance_matrix(
+            attention_scores, layer_id, self.num_layers
+        )
 
         # 记录历史
         if layer_id not in self.importance_history:
@@ -395,6 +391,51 @@ class ShadowKVAgent(BaseAgent):
         score = normalized_entropy * layer_factor * pos_factor
         return float(min(score, 1.0))
 
+    def _compute_importance_matrix(
+        self,
+        attention_scores: torch.Tensor,
+        layer_index: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        """
+        向量化计算全 (token, head) 重要性矩阵（AR002 M1）。
+
+        与逐元素调用 compute_importance_score 语义逐元素一致（容差 1e-6）：
+        - weights = softmax(attention_scores, dim=-1)（保留双重 softmax 现状）
+        - entropy 复刻 Metrics.compute_entropy 语义：clamp(min=1e-10) 后
+          对全部 (batch, seq_k) 元素重归一化，再取 -sum(p*log p) 标量
+        - normalized_entropy / log(seq_k)，乘层因子与位置因子，clamp(max=1)
+
+        非方形输入口径（与 reference 一致）：attention_scores 形状
+        (batch, heads, seq_q, seq_k) 时，token 维度为 seq_q（shape[2]），
+        而归一化与位置阈值均以 seq_k（shape[-1]）为基准。
+        """
+        num_query = attention_scores.shape[2]
+        seq_len = attention_scores.shape[-1]
+        log_seq = math.log(seq_len)
+        if log_seq == 0.0:
+            raise ZeroDivisionError("float division by zero")
+
+        weights = F.softmax(attention_scores, dim=-1)
+        clamped = weights.clamp(min=1e-10)
+        denom = clamped.sum(dim=(0, 3))
+        probs = clamped / denom.unsqueeze(0).unsqueeze(-1)
+        entropy = -(probs * torch.log(probs)).sum(dim=(0, 3))
+        normalized_entropy = entropy / log_seq
+
+        layer_factor = 1.0 + 0.1 * (layer_index / max(num_layers, 1))
+
+        pos_factor = torch.ones(
+            num_query, dtype=attention_scores.dtype, device=attention_scores.device
+        )
+        pos_factor[:5] = 1.2
+        pos_start = max(seq_len - 4, 0)
+        if pos_start < num_query:
+            pos_factor[pos_start:] = 1.2
+
+        scores = normalized_entropy.t() * pos_factor.unsqueeze(1) * layer_factor
+        return scores.clamp(max=1.0).float()
+
     def allocate_precision(
         self, importance_map: torch.Tensor, mode: str
     ) -> Dict[int, Dict[int, str]]:
@@ -413,6 +454,57 @@ class ShadowKVAgent(BaseAgent):
 
         aggressive 模式下阈值降低 0.1（更激进），conservative 模式下提高 0.1。
         """
+        mode_adjustment = {
+            "aggressive": -0.1,
+            "balanced": 0.0,
+            "conservative": 0.1,
+        }.get(mode, 0.0)
+
+        thresholds = {
+            "fp32": max(0.0, 0.8 + mode_adjustment),
+            "fp16": max(0.0, 0.5 + mode_adjustment),
+            "int8": max(0.0, 0.2 + mode_adjustment),
+            "int4": 0.0,
+        }
+
+        if isinstance(importance_map, dict):
+            return self._allocate_precision_reference(importance_map, mode)
+
+        seq_len = importance_map.shape[0]
+        num_heads = importance_map.shape[1]
+
+        scores = importance_map.detach().cpu().double()
+
+        code = torch.where(
+            scores >= thresholds["fp32"],
+            torch.full_like(scores, 3.0),
+            torch.where(
+                scores >= thresholds["fp16"],
+                torch.full_like(scores, 2.0),
+                torch.where(
+                    scores >= thresholds["int8"],
+                    torch.full_like(scores, 1.0),
+                    torch.zeros_like(scores),
+                ),
+            ),
+        )
+
+        code_names = {0: "int4", 1: "int8", 2: "fp16", 3: "fp32"}
+        precision_map: Dict[int, Dict[int, str]] = {}
+        code_list = code.to(torch.int32).tolist()
+        for token_idx in range(seq_len):
+            token_map: Dict[int, str] = {}
+            row = code_list[token_idx]
+            for head_idx in range(num_heads):
+                token_map[head_idx] = code_names[row[head_idx]]
+            precision_map[token_idx] = token_map
+
+        return precision_map
+
+    def _allocate_precision_reference(
+        self, importance_map: Any, mode: str
+    ) -> Dict[int, Dict[int, str]]:
+        """原逐元素循环实现（golden 基准 / dict 输入路径）。"""
         mode_adjustment = {
             "aggressive": -0.1,
             "balanced": 0.0,
@@ -573,6 +665,77 @@ class ShadowKVAgent(BaseAgent):
         adaptive_threshold = base_threshold * (1.0 - 0.5 * progress)
         effective_threshold = adaptive_threshold * (1.0 - qdrift_drift_score * 0.3)
 
+        # 3. 向量化逐 (token, head) 阈值比较（AR002 M1）：
+        #    float64 精确复刻逐元素 float()/python 浮点比较语义
+        delta64 = delta_map.double()  # [num_heads, seq_len]
+        importance64 = importance_map.detach().cpu().double().clamp(0.0, 1.0)  # [seq, heads]
+        threshold = effective_threshold * (1.0 - 0.3 * importance64)
+        threshold = torch.clamp(threshold, min=1e-5)
+        mask = delta64.t() < threshold  # [seq_len, num_heads]
+
+        per_token_reused = mask.sum(dim=1)
+        full_reuse_count = int((per_token_reused == num_heads).sum().item())
+        no_reuse_count = int((per_token_reused == 0).sum().item())
+        partial_reuse_count = seq_len - full_reuse_count - no_reuse_count
+        reused_entries = int(mask.sum().item())
+        total_entries = seq_len * num_heads
+
+        reuse_mask: Dict[Tuple[int, int], bool] = {}
+        mask_list = mask.tolist()
+        for token_idx in range(seq_len):
+            row = mask_list[token_idx]
+            for head_idx in range(num_heads):
+                reuse_mask[(token_idx, head_idx)] = bool(row[head_idx])
+
+        reuse_ratio = reused_entries / max(total_entries, 1)
+
+        stats = {
+            "full_reuse_count": float(full_reuse_count),
+            "partial_reuse_count": float(partial_reuse_count),
+            "no_reuse_count": float(no_reuse_count),
+            "reuse_ratio": float(reuse_ratio),
+        }
+
+        return reuse_mask, stats
+
+    def _decide_reuse_per_token_reference(
+        self,
+        kv_current_k: torch.Tensor,
+        kv_current_v: torch.Tensor,
+        kv_previous_k: torch.Tensor,
+        kv_previous_v: torch.Tensor,
+        step_id: int,
+        total_steps: int,
+        qdrift_drift_score: float,
+        mode: str,
+        importance_map: torch.Tensor,
+    ) -> Tuple[Dict[Tuple[int, int], bool], Dict[str, float]]:
+        """原逐元素循环实现（golden 基准）。"""
+        batch_size, num_heads, seq_len, head_dim = kv_current_k.shape
+
+        # 1. 计算每个 head/token 的相对 L2 漂移
+        diff_k = kv_current_k - kv_previous_k
+        diff_v = kv_current_v - kv_previous_v
+        norm_diff_k = torch.norm(diff_k, dim=(0, 3))
+        norm_diff_v = torch.norm(diff_v, dim=(0, 3))
+        norm_cur_k = torch.norm(kv_current_k, dim=(0, 3)) + 1e-8
+        norm_cur_v = torch.norm(kv_current_v, dim=(0, 3)) + 1e-8
+
+        delta_k = norm_diff_k / norm_cur_k
+        delta_v = norm_diff_v / norm_cur_v
+        delta_map = ((delta_k + delta_v) / 2.0).detach().cpu()  # [num_heads, seq_len]
+
+        # 2. 动态阈值
+        progress = step_id / max(total_steps, 1)
+        base_threshold = {
+            "aggressive": 0.20,
+            "balanced": 0.15,
+            "conservative": 0.10,
+        }.get(mode, 0.15)
+
+        adaptive_threshold = base_threshold * (1.0 - 0.5 * progress)
+        effective_threshold = adaptive_threshold * (1.0 - qdrift_drift_score * 0.3)
+
         reuse_mask: Dict[Tuple[int, int], bool] = {}
         full_reuse_count = 0
         partial_reuse_count = 0
@@ -701,13 +864,6 @@ class ShadowKVAgent(BaseAgent):
         v_tensor = kv_current["v"]
         batch_size, num_heads, seq_len, head_dim = k_tensor.shape
 
-        # 初始化输出
-        k_out = torch.zeros_like(k_tensor)
-        v_out = torch.zeros_like(v_tensor)
-
-        scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
-        scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
-
         # 解析复用掩码（新格式优先）
         effective_reuse_mask: Optional[Dict[Tuple[int, int], bool]] = None
         if reuse_mask is not None:
@@ -715,42 +871,38 @@ class ShadowKVAgent(BaseAgent):
         elif reuse_decision is not None and "reuse_mask" in reuse_decision:
             effective_reuse_mask = reuse_decision["reuse_mask"]
 
-        # 旧格式回退：全局 reused_heads
-        reused_heads: Set[int] = set()
+        # 旧格式回退：全局 reused_heads 展开为逐 (token, head) 掩码
         if effective_reuse_mask is None and reuse_decision is not None:
             if reuse_decision.get("should_reuse", False):
-                reused_heads = set(reuse_decision.get("reused_heads", []))
+                reused_head_set: Set[int] = set(reuse_decision.get("reused_heads", []))
+                if reused_head_set:
+                    effective_reuse_mask = {
+                        (token_idx, head_idx): head_idx in reused_head_set
+                        for token_idx in range(seq_len)
+                        for head_idx in range(num_heads)
+                    }
 
-        # 逐 token/head 处理
-        for token_idx in range(seq_len):
-            token_precision = precision_map.get(token_idx, {})
-            for head_idx in range(num_heads):
-                precision = token_precision.get(head_idx, "fp16")
+        k_prev = kv_previous["k"] if kv_previous is not None else None
+        v_prev = kv_previous["v"] if kv_previous is not None else None
 
-                should_reuse = False
-                if effective_reuse_mask is not None:
-                    should_reuse = effective_reuse_mask.get((token_idx, head_idx), False)
-                elif head_idx in reused_heads:
-                    should_reuse = True
+        # 热路径核心（AR002 M1）：向量化主路径，异常时回退 reference
+        try:
+            core = self._compress_kv_vectorized(
+                k_tensor, v_tensor, k_prev, v_prev, precision_map, effective_reuse_mask
+            )
+        except Exception as exc:
+            self.logger.log_alert(
+                "error",
+                f"vectorized compress_kv failed, falling back to reference: {exc}",
+            )
+            core = self._compress_kv_reference(
+                k_tensor, v_tensor, k_prev, v_prev, precision_map, effective_reuse_mask
+            )
 
-                if should_reuse and kv_previous is not None:
-                    # 复用旧值
-                    k_out[:, head_idx, token_idx, :] = kv_previous["k"][:, head_idx, token_idx, :]
-                    v_out[:, head_idx, token_idx, :] = kv_previous["v"][:, head_idx, token_idx, :]
-                    continue
-
-                # 量化当前值
-                k_slice = k_tensor[:, head_idx, token_idx, :]
-                v_slice = v_tensor[:, head_idx, token_idx, :]
-
-                k_quantized, scale_k = Quantizer.quantize_tensor(k_slice.unsqueeze(0), precision)
-                v_quantized, scale_v = Quantizer.quantize_tensor(v_slice.unsqueeze(0), precision)
-
-                k_out[:, head_idx, token_idx, :] = k_quantized.squeeze(0)
-                v_out[:, head_idx, token_idx, :] = v_quantized.squeeze(0)
-
-                scale_k_map[(token_idx, head_idx)] = scale_k
-                scale_v_map[(token_idx, head_idx)] = scale_v
+        k_out = core["k"]
+        v_out = core["v"]
+        scale_k_map = core["scale_k_map"]
+        scale_v_map = core["scale_v_map"]
 
         # 计算压缩比
         original_bytes = (
@@ -789,6 +941,157 @@ class ShadowKVAgent(BaseAgent):
         self._compression_stats["step_count"] += 1
 
         return result
+
+    def _compress_kv_vectorized(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_prev: Optional[torch.Tensor],
+        v_prev: Optional[torch.Tensor],
+        precision_map: Dict[int, Dict[int, str]],
+        reuse_mask: Optional[Dict[Tuple[int, int], bool]],
+    ) -> Dict[str, Any]:
+        """
+        向量化压缩核心（AR002 M1）。
+
+        与 _compress_kv_reference 逐元素等价：
+        - 按精度分组，advanced indexing 批量取 (N, batch, head_dim) 后整组量化
+        - 复用条目批量拷贝自 k_prev/v_prev
+        - int8/int4 的整数码与 per-entry scale 与 reference bitwise 一致
+
+        已知包络差异（预存缺陷，文档记录）：reference 的 int4 写回依赖
+        (batch, g, gs) 向 (batch, head_dim) 的赋值，仅在 batch==1 且
+        g==1（head_dim==group_size=64）时成立，其余情形 RuntimeError；
+        本路径统一 reshape(N, batch, head_dim) 写回，在 reference 可用的
+        包络内 bitwise 一致，其余情形按语义意图产出。
+        """
+        batch_size, num_heads, seq_len, head_dim = k_tensor.shape
+        k_out = torch.zeros_like(k_tensor)
+        v_out = torch.zeros_like(v_tensor)
+        scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+        scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+
+        groups: Dict[str, List[Tuple[int, int]]] = {
+            "fp32": [],
+            "fp16": [],
+            "int8": [],
+            "int4": [],
+        }
+        reuse_ts: List[int] = []
+        reuse_hs: List[int] = []
+
+        for token_idx in range(seq_len):
+            token_precision = precision_map.get(token_idx, {})
+            for head_idx in range(num_heads):
+                precision = token_precision.get(head_idx, "fp16")
+                p = precision.lower() if hasattr(precision, "lower") else precision
+                if p not in groups:
+                    raise ValueError(f"Unsupported precision: {precision}")
+                if (
+                    reuse_mask is not None
+                    and reuse_mask.get((token_idx, head_idx), False)
+                    and k_prev is not None
+                ):
+                    reuse_ts.append(token_idx)
+                    reuse_hs.append(head_idx)
+                else:
+                    groups[p].append((token_idx, head_idx))
+
+        device = k_tensor.device
+
+        if reuse_ts:
+            h_idx = torch.tensor(reuse_hs, dtype=torch.long, device=device)
+            t_idx = torch.tensor(reuse_ts, dtype=torch.long, device=device)
+            k_out[:, h_idx, t_idx, :] = k_prev[:, h_idx, t_idx, :]
+            v_out[:, h_idx, t_idx, :] = v_prev[:, h_idx, t_idx, :]
+
+        for precision, entries in groups.items():
+            if not entries:
+                continue
+
+            h_idx = torch.tensor([h for _, h in entries], dtype=torch.long, device=device)
+            t_idx = torch.tensor([t for t, _ in entries], dtype=torch.long, device=device)
+            k_group = k_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)  # (N, batch, head_dim)
+            v_group = v_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)
+
+            if precision in ("fp32", "fp16"):
+                k_quantized = k_group if precision == "fp32" else k_group.half()
+                v_quantized = v_group if precision == "fp32" else v_group.half()
+                k_out[:, h_idx, t_idx, :] = k_quantized.permute(1, 0, 2).to(k_out.dtype)
+                v_out[:, h_idx, t_idx, :] = v_quantized.permute(1, 0, 2).to(v_out.dtype)
+                for token_idx, head_idx in entries:
+                    scale_k_map[(token_idx, head_idx)] = None
+                    scale_v_map[(token_idx, head_idx)] = None
+            else:
+                if precision == "int8":
+                    qk, sk = Quantizer.quantize_int8(k_group)
+                    qv, sv = Quantizer.quantize_int8(v_group)
+                else:
+                    qk, sk = Quantizer.quantize_int4(k_group)
+                    qv, sv = Quantizer.quantize_int4(v_group)
+                k_codes = qk.reshape(qk.shape[0], batch_size, head_dim).permute(1, 0, 2)
+                v_codes = qv.reshape(qv.shape[0], batch_size, head_dim).permute(1, 0, 2)
+                k_out[:, h_idx, t_idx, :] = k_codes.to(k_out.dtype)
+                v_out[:, h_idx, t_idx, :] = v_codes.to(v_out.dtype)
+                for n, (token_idx, head_idx) in enumerate(entries):
+                    scale_k_map[(token_idx, head_idx)] = sk[n : n + 1]
+                    scale_v_map[(token_idx, head_idx)] = sv[n : n + 1]
+
+        return {
+            "k": k_out,
+            "v": v_out,
+            "scale_k_map": scale_k_map,
+            "scale_v_map": scale_v_map,
+        }
+
+    def _compress_kv_reference(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_prev: Optional[torch.Tensor],
+        v_prev: Optional[torch.Tensor],
+        precision_map: Dict[int, Dict[int, str]],
+        reuse_mask: Optional[Dict[Tuple[int, int], bool]],
+    ) -> Dict[str, Any]:
+        """原逐元素循环实现（golden 基准 / 异常回退路径）。"""
+        batch_size, num_heads, seq_len, head_dim = k_tensor.shape
+        k_out = torch.zeros_like(k_tensor)
+        v_out = torch.zeros_like(v_tensor)
+        scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+        scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+
+        for token_idx in range(seq_len):
+            token_precision = precision_map.get(token_idx, {})
+            for head_idx in range(num_heads):
+                precision = token_precision.get(head_idx, "fp16")
+
+                should_reuse = False
+                if reuse_mask is not None:
+                    should_reuse = reuse_mask.get((token_idx, head_idx), False)
+
+                if should_reuse and k_prev is not None:
+                    k_out[:, head_idx, token_idx, :] = k_prev[:, head_idx, token_idx, :]
+                    v_out[:, head_idx, token_idx, :] = v_prev[:, head_idx, token_idx, :]
+                    continue
+
+                k_slice = k_tensor[:, head_idx, token_idx, :]
+                v_slice = v_tensor[:, head_idx, token_idx, :]
+
+                k_quantized, scale_k = Quantizer.quantize_tensor(k_slice.unsqueeze(0), precision)
+                v_quantized, scale_v = Quantizer.quantize_tensor(v_slice.unsqueeze(0), precision)
+
+                k_out[:, head_idx, token_idx, :] = k_quantized.squeeze(0)
+                v_out[:, head_idx, token_idx, :] = v_quantized.squeeze(0)
+
+                scale_k_map[(token_idx, head_idx)] = scale_k
+                scale_v_map[(token_idx, head_idx)] = scale_v
+
+        return {
+            "k": k_out,
+            "v": v_out,
+            "scale_k_map": scale_k_map,
+            "scale_v_map": scale_v_map,
+        }
 
     def _compute_head_deltas(self, kv_current_k, kv_current_v, kv_previous_k, kv_previous_v):
         """计算每个 head 的变化幅度。"""

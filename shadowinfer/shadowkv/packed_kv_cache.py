@@ -75,6 +75,139 @@ class PackedKVCache:
         precision_map: Dict[int, Dict[int, str]],
         group_size: int = 64,
     ) -> None:
+        """
+        Vectorized packing core (AR002 M1).
+
+        Element-wise identical to ``_do_pack_reference``: per-precision groups
+        are gathered with advanced indexing and quantized in one batched call
+        instead of per-entry slicing. The int4 scale layout ``(n*batch, g, 1)``
+        is preserved bit-for-bit (including its known batch>1 indexing defect
+        in ``unpack``, kept for compatibility).
+        """
+        self.packed_data = {}
+        total_bytes = 0
+
+        groups: Dict[str, List[Tuple[int, int]]] = {
+            "fp32": [],
+            "fp16": [],
+            "int8": [],
+            "int4": [],
+        }
+        for token_idx in range(self.seq_len):
+            token_map = precision_map.get(token_idx, {})
+            for head_idx in range(self.num_heads):
+                precision = token_map.get(head_idx, "fp16").lower()
+                if precision not in groups:
+                    precision = "fp16"
+                groups[precision].append((token_idx, head_idx))
+
+        device = k_tensor.device
+        for precision, indices in groups.items():
+            if not indices:
+                continue
+
+            h_idx = torch.tensor([h for _, h in indices], dtype=torch.long, device=device)
+            t_idx = torch.tensor([t for t, _ in indices], dtype=torch.long, device=device)
+
+            if precision in ("fp32", "fp16"):
+                dtype = torch.float32 if precision == "fp32" else torch.float16
+                k_stacked = k_tensor[:, h_idx, t_idx, :].permute(1, 0, 2).to(dtype)
+                v_stacked = v_tensor[:, h_idx, t_idx, :].permute(1, 0, 2).to(dtype)
+                total_bytes += k_stacked.numel() * k_stacked.element_size()
+                total_bytes += v_stacked.numel() * v_stacked.element_size()
+                self.packed_data[precision] = {
+                    "k": k_stacked,
+                    "v": v_stacked,
+                    "scale_k": None,
+                    "scale_v": None,
+                    "indices": indices,
+                }
+
+            elif precision == "int8":
+                k_stacked = k_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)
+                v_stacked = v_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)
+                qk, scale_k = Quantizer.quantize_int8(k_stacked)
+                qv, scale_v = Quantizer.quantize_int8(v_stacked)
+                total_bytes += qk.numel() * qk.element_size()
+                total_bytes += qv.numel() * qv.element_size()
+                total_bytes += scale_k.numel() * scale_k.element_size()
+                total_bytes += scale_v.numel() * scale_v.element_size()
+                self.packed_data[precision] = {
+                    "k": qk,
+                    "v": qv,
+                    "scale_k": scale_k,
+                    "scale_v": scale_v,
+                    "indices": indices,
+                }
+
+            elif precision == "int4":
+                effective_group_size = (
+                    group_size if self.head_dim % group_size == 0 else self.head_dim
+                )
+                num_groups = self.head_dim // effective_group_size
+
+                k_stacked = k_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)
+                v_stacked = v_tensor[:, h_idx, t_idx, :].permute(1, 0, 2)
+                qk_all, scale_k_all = Quantizer.quantize_int4(
+                    k_stacked, group_size=effective_group_size
+                )
+                qv_all, scale_v_all = Quantizer.quantize_int4(
+                    v_stacked, group_size=effective_group_size
+                )
+
+                k_slices_packed: List[torch.Tensor] = []
+                v_slices_packed: List[torch.Tensor] = []
+                byte_offsets: List[Tuple[int, int, int, int]] = []
+                k_byte_cursor = 0
+                v_byte_cursor = 0
+
+                for n in range(len(indices)):
+                    qk_packed = _kernels._pack_int4(qk_all[n].reshape(-1))
+                    qv_packed = _kernels._pack_int4(qv_all[n].reshape(-1))
+                    byte_offsets.append(
+                        (
+                            k_byte_cursor,
+                            k_byte_cursor + qk_packed.numel(),
+                            v_byte_cursor,
+                            v_byte_cursor + qv_packed.numel(),
+                        )
+                    )
+                    k_byte_cursor += qk_packed.numel()
+                    v_byte_cursor += qv_packed.numel()
+                    k_slices_packed.append(qk_packed)
+                    v_slices_packed.append(qv_packed)
+
+                k_stacked_packed = torch.cat(k_slices_packed, dim=0)
+                v_stacked_packed = torch.cat(v_slices_packed, dim=0)
+                scale_k = scale_k_all.reshape(-1, num_groups, 1)
+                scale_v = scale_v_all.reshape(-1, num_groups, 1)
+
+                total_bytes += k_stacked_packed.numel() * k_stacked_packed.element_size()
+                total_bytes += v_stacked_packed.numel() * v_stacked_packed.element_size()
+                total_bytes += scale_k.numel() * scale_k.element_size()
+                total_bytes += scale_v.numel() * scale_v.element_size()
+
+                self.packed_data[precision] = {
+                    "k": k_stacked_packed,
+                    "v": v_stacked_packed,
+                    "scale_k": scale_k,
+                    "scale_v": scale_v,
+                    "indices": indices,
+                    "byte_offsets": byte_offsets,
+                    "group_size": effective_group_size,
+                    "num_groups": num_groups,
+                }
+
+        self._memory_bytes = total_bytes
+
+    def _do_pack_reference(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        precision_map: Dict[int, Dict[int, str]],
+        group_size: int = 64,
+    ) -> None:
+        """Original per-entry loop implementation (golden baseline)."""
         self.packed_data = {}
         total_bytes = 0
 

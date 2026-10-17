@@ -14,8 +14,8 @@
 | T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | passing | 2026-10-17 完成；权威数字以 baseline-profile.md 为准（净墙钟 7.29×，双热点：ShadowKV 51.4% + FFN unpack 36.2%；独立复测 12.1× 内部比佐证结论稳健） |
 | T002 | M6 指标真实化：step 真实 perf_counter 计时接入 perf_data；内存对账与告警；调度器真实延迟奖励；benchmarks 移除硬编码 mock 断言 | T001 | passing | 2026-10-17 完成；内存对账按 design 功能点 2 与 M5 合并实现（T006）；mock 源码诚实化（无伪造差分 + mode 标注） |
 | T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | passing | 2026-10-17 完成；全仓库 grep 无零值旧断言（仅新增正向断言）；墙钟一致性入 test_m6_metrics.py（宽松界）+ T008 严格 <2% 落档 |
-| T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | pending | FR3.2 |
-| T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | pending | FR3.2 验收 |
+| T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | passing | 2026-10-17 完成；FR3.2；详见进度记录 |
+| T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | passing | 2026-10-17 完成；test_m1_vectorization.py 8 用例（含 5× perf 实测通过）；详见进度记录 |
 | T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | pending | FR3.3 + design §7.2 |
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | pending | FR3.4 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | pending | FR NFR |
@@ -73,3 +73,19 @@
 - 修改文件：orchestrator.py（step 计时接入 _run_profiler、global_state["latency_ms"] 数据源、_compute_total_latency 去 10.0 造假兜底、_aggregate_optimized_data per-step 真实值）、core/structs.py（StepState.to_dict 增 latency_ms）、profiler/profiler_agent.py（device 口径标注）、benchmarks/real_model/__init__.py（mock 无伪造差分 + summary.mode="mock"）
 - 测试：新增 test_m6_metrics.py（18 用例）+ test_benchmark_no_hardcoded_speedup.py（3 用例）；修订 test_real_model_benchmark.py（5 处断言按无差分契约改写）；基准测试 36 passed；相关模块回归 61 passed
 - 备注：TDD-Red 子代理另产出 test_m6_metrics_integrity.py（发明 run_step/_make_dummy_inputs 等不存在 API，违反 design 4.3 对外零变更），审查后删除；调度器奖励未改代码（数据源修复即生效，符合 design「不改语义，改数据源」）
+
+### 2026-10-17 T004/T005 会话记录
+
+- 完成任务：T004（M1 决策面张量化）+ T005（golden test + 5× perf 证据）
+- 修改文件：
+  - utils/quantization.py：新增公开 quantize_batch（2D 批量量化，逐行等价 quantize_tensor）
+  - shadowkv/shadowkv_agent.py：新增 _compute_importance_matrix（整矩阵向量化重要性，on_step Step 2 接入）；allocate_precision 张量路径向量化（f64 精确阈值比较，dict 路径走 _allocate_precision_reference）；decide_reuse_per_token 向量化（f64 阈值矩阵 + 布尔掩码，原实现保留为 _decide_reuse_per_token_reference）；compress_kv 重构为公共入口（复用掩码/旧格式解析 + packed/统计）+ _compress_kv_vectorized（按精度分组 advanced indexing 批量取/量化/写回 + 批量 reuse 拷贝）+ _compress_kv_reference（原循环保留，异常兜底：logger.log_alert error 后回退）
+  - shadowkv/packed_kv_cache.py：_do_pack 向量化（分组 take + 整组量化；int4 保留逐 entry _pack_int4 打包与 byte_offsets/scale 布局 bit-for-bit 一致），原实现保留为 _do_pack_reference
+  - tests/test_m1_vectorization.py：8 用例（quantize_batch/重要性矩阵/精度分配/复用决策/compress golden/异常回退/pack golden/5× perf）
+- 关键实现事实：
+  - advanced indexing 布局：k[:, h_idx, t_idx, :] 结果为 (batch, N, head_dim)（广播形状插入首个高级索引位置），统一 permute(1,0,2) 归一到 (N, batch, head_dim)；高级索引赋值要求 dtype 严格匹配，写回显式 .to(k_out.dtype)（与基础切片赋值的隐式转型值相同）
+  - 非方形 attention_scores 口径（T001 未覆盖、real_backend 暴露）：真实后端为 (batch, heads, seq_q=4, seq_k=8)；reference 的归一化与位置阈值均以 shape[-1]（seq_k）为基准、token 维度为 shape[2]（seq_q）——_compute_importance_matrix 已按此口径实现并有非方形 golden 用例锁定
+  - 预存缺陷（保持兼容、记录在案）：compress_kv 原循环 int4 写回仅 batch=1 且 head_dim==group_size=64 时可用（(B,g,gs)→(B,D) 赋值限制，其余 RuntimeError）；向量化路径统一 reshape 写回，可用包络内 bitwise 一致，崩溃包络按语义意图产出（golden 测试 int4 比对限制在可用包络）。packed int4 unpack 的 scale 索引 batch>1 缺陷保持原样（向量化 _do_pack 产出布局 bit-for-bit 一致）
+  - 测试隔离缺陷修复（预存、非本 AR 引入）：test_logging_utils.py 的 configure_shadowinfer_logging(level=ERROR/WARNING) 写入 _GLOBAL_LEVEL 后不复位，全量运行时污染后续测试的 INFO metric 记录（test_m6_metrics 3 用例仅全量失败的原因）；已加 autouse fixture 快照/恢复全局日志状态
+- 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 610 passed / 1 skipped / 覆盖率 81.48%（fail-under 75）
+- T005 perf 证据：test_compress_kv_perf_5x（seq=128/heads=32/batch=1/head_dim=128，真实精度分布）断言 vectorized×5 ≤ reference 通过；绝对数值对照 T001 基线（compress_kv cumtime 11.2s/24 calls）在 T008 端到端复测落档
