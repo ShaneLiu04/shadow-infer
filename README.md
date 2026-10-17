@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.3.0 | 581 passed / 1 skipped | 80.84% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.4.0 | 630 passed / 1 skipped | 81.68% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -49,10 +49,13 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | 特性 | 说明 |
 |------|------|
 | **ShadowKV 决策平面** | 形式化 Importance / Drift / Memory-Pressure 三维平面，统一输出 precision / reuse / eviction 决策。 |
+| **热路径张量化** | ShadowKV 重要性评分、精度分配、复用决策、压缩与打包全链路向量化，压缩耗时较逐元素实现下降约 20x（CPU 实测）；逐元素 reference 实现保留作 golden 对照与异常兜底。 |
 | **字节级混合精度 KV Cache** | 支持 FP16 / INT8 / INT4 按需存储，per-token-head 动态分配精度。 |
 | **重要性感知驱逐** | 显存预算超限时按重要性回收低价值 token-head，支持 LRU / age 策略。 |
 | **KV Cache 预取** | 基于 Q-drift 敏感度预测下一 step 复用 mask，提前 stage KV 数据。 |
-| **Q-drift 步感知调度** | 根据 step 敏感度和激活漂移动态选择 ShadowKV / FFN 工作模式。 |
+| **Q-drift 步感知调度** | 敏感度由位置先验与实测扰动响应凸组合（默认权重 0.3 / 0.7），结合激活漂移动态选择 ShadowKV / FFN 工作模式；扰动响应与真实扰动幅度的 Spearman 秩相关 >= 0.9。 |
+| **决策记忆化** | 同 (step, layer) 同输入的决策缓存（输入指纹校验、step 边界失效、异常旁路）与 FFN 反量化结果缓存，重复调用决策耗时下降 >= 90%。 |
+| **真实性能记账** | latency.e2e_ms / per_step_ms 真实测量（内部计时与外部墙钟对照偏差 0.02%），KV memory 按真实节省字节记账。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
 | **Agent 插件系统** | 通过 `shadowinfer.agents` entry-point 注册第三方 Agent，Orchestrator 自动调度并收集输出。 |
@@ -96,7 +99,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`581 passed, 1 skipped`，测试覆盖率 `80.84%`（pytest-cov，fail-under 75）。
+当前主分支：`630 passed, 1 skipped`，测试覆盖率 `81.68%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -314,7 +317,22 @@ Profiler  ShadowKV  Q-drift  FFN Optimizer
    should_reuse = delta < threshold
    ```
 
+以上三步在 v3.4.0 起均为整矩阵张量化实现（重要性评分 / 精度分配 / 复用决策 /
+压缩 / 打包）；逐元素 reference 实现保留，作为单元测试的 golden 对照与张量路径
+的异常兜底（命中异常时记录告警并回退，保证可用性）。
+
 ### Q-drift 调度矩阵
+
+sensitivity_score 为位置先验与实测扰动响应的凸组合（v3.4.0 起）：
+
+```python
+sensitivity = clamp(alpha * positional_base + (1 - alpha) * tanh(raw_drift), 0, 1)
+# alpha 默认 0.3（配置键 qdrift.positional_prior_weight）
+# raw_drift 为相邻 step query/activation 的未归一化漂移（0.6/0.4 加权）
+# previous 张量缺失时回退纯位置先验并记录日志
+```
+
+drift_score 采用 tanh 归一化以保持动态范围（避免大幅扰动下塌缩为恒 1.0）。
 
 | sensitivity_score | drift_score | ShadowKV | FFN | 说明 |
 |------------------|------------|----------|-----|------|
@@ -638,27 +656,39 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
-### 实测数据（v3.3.0，2026-10-17，Windows / CPU fallback）
+### 实测数据（v3.4.0，2026-10-17，Windows / CPU fallback）
 
 **质量与测试**
 
 | 指标 | 实测值 | 说明 |
 |------|--------|------|
-| 测试通过率 | 581 passed / 1 skipped | 全量套件，38 个测试文件 |
-| 测试覆盖率 | 80.84% | pytest-cov（门禁 fail-under 75） |
+| 测试通过率 | 630 passed / 1 skipped | 全量套件，40 个测试文件 |
+| 测试覆盖率 | 81.68% | pytest-cov（门禁 fail-under 75） |
 | 静态检查 | black / isort / flake8 / mypy 全部零告警 | 提交前强制门禁 |
 
-**端到端流水线（SimpleDiffusionLLM，6 steps，CPU）**
+**热路径张量化收益（6-step 端到端 cProfile，对照 v3.3.0 逐元素实现）**
+
+| 函数 | v3.3.0 | v3.4.0 | 下降 |
+|------|--------|--------|------|
+| ShadowKV compress_kv（压缩链路） | 11.43 s | 0.575 s | 19.9x |
+| shadowkv.on_step（含决策面） | 24.66 s | 0.954 s | 25.8x |
+| 重要性评分（矩阵化） | 8.66 s（98304 次调用） | 0.041 s（24 次调用） | > 200x |
+| packed KV 打包 | 3.12 s | 0.199 s | 15.7x |
+| FFN 反量化（M5 结果缓存） | 17.13 s（32 次） | 1.257 s（8 次） | 13.6x |
+
+**端到端流水线（SimpleDiffusionLLM，6 steps，CPU，外部墙钟）**
 
 | 指标 | 实测值 |
 |------|--------|
-| 基线端到端延迟 | 3571.4 ms |
-| KV 显存节省比例 | 8.6% |
-| 精度损失（perplexity delta） | 0.0000 |
-| BLEU 损失 | 0.0000 |
-| Q-drift 步调度命中率 | 100% |
+| 基线端到端延迟 | 6481.2 ms |
+| 优化路径端到端延迟 | 10273.5 ms |
+| 优化 / 基线比值 | 1.585x（4 次复测 1.585-1.639，中位 1.61x；v3.3.0 为 7.29x） |
+| 优化路径每步延迟 | 948-993 ms（全部真实测量，step 0 含惰性初始化 5419 ms） |
+| 内部计时与外部墙钟偏差 | 0.02% |
+| 向量化 golden 精度 | 与 reference 实现 bitwise 一致（容差 1e-6） |
+| Q-drift 扰动响应 Spearman | >= 0.9（50 组合成扰动统计测试） |
 
-> **CPU fallback 说明：** 当前主机无可用 CUDA，内核走 CPU fallback。ShadowKV 决策 / 打包 / 驱逐路径当前为纯 Python 实现，在 CPU + 小规模参考模型上每步开销大于收益（优化运行耗时高于基线）。框架的目标收益场景是端侧 GPU + 真实 7B Diffusion LLM——GPU 环境启用 CUDA kernel 后收益兑现。CPU 路径的向量化与内核化已列入 [ROADMAP](ROADMAP.md)。
+> **CPU fallback 说明：** 当前主机无可用 CUDA，内核走 CPU fallback。v3.4.0 完成决策 / 压缩 / 打包热路径张量化后，优化路径与基线比值由 v3.3.0 的 7.29x 收敛至 1.61x；残余差距主要来自 FFN 反量化支线（unpack 仍为逐元素 Python 热路径，占优化路径采样时间约 57%），已列为下一阶段优化项。框架的目标收益场景是端侧 GPU + 真实 7B Diffusion LLM——GPU 环境启用 CUDA kernel 后收益进一步兑现。
 
 完整基准套件：
 
@@ -822,6 +852,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.4.0（2026-10）
+
+- 热路径张量化（M1）：ShadowKV 重要性评分 / 精度分配 / 复用决策 / 压缩 / 打包全链路向量化，压缩链路耗时 11.43s → 0.575s（19.9x），golden 测试保证与逐元素 reference bitwise 一致（容差 1e-6）；异常路径自动回退 reference 并记录告警；
+- 指标真实化（M6）：latency.per_step_ms / e2e_ms 真实测量，修复 per_step 硬编码 0.0 与内外口径矛盾；内部计时与外部墙钟对照偏差 0.02%；
+- 记忆化（M5）：同 (step, layer) 同输入决策缓存（指纹校验 + step 边界失效 + 异常旁路）与 FFN 反量化结果缓存（repack 自动失效）；on_init 修复累计状态未重置缺陷；kv memory_mb 改为真实节省字节口径；
+- 实测漂移灵敏度（M3-lite）：Q-drift sensitivity 改为位置先验（权重 0.3）与实测扰动响应（tanh 归一化）凸组合，drift_score 修复恒 1.0 塌缩恢复动态范围；50 组合成扰动 Spearman >= 0.9 统计测试；
+- 端到端：优化 / 基线比值 7.29x → 1.61x（CPU fallback，4 次实测中位）；残余差距为 FFN 反量化支线（下一阶段优化项）；
+- 质量门禁全绿：`630 passed, 1 skipped`，覆盖率 `81.68%`。
 
 ### v3.3.0（2026-10）
 

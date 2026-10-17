@@ -19,7 +19,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 ### Strengths
 
 - Clean multi-agent architecture (Orchestrator + Profiler / ShadowKV / Q-drift / FFN Optimizer).
-- 581 passing tests (1 skipped) with 80.84% coverage.
+- 630 passing tests (1 skipped) with 81.68% coverage.
 - Comprehensive documentation (architecture, technical spec, engineering, ADRs, bilingual README, tutorials).
 - Built-in observability, benchmarking, and production-safety components.
 - CUDA kernel scaffold (INT8/INT4 quantization, sparse GEMM, fused quantized attention).
@@ -54,10 +54,15 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] Declarative Policy DSL — YAML/JSON rules for Q-drift, ShadowKV, FFN, Profiler, and Orchestrator arbitration (`configs/policy_default.yaml`).
 - [ ] Real Diffusion LLM model adapter (Fast-dLLM-v2 or equivalent).
 - [ ] Production serving integration with vLLM / SGLang adapter (full single-step diffusion forward).
-- [ ] **CPU optimization-path vectorization**: ShadowKV decision / packing / eviction paths are
-      pure Python today; on CPU fallback with small reference models the per-step overhead
-      exceeds the savings (v3.3.0 measured: 6-step optimized run ~343s vs ~3.6s baseline).
-      Vectorize / kernelize these paths so CPU fallback stays usable for development.
+- [x] **CPU optimization-path vectorization** (v3.4.0): ShadowKV decision / packing /
+      compression hot paths are fully vectorized (compress chain 11.43s -> 0.575s,
+      19.9x on the 6-step CPU benchmark); optimized-vs-baseline ratio improved from
+      7.29x to 1.61x. Element-wise reference implementations retained as golden
+      tests and exception fallbacks.
+- [ ] **FFN dequantization/unpack vectorization**: the packed-weight unpack path is
+      still an element-wise Python hot path (~57% of the optimized-path profile in
+      the v3.4.0 CPU benchmark); the residual end-to-end gap to the 1.5x target.
+      Next AR candidate.
 - [x] Continuous benchmarking and performance regression tracking.
 - [x] English documentation and broader internationalization — all content consolidated into the Chinese README.md.
 
@@ -100,6 +105,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] **Real Sparse FFN Kernel**: Integrate packed INT8/INT4 weights and the existing `sparse_gemm` kernel.
 - [ ] **Real Sparse FFN Kernel**: Use CSR/CSC formats and a production-grade sparse kernel.
 - **Packed Weight Storage**: Store weights as packed INT8/INT4 with on-the-fly dequantization.
+- [ ] **Vectorized Unpack/Dequantization**: `PackedFFNWeight.unpack` / `dequantize_for_matmul` still use element-wise Python loops (v3.4.0 residual end-to-end bottleneck; result caching already added in v3.4.0).
 - **FFN-Compiler**: Lightweight compiler to generate fused kernels from FFN subgraphs.
 - [x] **Dynamic Channel Pruning**: Zero out low-contribution channels at runtime.
 
@@ -212,7 +218,7 @@ These directions can differentiate ShadowInfer on GitHub and in the research com
 | pip Installable | ✅ | ✅ | ✅ |
 | Real Model Support | Partial (`SimpleDiffusionLLM` + HuggingFace adapter) | 1 public Diffusion LLM | 3+ |
 | CUDA Kernel Completion | ~35% | 70% | 90%+ |
-| Test Coverage | ~80.84% | >82% | >85% |
+| Test Coverage | ~81.68% | >82% | >85% |
 | Docs Languages | Chinese + English intro | Bilingual core | Bilingual full |
 | Contributors | 1 | 5+ | 20+ |
 | Academic Output | 0 | 1 arXiv | 1 paper + artifact |

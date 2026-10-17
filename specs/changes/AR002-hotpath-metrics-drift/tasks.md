@@ -19,7 +19,7 @@
 | T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | passing | 2026-10-17 完成；test_m5_memoization.py 13 用例；详见进度记录 |
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | passing | 2026-10-17 完成；详见进度记录 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | passing | 2026-10-17 完成：4 次实测 1.585-1.639（中位 1.61），落入 design 4.1 授权兜底区 (1.5, 2.5]，按兜底路径结案（杠杆已全部在下限，残余瓶颈为 FFN 支线 AR003 范围）；详见 baseline-profile.md §8 |
-| T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | pending | FR3.5 |
+| T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | passing | 2026-10-17 完成；详见进度记录 |
 | T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | pending | |
 | T011 | 按 Runbook 推送 Gitee（小批量多次；三核验；远端无 AGENTS.md 确认） | T010 | pending | FR3.6 |
 
@@ -127,3 +127,14 @@
   - M6：per_step_ms 全部 >0（稳态 948-993ms）；内部 e2e_ms 与外部墙钟偏差 0.02%（<2% 验收线）
   - M3-lite：sensitivity 实测混合 [0.300→0.833]，drift [0.888x] 不再恒 1.0 塌缩；kv memory_mb 真实节省口径 [1.00/0.51/0.37/0.33] MB/层
 - 质量门禁：五件套复跑全绿（本任务无代码变更，门禁状态承自 T007 提交 a0d9a24 后全量实跑：630 passed/1 skipped、black/isort/flake8/mypy 全绿）
+
+### 2026-10-17 T009 会话记录
+
+- 完成任务：T009（README 四检查点 + 版本同步 + ROADMAP 同步，FR3.5 / AGENTS 规则一）
+- 四检查点执行：
+  - 特性表：新增 3 行（热路径张量化 / 决策记忆化 / 真实性能记账），修订 Q-drift 行（位置先验 + 实测扰动混合、Spearman >= 0.9）
+  - 版本历史：追加 v3.4.0 条目（M1/M6/M5/M3-lite/端到端 1.61x/门禁数据）；pyproject.toml 与 shadowinfer/__init__.py 同步 3.4.0（import 冒烟验证）
+  - 基准数据：性能基准章节全量替换为 v3.4.0 实测（630 passed/1 skipped/81.68%；热路径五函数对照表；端到端 6481.2/10273.5ms 比值 1.585-1.639；per-step 948-993ms；墙钟对照 0.02%；golden 1e-6；Spearman >= 0.9）；CPU fallback 说明改写（7.29x → 1.61x，残余为 FFN 支线）
+  - 结构与口径：核心算法章节补张量化与混合公式口径；TOC 无新增章节；测试数以当次实跑为准；无 emoji；失效引用零残留（v3.3.0 历史条目自身数字属正确历史记录保留）
+- ROADMAP 同步：Current State 测试数更新（630/81.68%）；CPU 向量化项标记完成（v3.4.0 数据）；新增 FFN unpack 向量化缺口条目（残余瓶颈，§2 与 §3.5）；Success Metrics 覆盖率更新
+- 质量门禁：五件套复跑全绿（630 passed / 1 skipped / 81.68%）
