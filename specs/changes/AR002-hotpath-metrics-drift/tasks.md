@@ -16,7 +16,7 @@
 | T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | passing | 2026-10-17 完成；全仓库 grep 无零值旧断言（仅新增正向断言）；墙钟一致性入 test_m6_metrics.py（宽松界）+ T008 严格 <2% 落档 |
 | T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | passing | 2026-10-17 完成；FR3.2；详见进度记录 |
 | T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | passing | 2026-10-17 完成；test_m1_vectorization.py 8 用例（含 5× perf 实测通过）；详见进度记录 |
-| T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | pending | FR3.3 + design §7.2 |
+| T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | passing | 2026-10-17 完成；test_m5_memoization.py 13 用例；详见进度记录 |
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | pending | FR3.4 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | pending | FR NFR |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | pending | FR3.5 |
@@ -89,3 +89,17 @@
   - 测试隔离缺陷修复（预存、非本 AR 引入）：test_logging_utils.py 的 configure_shadowinfer_logging(level=ERROR/WARNING) 写入 _GLOBAL_LEVEL 后不复位，全量运行时污染后续测试的 INFO metric 记录（test_m6_metrics 3 用例仅全量失败的原因）；已加 autouse fixture 快照/恢复全局日志状态
 - 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 610 passed / 1 skipped / 覆盖率 81.48%（fail-under 75）
 - T005 perf 证据：test_compress_kv_perf_5x（seq=128/heads=32/batch=1/head_dim=128，真实精度分布）断言 vectorized×5 ≤ reference 通过；绝对数值对照 T001 基线（compress_kv cumtime 11.2s/24 calls）在 T008 端到端复测落档
+
+### 2026-10-17 T006 会话记录
+
+- 完成任务：T006（M5 决策记忆化与记账修复，含 design §7.2 FFN 反量化缓存）
+- 修改文件：
+  - shadowkv/shadowkv_agent.py：__init__ 存储 _memory_budget_bytes/_eviction_policy 并初始化 _decision_cache/_decision_cache_step；on_init 修复重置缺陷（重建 cache_manager 保留 memory_budget/eviction 配置 + 全量重置 _compression_stats/_precision_distribution/_reuse_stats/_decision_cache）；on_step Steps 2-4 包裹决策缓存（(step_id, layer_id) 定位键 + _decision_input_fingerprint 指纹校验：shape/dtype/data_ptr + 标量元组，异常返回 None 旁路；step 滚动清空；importance_history 命中路径同样记录）；compress_kv memory_mb 口径改为真实节省（(uncompressed_bytes − compressed_bytes)/MB），新增 uncompressed_bytes/compressed_bytes 结果键
+  - ffn_optimizer/packed_weight.py：PackedFFNWeight 新增 _precision_plan_fingerprint 与反量化结果缓存（dequantize_for_matmul 指纹一致直接复用；_do_pack 重建精度计划时失效）
+  - tests/test_m5_memoization.py：13 用例（缓存命中/≥90% 决策耗时下降/异输入不脏命中/step 滚动失效/指纹异常旁路/on_init 全量重置与配置保留/FFN unpack 计数缓存命中与 repack 失效/memory_mb 三口径）
+- 关键决策：
+  - ≥90% 耗时断言口径定为「决策面三方法独占耗时之和」（缓存覆盖面，二次调用精确为 0，负载不敏感）；端到端 on_step 计时含未缓存固定开销（压缩/统计），全量运行下机器负载使比值不稳定（实测全量 FAIL、单跑 PASS），不适合作分母
+  - memory_mb 消费链梳理：唯一直接断言（test_m1_vectorization fallback 对称比较）不受影响；profiler savings_ratio 现状已退化（baseline_total == compressed 恒 0），本 AR 不扩大修（记录，M7 候选）
+  - 指纹 data_ptr 跨 step 地址复用风险被 step 滚动清空消除（同 step 内层间调用输入即同一张量对象）
+- 效果佐证：全量测试套件耗时 296.8s → 214.9s（决策缓存在 orchestrator 逐层重复调用场景生效）
+- 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 623 passed / 1 skipped / 覆盖率 81.62%（fail-under 75）

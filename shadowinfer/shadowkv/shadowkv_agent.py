@@ -80,6 +80,9 @@ class ShadowKVAgent(BaseAgent):
             memory_budget_bytes=memory_budget_bytes,
             eviction_policy=eviction_policy,
         )
+        # AR002 M5：保留初始化配置，on_init 重建 cache_manager 时不再丢失
+        self._memory_budget_bytes = memory_budget_bytes
+        self._eviction_policy = eviction_policy
         self._compression_stats = {
             "total_original_bytes": 0,
             "total_compressed_bytes": 0,
@@ -96,6 +99,9 @@ class ShadowKVAgent(BaseAgent):
             "partial_reuse_count": 0,
             "no_reuse_count": 0,
         }
+        # AR002 M5：决策缓存（(step_id, layer_id) 定位键 + 输入指纹校验）
+        self._decision_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._decision_cache_step: Optional[int] = None
 
     def on_init(self, model_config: Dict[str, Any]) -> None:
         """初始化：加载配置，设置精度阈值和复用参数。"""
@@ -103,7 +109,31 @@ class ShadowKVAgent(BaseAgent):
         self.num_heads = model_config.get("num_heads", self.num_heads)
         self.head_dim = model_config.get("head_dim", self.head_dim)
         self.model_name = model_config.get("model_name", self.model_name)
-        self.cache_manager = KVCacheManager(self.num_layers)
+        # AR002 M5：重建 cache_manager 时保留 memory_budget / eviction 配置
+        # （修复原实现丢弃配置的缺陷），并全量重置累计状态与决策缓存
+        self.cache_manager = KVCacheManager(
+            self.num_layers,
+            memory_budget_bytes=self._memory_budget_bytes,
+            eviction_policy=self._eviction_policy,
+        )
+        self._compression_stats = {
+            "total_original_bytes": 0,
+            "total_compressed_bytes": 0,
+            "step_count": 0,
+        }
+        self._precision_distribution = {
+            "fp32": 0,
+            "fp16": 0,
+            "int8": 0,
+            "int4": 0,
+        }
+        self._reuse_stats = {
+            "full_reuse_count": 0,
+            "partial_reuse_count": 0,
+            "no_reuse_count": 0,
+        }
+        self._decision_cache = {}
+        self._decision_cache_step = None
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
@@ -170,38 +200,71 @@ class ShadowKVAgent(BaseAgent):
             # 增加压缩率但保留 top 20% head 为 FP16
             mode = "balanced"
 
-        # Step 2: 计算重要性分数（AR002 M1：向量化整矩阵计算）
+        # Step 2-4: 决策计算（AR002 M5：(step_id, layer_id) 决策缓存 + 输入指纹校验；
+        # 命中且指纹一致时直接复用，指纹异常旁路，step 滚动自动失效）
         batch_size, num_heads, seq_len, _ = attention_scores.shape
-        importance_map = self._compute_importance_matrix(
-            attention_scores, layer_id, self.num_layers
-        )
 
-        # 记录历史
+        if step_id != self._decision_cache_step:
+            self._decision_cache = {}
+            self._decision_cache_step = step_id
+
+        cache_key = (step_id, layer_id)
+        fingerprint = self._decision_input_fingerprint(
+            attention_scores,
+            kv_current,
+            kv_previous,
+            total_steps,
+            sensitivity_score,
+            drift_score,
+            mode,
+        )
+        cached = self._decision_cache.get(cache_key) if fingerprint is not None else None
+        if cached is not None and cached.get("fingerprint") == fingerprint:
+            importance_map = cached["importance_map"]
+            precision_map = cached["precision_map"]
+            reuse_decision = cached["reuse_decision"]
+        else:
+            # Step 2: 计算重要性分数（AR002 M1：向量化整矩阵计算）
+            importance_map = self._compute_importance_matrix(
+                attention_scores, layer_id, self.num_layers
+            )
+
+            # Step 3: 分配精度
+            precision_map = self.allocate_precision(importance_map, mode)
+
+            # 如果 drift_score > 0.5，保留每 token top 20% head 为 FP16
+            if drift_score > 0.5:
+                num_fp16_heads = max(1, int(num_heads * 0.2))
+                for token_idx in range(seq_len):
+                    top_heads = torch.topk(
+                        importance_map[token_idx], num_fp16_heads
+                    ).indices.tolist()
+                    for head_idx in top_heads:
+                        precision_map[token_idx][head_idx] = "fp16"
+
+            # Step 4: 复用决策
+            reuse_decision = self._build_reuse_decision(
+                kv_current,
+                kv_previous,
+                step_id,
+                total_steps,
+                drift_score,
+                mode,
+                importance_map,
+            )
+
+            if fingerprint is not None:
+                self._decision_cache[cache_key] = {
+                    "fingerprint": fingerprint,
+                    "importance_map": importance_map,
+                    "precision_map": precision_map,
+                    "reuse_decision": reuse_decision,
+                }
+
+        # 记录历史（缓存命中路径同样记录，保持逐次调用语义不变）
         if layer_id not in self.importance_history:
             self.importance_history[layer_id] = []
         self.importance_history[layer_id].append(importance_map.detach().cpu())
-
-        # Step 3: 分配精度
-        precision_map = self.allocate_precision(importance_map, mode)
-
-        # 如果 drift_score > 0.5，保留每 token top 20% head 为 FP16
-        if drift_score > 0.5:
-            num_fp16_heads = max(1, int(num_heads * 0.2))
-            for token_idx in range(seq_len):
-                top_heads = torch.topk(importance_map[token_idx], num_fp16_heads).indices.tolist()
-                for head_idx in top_heads:
-                    precision_map[token_idx][head_idx] = "fp16"
-
-        # Step 4: 复用决策
-        reuse_decision = self._build_reuse_decision(
-            kv_current,
-            kv_previous,
-            step_id,
-            total_steps,
-            drift_score,
-            mode,
-            importance_map,
-        )
 
         # Step 5: 压缩 KV
         compressed_kv = self.compress_kv(
@@ -777,6 +840,42 @@ class ShadowKVAgent(BaseAgent):
 
         return reuse_mask, stats
 
+    def _decision_input_fingerprint(
+        self,
+        attention_scores: torch.Tensor,
+        kv_current: Dict[str, torch.Tensor],
+        kv_previous: Optional[Dict[str, torch.Tensor]],
+        total_steps: int,
+        sensitivity_score: float,
+        drift_score: float,
+        mode: str,
+    ) -> Optional[tuple]:
+        """
+        决策输入指纹（AR002 M5，design 4.2.2 点 5）。
+
+        各输入张量的 (shape 元组, dtype, data_ptr) + 标量输入元组；
+        计算抛异常时返回 None（调用方旁路缓存：不命中、不写入）。
+        """
+        try:
+            parts: List[Any] = []
+            for tensor in (attention_scores, kv_current["k"], kv_current["v"]):
+                parts.append((tuple(tensor.shape), str(tensor.dtype), tensor.data_ptr()))
+            if kv_previous is not None:
+                parts.append(
+                    (
+                        tuple(kv_previous["k"].shape),
+                        kv_previous["k"].data_ptr(),
+                        tuple(kv_previous["v"].shape),
+                        kv_previous["v"].data_ptr(),
+                    )
+                )
+            else:
+                parts.append(None)
+            parts.extend((total_steps, float(sensitivity_score), float(drift_score), mode))
+            return tuple(parts)
+        except Exception:
+            return None
+
     def _build_reuse_decision(
         self,
         kv_current: Dict[str, torch.Tensor],
@@ -919,7 +1018,6 @@ class ShadowKVAgent(BaseAgent):
         if self.use_packed_cache:
             packed_result = PackedKVCache.pack(k_tensor, v_tensor, precision_map)
             compressed_bytes = packed_result["memory_bytes"]
-            memory_mb = packed_result["memory_mb"]
             compression_ratio = (
                 1.0 - compressed_bytes / original_bytes if original_bytes > 0 else 0.0
             )
@@ -927,13 +1025,18 @@ class ShadowKVAgent(BaseAgent):
             result["memory_bytes"] = compressed_bytes
         else:
             compressed_bytes = self._estimate_compressed_bytes(k_tensor, v_tensor, precision_map)
-            memory_mb = compressed_bytes / (1024.0 * 1024.0)
             compression_ratio = (
                 1.0 - compressed_bytes / original_bytes if original_bytes > 0 else 0.0
             )
 
+        # AR002 M5（srs FR3.3）：memory_mb 口径修正为真实节省
+        # （未压缩基准字节 - 压缩后字节），禁止以元素数近似
+        memory_mb = (original_bytes - compressed_bytes) / (1024.0 * 1024.0)
+
         result["compression_ratio"] = compression_ratio
         result["memory_mb"] = memory_mb
+        result["uncompressed_bytes"] = original_bytes
+        result["compressed_bytes"] = compressed_bytes
 
         # 更新统计
         self._compression_stats["total_original_bytes"] += original_bytes

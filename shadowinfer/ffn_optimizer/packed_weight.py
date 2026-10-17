@@ -8,7 +8,7 @@ and the mixed-precision grouping ideas from
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -47,6 +47,16 @@ class PackedFFNWeight:
         self._original_bytes = int(
             torch.prod(torch.tensor(self.shape, dtype=torch.int64)).item() * 4
         )
+        # AR002 M5（design §7.2）：反量化结果缓存——dequantize_for_matmul 首次
+        # 调用后缓存稠密权重与精度计划指纹；_do_pack 重建精度计划时失效。
+        self._dequant_cache: Optional[torch.Tensor] = None
+        self._dequant_cache_fingerprint: Optional[tuple] = None
+
+    def _precision_plan_fingerprint(self) -> tuple:
+        """当前精度计划指纹：(channel_idx, precision) 有序元组。"""
+        return tuple(
+            (channel_idx, data["precision"]) for channel_idx, data in sorted(self._data.items())
+        )
 
     @classmethod
     def pack(
@@ -81,6 +91,8 @@ class PackedFFNWeight:
     ) -> None:
         """Internal packing implementation."""
         self._data = {}
+        self._dequant_cache = None
+        self._dequant_cache_fingerprint = None
         total_bytes = 0
         channels = weight.shape[self.pack_dim]
 
@@ -172,10 +184,17 @@ class PackedFFNWeight:
     def dequantize_for_matmul(self) -> torch.Tensor:
         """Return a dense tensor suitable for fallback matmul paths.
 
-        Returns:
-            FP32 dense tensor with the original ``self.shape``.
+        AR002 M5（design §7.2）：结果缓存——精度计划指纹一致时直接复用
+        上次反量化结果（语义逐元素等价，同输入同输出）；指纹不一致或
+        缓存为空时重算并写回缓存。
         """
-        return self.unpack()
+        fingerprint = self._precision_plan_fingerprint()
+        if self._dequant_cache is not None and self._dequant_cache_fingerprint == fingerprint:
+            return self._dequant_cache
+        dense = self.unpack()
+        self._dequant_cache = dense
+        self._dequant_cache_fingerprint = fingerprint
+        return dense
 
     def memory_bytes(self) -> int:
         """Return the actual byte-level storage size."""
