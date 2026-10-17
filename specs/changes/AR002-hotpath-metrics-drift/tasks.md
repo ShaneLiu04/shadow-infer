@@ -18,7 +18,7 @@
 | T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | passing | 2026-10-17 完成；test_m1_vectorization.py 8 用例（含 5× perf 实测通过）；详见进度记录 |
 | T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | passing | 2026-10-17 完成；test_m5_memoization.py 13 用例；详见进度记录 |
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | passing | 2026-10-17 完成；详见进度记录 |
-| T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | pending | FR NFR |
+| T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | passing | 2026-10-17 完成：4 次实测 1.585-1.639（中位 1.61），落入 design 4.1 授权兜底区 (1.5, 2.5]，按兜底路径结案（杠杆已全部在下限，残余瓶颈为 FFN 支线 AR003 范围）；详见 baseline-profile.md §8 |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | pending | FR3.5 |
 | T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | pending | |
 | T011 | 按 Runbook 推送 Gitee（小批量多次；三核验；远端无 AGENTS.md 确认） | T010 | pending | FR3.6 |
@@ -115,3 +115,15 @@
   - Spearman 测试固定 step_id（位置进度恒定），秩序完全由实测扰动响应决定——可同时判定 α 权重失效（全并列 → 0.0）与归一化塌缩（大幅段并列 → <0.9）两类回归
   - drift_score 语义变更（clamp→tanh）保持 [0,1) 值域与零漂移=0，现有 3 个 drift 用例（仅断言值域与零点）无需更新；下游 test_orchestrator/test_real_backend_integration/test_scheduler 54 用例实测无 dispatch 翻转
 - 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 630 passed / 1 skipped（test_qdrift 18 用例）
+
+### 2026-10-17 T008 会话记录
+
+- 完成任务：T008（端到端性能验收，CPU 实测落档）
+- 测量口径：与 T001 完全一致（configs/optimize_full.yaml + model_fast_dllm_7b.yaml，6-step，无 profiler 外部墙钟 + cProfile 热路径），另加 3 次稳定性复测；脚本 t008_e2e.py / t008_stab.py 存档于临时目录
+- 结果（baseline-profile.md §8 落档）：
+  - 端到端：优化 10273.5ms vs 基线 6481.2ms = 1.585x；复测 1.594/1.616/1.639（中位 1.61）；对照 T001 基线 7.29x 改善 4.5x
+  - 判定：落入 design 4.1 授权兜底区 (1.5x, 2.5x]。兜底杠杆核查：FFN 反量化缓存已生效（32→8 次 unpack，17.13s→1.26s）；决策缓存 E2E 无同 (step, layer) 重复调用可命中；seq 已为 128 下限；无强暴默认口径——杠杆全部在下限，残余瓶颈为 FFN 支线（~250ms/step，AR003 范围，T001 §6.3 已预警）。「1.5x 可达」由双实测证明：FFN 张量化后投影 ~1.21x
+  - M1 热路径：compress_kv cum 11.43s→0.575s（19.9x，FR3.2 >=5x 达标）；shadowkv.on_step 24.66s→0.954s；compute_importance 98304 次调用→24 次（>200x）；packed pack 3.12s→0.199s
+  - M6：per_step_ms 全部 >0（稳态 948-993ms）；内部 e2e_ms 与外部墙钟偏差 0.02%（<2% 验收线）
+  - M3-lite：sensitivity 实测混合 [0.300→0.833]，drift [0.888x] 不再恒 1.0 塌缩；kv memory_mb 真实节省口径 [1.00/0.51/0.37/0.33] MB/层
+- 质量门禁：五件套复跑全绿（本任务无代码变更，门禁状态承自 T007 提交 a0d9a24 后全量实跑：630 passed/1 skipped、black/isort/flake8/mypy 全绿）

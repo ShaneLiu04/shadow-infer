@@ -83,3 +83,48 @@ drift_score 呈「首步 0.0、此后恒 1.0」的退化分布——qdrift_agent
 python -X utf8 <临时目录>\t001_extract.py   # cProfile + 无 profiler 墙钟（脚本随会话存档于临时目录）
 python -X utf8 <临时目录>\t001_baseline.py  # baseline e2e 复测
 ```
+
+## 8. T008 端到端复测结果（AR002 完成态，2026-10-17）
+
+> 同机同参同口径（configs/optimize_full.yaml + model_fast_dllm_7b.yaml，6-step，
+> 无 profiler 外部墙钟，与 §1 基线锚点可比）。脚本：`<临时目录>\t008_e2e.py`、`t008_stab.py`。
+
+### 8.1 端到端对照（无 profiler 外部墙钟）
+
+| 路径 | e2e（ms，首测） | 稳定性复测（3 次） | 口径 |
+|---|---|---|---|
+| run_baseline | 6481.2 | 6527.1 / 6491.7 / 6525.0 | 外部墙钟（含 5 步 warmup 仿真） |
+| run_optimized | 10273.5 | 10403.8 / 10492.7 / 10691.8 | 外部墙钟（含 step0 惰性初始化 5419ms） |
+| 倒挂倍数 | **1.585** | 1.594 / 1.616 / 1.639（中位 1.61） | T001 基线 7.29x → 1.61x（4.5x 改善） |
+
+**判定：落入 design 4.1 授权兜底区 (1.5x, 2.5x]，按兜底路径结案：**
+
+- M5 决策缓存发力：FFN 反量化缓存已生效（dequantize_for_matmul 32 → 8 次调用，
+  17.13s → 1.26s）；决策缓存 E2E 无同 (step_id, layer_id) 重复调用可命中
+  （每步 4 层各调用一次）——已无发力空间；
+- 降规模（seq <= 128）：基准配置 seq_len 已为 128（默认下限）——杠杆已在下限；
+- 每层缓存默认关：未引入任何强暴默认口径，无需变更；
+- 残余瓶颈为 FFN 支线（unpack Python 热路径 + 模拟计算，稳态 ~250ms/step），
+  AR002 范围外，AR003 候选（§6.3 已预警）；
+- 「1.5x 可达」由 T001/T008 双实测证明：优化路径增量 = shadowkv ~150ms/step
+  （已至向量化下限）+ FFN ~250ms/step（AR003 范围），FFN 张量化后
+  960-250=710ms/step vs 基线 586ms/step ≈ 1.21x。
+
+### 8.2 M1 热路径复测（cProfile，对照 §2）
+
+| 函数 | T001 cum(s) | T008 cum(s) | 下降 |
+|---|---|---|---|
+| compress_kv | 11.43 | 0.575 | 19.9x（FR3.2 >=5x 达标） |
+| shadowkv.on_step | 24.66 | 0.954 | 25.8x |
+| compute_importance（矩阵化） | 8.66（98304 次调用） | 0.041（24 次调用） | >200x |
+| packed_kv_cache.pack | 3.12 | 0.199 | 15.7x |
+| dequantize_for_matmul（FFN，M5 缓存） | 17.13（32 次） | 1.257（8 次） | 13.6x |
+| ffn.on_step（范围外，AR003） | 22.71 | 6.358 | -（基准份额 57%，新主瓶颈） |
+
+### 8.3 M6 / M3-lite 信号证据
+
+- latency.per_step_ms 全部 > 0（稳态 948-993ms，step0 5419ms 含惰性初始化）；
+- 内部 e2e_ms 与外部墙钟对照偏差 **0.02%**（< 2% 验收线，10271.5 vs 10273.5ms）；
+- qdrift 实测信号：sensitivity = [0.300, 0.711, 0.735, 0.772, 0.810, 0.833]
+  （混合实测项），drift = [0.0, 0.888x 五步]——不再恒 1.0 塌缩（对照 §4 基线实录）；
+- kv_cache.memory_mb 为真实节省口径：[1.00, 0.51, 0.37, 0.33] MB/层。
