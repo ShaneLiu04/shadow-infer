@@ -52,3 +52,10 @@
 - Minor-2（G1）：tokens_per_sec / gpu_utilization 的取值口径需在 design.md 明确（CPU 环境前者由真实延迟派生、后者口径固定）
 - Minor-3（G3）：drift_score 恒 1.0 的复现证据在 T001 baseline-profile.md 落档佐证
 - 决定：准予进入设计阶段，3 项 Minor 随 design.md 编制一并处理
+
+### 2026-10-17 design 门控
+
+- 第 1 轮：**FAIL**（Important×1：决策缓存键 (step_id, layer_id) 与 srs FR3.3 输入指纹语义冲突且 6.4 指纹异常测试无实现主体；Minor×3：benchmarks 断言清理未落设计、scale 等价论证漏 batch 维、流程图 fork 误用）
+- 修复：缓存改为「(step_id, layer_id) 定位键 + 输入指纹校验」（4.2.2 点 5，四处口径统一）；#3 表/4.4/6.3 增补 benchmarks 清理；scale 论证补 (N, batch, head_dim)→amax(dim=-1) 逐 batch 等价 + golden 覆盖 batch>1；fork 改 repeat 循环
+- 第 2 轮：**PASS**（4 项全修复，无新 Critical/Important；2 项实现层 Minor 随编码处理：int4 scale 分组维注释 + quantize_batch 形状契约）
+- 决定：准予进入开发阶段
