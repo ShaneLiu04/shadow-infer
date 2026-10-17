@@ -68,3 +68,7 @@ checkpoints/
 # Secrets
 .env
 .env.local
+
+# Local agent contract (never commit, never upload)
+AGENTS.md
+.opencode/
