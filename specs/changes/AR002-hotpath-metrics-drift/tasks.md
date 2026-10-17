@@ -20,7 +20,7 @@
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | passing | 2026-10-17 完成；详见进度记录 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | passing | 2026-10-17 完成：4 次实测 1.585-1.639（中位 1.61），落入 design 4.1 授权兜底区 (1.5, 2.5]，按兜底路径结案（杠杆已全部在下限，残余瓶颈为 FFN 支线 AR003 范围）；详见 baseline-profile.md §8 |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | passing | 2026-10-17 完成；详见进度记录 |
-| T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | in_progress | Review PASS（2026-10-17，2 项 Minor 当轮处置）；ST 待执行 |
+| T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | passing | 2026-10-17 完成：Review PASS（2 项 Minor 当轮处置）；ST 15/15 PASS、需求覆盖 100%、Go |
 | T011 | 按 Runbook 推送 Gitee（小批量多次；三核验；远端无 AGENTS.md 确认） | T010 | pending | FR3.6 |
 
 ## 状态说明
@@ -154,3 +154,11 @@
   3. compress_kv 回退分支 log_alert("error") 无断言 → 已修复（test_compress_kv_fallback 增补告警级别与内容断言）
   4. design 6.4「计时器异常回退」→ 豁免论证补记于 srs.md §3.1（perf_counter 为单调计数器，无异常失败路径；张量路径异常已有 error 告警 + reference 兜底并测试覆盖）
 - 修复后复验：630 passed / 1 skipped，五件套全绿
+
+### 2026-10-17 ST 验收记录
+
+- ST 用例：15 个（st-cases.md），全部 PASS，需求覆盖 6/6（100%）
+- 执行证据：验收测试集新鲜复跑 57 passed；端到端交叉验证外部墙钟 10398.4ms / 内部 10396.7ms 偏差 0.016%（< 2%）、per_step 全部 > 0（稳态 958.8-1019.8ms）；benchmarks grep 零硬编码加速比；README 四检查点核验
+- 遗留（Minor）：NFR 1.5x 实测中位 1.61x（design 预授权兜底区内结案，FFN unpack 列 AR003）；savings_ratio 退化与 RSS 告警列 M7/AR003
+- 判定：Go（confirm_mode=auto 预授权；无 Critical/Major）
+- 归档：specs/archive/AR002-hotpath-metrics-drift/（srs.md / design.md / st-cases.md / baseline-profile.md；tasks.md 按规范不归档）
