@@ -13,11 +13,11 @@
 |----|---------|------|------|------|
 | T001 | 质量门禁基线：实跑 black/isort/flake8/mypy/pytest，记录测试数、覆盖率、告警清单（作为文档数据唯一事实来源） | - | passing | 2026-10-17 完成 |
 | T002 | 代码深度审阅与全量修复：core/orchestrator/shadowkv/qdrift/ffn_optimizer 等模块，修复过期 docstring、死代码、逻辑缺陷、类型与格式问题 | T001 | passing | 2026-10-17 完成，含 `__init__.py` docstring 修复（FR3.4） |
-| T003 | 新建 AGENTS.md：写入「创新完成→README 全方位更新」「AR 完成→Gitee 推送」两条流程规则 + Gitee Push Runbook（适配 shadow-infer 仓库）；同步更新 .gitignore 排除 AGENTS.md 与 .opencode/ | - | pending | FR3.5 |
-| T004 | 设计生成深色科技风 SVG 封面横幅 assets/banner.svg（无 emoji，矢量可版本化） | - | pending | FR3.3 |
-| T005 | README 全方位重塑：封面+徽章、结构重组、数据统一（T001 实测）、TOC 补齐、架构图重绘、性能基准量化表格、Citation/社区章节、版本历史补 v3.2.0 与 v3.3.0 条目（版本号同步 pyproject.toml 与 `__version__`） | T001, T004 | pending | FR3.2 |
-| T006 | 关联文档修复：ROADMAP.md 链接与数据口径 | T001 | pending | FR3.4 |
-| T007 | 全套质量门禁复跑验证：五件套全绿，覆盖率不低于基线 | T002, T005, T006 | pending | FR3.1 验收 |
+| T003 | 新建 AGENTS.md：写入「创新完成→README 全方位更新」「AR 完成→Gitee 推送」两条流程规则 + Gitee Push Runbook（适配 shadow-infer 仓库）；同步更新 .gitignore 排除 AGENTS.md 与 .opencode/ | - | passing | 2026-10-17 完成 |
+| T004 | 设计生成深色科技风 SVG 封面横幅 assets/banner.svg（无 emoji，矢量可版本化） | - | passing | 2026-10-17 完成 |
+| T005 | README 全方位重塑：封面+徽章、结构重组、数据统一（T001 实测）、TOC 补齐、架构图重绘、性能基准量化表格、Citation/社区章节、版本历史补 v3.2.0 与 v3.3.0 条目（版本号同步 pyproject.toml 与 `__version__`） | T001, T004 | passing | 2026-10-17 完成 |
+| T006 | 关联文档修复：ROADMAP.md 链接与数据口径 | T001 | passing | 2026-10-17 完成 |
+| T007 | 全套质量门禁复跑验证：五件套全绿，覆盖率不低于基线 | T002, T005, T006 | passing | 2026-10-17 完成，581 passed/80.84% |
 | T008 | Review 合规检查 + ST 验收：README 渲染检查（锚点/链接/SVG）、AGENTS.md 排除验证 | T003, T007 | pending | |
 | T009 | AR 归档 + 按 Runbook 推送 Gitee：向用户索取 token、分批推送 main→master、三核验、确认 AGENTS.md 不在远端 | T003, T008 | pending | FR3.6 |
 
@@ -49,6 +49,15 @@
 - 修改文件：33 个 .py + pyproject.toml（详见 commit 8c24c77）
 - 测试：受影响模块子集 104 passed；orchestrator 全量 24 passed
 - 备注：修复后全量门禁复跑在 T007 执行
+
+### 2026-10-17 会话记录（T003-T007）
+
+- T003：AGENTS.md 落地（两条流程规则 + Gitee Push Runbook 适配），.gitignore 排除验证通过（git check-ignore）
+- T004：assets/banner.svg 生成并通过校验（XML 合法、无 emoji、viewBox 完整）
+- T005：README 全方位重塑（三层渐进披露结构、实测数据口径 581/80.84%、v3.3.0 版本历史、Citation 章节）；修复快速开始示例与真实 API 不符缺陷
+- T006：ROADMAP.md 链接/口径修复、已实现项勾选、新增 CPU 路径向量化待办
+- T007：五件套门禁全绿（black/isort/flake8/mypy 零告警；pytest 581 passed, 1 skipped, 覆盖率 80.84%，442s）
+- 发现并记录：CPU fallback 下优化路径开销大于收益（设计级性能项，已入 ROADMAP 待办，不在本 AR 强改）
 
 ## 阶段门控记录
 
