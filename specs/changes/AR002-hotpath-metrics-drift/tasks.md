@@ -11,12 +11,12 @@
 
 | ID | 任务描述 | 依赖 | 状态 | 备注 |
 |----|---------|------|------|------|
-| T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | pending | 证据存 specs/changes/AR002-hotpath-metrics-drift/baseline-profile.md |
+| T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | passing | 2026-10-17 完成；证据存 baseline-profile.md（含 FFN unpack 36.2% 双热点发现） |
 | T002 | M6 指标真实化：step 真实 perf_counter 计时接入 perf_data；内存对账与告警；调度器真实延迟奖励；benchmarks 移除硬编码 mock 断言 | T001 | pending | FR3.1 |
 | T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | pending | FR3.1 验收 |
 | T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | pending | FR3.2 |
 | T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | pending | FR3.2 验收 |
-| T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试 | T004 | pending | FR3.3 |
+| T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | pending | FR3.3 + design §7.2 |
 | T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | pending | FR3.4 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | pending | FR NFR |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | pending | FR3.5 |
@@ -59,3 +59,10 @@
 - 修复：缓存改为「(step_id, layer_id) 定位键 + 输入指纹校验」（4.2.2 点 5，四处口径统一）；#3 表/4.4/6.3 增补 benchmarks 清理；scale 论证补 (N, batch, head_dim)→amax(dim=-1) 逐 batch 等价 + golden 覆盖 batch>1；fork 改 repeat 循环
 - 第 2 轮：**PASS**（4 项全修复，无新 Critical/Important；2 项实现层 Minor 随编码处理：int4 scale 分组维注释 + quantize_batch 形状契约）
 - 决定：准予进入开发阶段
+
+### 2026-10-17 开发阶段 design 增补（T001 实证修订，用户已授权全流程自动化）
+
+- 触发：T001 基线画像（真实后端净墙钟 7.29×）推翻 design 4.1 可达性测算输入（「FFN ≈ 11 ms」失真，实测 FFN on_step 22.95 s，其中 unpack 17.13 s 占 36.2%）
+- 修订：design.md 新增 §7——M5 扩展「FFN 反量化结果缓存」（精度计划指纹校验，语义等价零风险）；可达性重估 1.47×（内部比）
+- 依据：baseline-profile.md §3；srs FR3.3 记忆化语义在 FFN 平面的应用，M7（channel_mask 行为）仍 Out of Scope
+- 决定：准予按修订后设计继续开发（T006 范围同步扩展）
