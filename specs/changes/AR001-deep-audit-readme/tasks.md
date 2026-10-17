@@ -59,6 +59,14 @@
 - T007：五件套门禁全绿（black/isort/flake8/mypy 零告警；pytest 581 passed, 1 skipped, 覆盖率 80.84%，442s）
 - 发现并记录：CPU fallback 下优化路径开销大于收益（设计级性能项，已入 ROADMAP 待办，不在本 AR 强改）
 
+### 2026-10-17 审查记录（T008 Review）
+
+- 审查结果：PASS（第 1 轮）
+- S 维度：S1/S2/S4/S5 通过；S3 Minor——ffn_optimizer_agent.py 残留 5 处 FFN_OPTIMIZER_AGENT.md docstring 引用，已修复（e678d14，失效引用全库清零）
+- D 维度：D1-D4 全部通过（safety_degraded 关键字参数默认值不破坏调用；影响范围与 design §4.4 一致；两处偏离均有记录）
+- C 维度：C1-C3 全部通过（公开 API/CLI 未破坏、无 emoji、提交信息合规）
+- 修复后验证：test_ffn_optimizer 18 passed；black/isort/flake8/mypy 单文件全绿
+
 ## 阶段门控记录
 
 > 由 sdd-phase-gate skill 在阶段门控审查后追加，记录每轮审查结果（PASS/FAIL + 轮次）。
