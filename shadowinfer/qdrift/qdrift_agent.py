@@ -36,6 +36,11 @@ class QDriftAgent(BaseAgent):
         self.noise_schedule: str = config.get("noise_schedule", "cosine")
         self.temperature: float = config.get("sensitivity_temperature", 1.0)
         self.drift_method: str = config.get("drift_method", "relative_l2")
+        # M3-lite：位置先验权重 alpha（配置键 qdrift.positional_prior_weight），
+        # sensitivity = alpha * 位置先验 + (1 - alpha) * 实测扰动响应
+        self.positional_prior_weight: float = min(
+            max(float(config.get("positional_prior_weight", 0.3)), 0.0), 1.0
+        )
         self.logger: StructuredLogger = StructuredLogger("qdrift", config.get("log_dir", "logs/"))
 
     # ------------------------------------------------------------------
@@ -92,14 +97,19 @@ class QDriftAgent(BaseAgent):
         activation_previous = inputs.get("activation_previous")
         profiler_feedback: Optional[Dict] = inputs.get("profiler_feedback")
 
-        # 1. Step Sensitivity Estimation
-        sensitivity_score = self.estimate_sensitivity(
+        # 1. Step Sensitivity Estimation（M3-lite：提供 previous/current 张量时
+        #    混入实测扰动响应，缺失时回退纯位置先验，行为与 v3.3.0 一致）
+        sensitivity_score = self.compute_sensitivity(
             step_id=step_id,
             total_steps=total_steps,
             noise_level=noise_level,
             noise_schedule=self.noise_schedule,
             temperature=self.temperature,
             profiler_feedback=profiler_feedback,
+            query_current=query_current,
+            query_previous=query_previous,
+            activation_current=activation_current,
+            activation_previous=activation_previous,
         )
 
         # 2. Activation Drift Detection
@@ -349,8 +359,10 @@ class QDriftAgent(BaseAgent):
             query_drift = KL(query_current_norm || query_prev_norm)
             activation_drift = 0.0
 
-        综合：drift_score = 0.6 * query_drift + 0.4 * activation_drift
-        return clamp(drift_score, 0.0, 1.0)
+        综合：raw_drift = 0.6 * query_drift + 0.4 * activation_drift
+        归一化：drift_score = tanh(raw_drift)（AR002 M3-lite 修复：原
+        clamp(raw, 0, 1) 使大幅扰动塌缩为恒 1.0、丢失动态范围；tanh 单调
+        且将 [0, inf) 映射到 [0, 1)，恢复可分辨的动态范围）
 
         Args:
             query_current: 当前 step 的 query tensor。
@@ -360,7 +372,36 @@ class QDriftAgent(BaseAgent):
             method: 漂移检测方法，"relative_l2" | "cosine_similarity" | "kl_divergence"。
 
         Returns:
-            漂移分数，范围 [0.0, 1.0]。
+            漂移分数，范围 [0.0, 1.0)。
+        """
+        raw_drift = self._compute_raw_drift(
+            query_current=query_current,
+            query_previous=query_previous,
+            activation_current=activation_current,
+            activation_previous=activation_previous,
+            method=method,
+        )
+        return float(math.tanh(raw_drift))
+
+    def _compute_raw_drift(
+        self,
+        query_current: torch.Tensor,
+        query_previous: torch.Tensor,
+        activation_current: torch.Tensor,
+        activation_previous: torch.Tensor,
+        method: str = "relative_l2",
+    ) -> float:
+        """计算未归一化的原始漂移值（供 detect_drift 与 compute_sensitivity 复用）。
+
+        Args:
+            query_current: 当前 step 的 query tensor。
+            query_previous: 上一 step 的 query tensor。
+            activation_current: 当前 step 的 activation tensor。
+            activation_previous: 上一 step 的 activation tensor。
+            method: 漂移检测方法，"relative_l2" | "cosine_similarity" | "kl_divergence"。
+
+        Returns:
+            原始漂移值（>= 0，未做归一化与 clamp）。
         """
         # 如果缺少 previous tensor，无法计算漂移，返回 0.0
         if query_previous is None or activation_previous is None:
@@ -393,9 +434,95 @@ class QDriftAgent(BaseAgent):
                 activation_current, activation_previous
             )
 
-        # 综合漂移分数
-        drift_score = 0.6 * query_drift + 0.4 * activation_drift
-        return float(max(0.0, min(1.0, drift_score)))
+        # 综合原始漂移值（未 clamp，由调用方决定归一化方式）
+        raw_drift = 0.6 * query_drift + 0.4 * activation_drift
+        return float(max(0.0, raw_drift))
+
+    # ------------------------------------------------------------------
+    # 核心算法 2b: 实测敏感度（M3-lite：位置先验 + 实测扰动响应混合）
+    # ------------------------------------------------------------------
+
+    def compute_sensitivity(
+        self,
+        step_id: int,
+        total_steps: int,
+        noise_level: float,
+        noise_schedule: str = "cosine",
+        temperature: float = 1.0,
+        profiler_feedback: Optional[Dict] = None,
+        query_current: Optional[torch.Tensor] = None,
+        query_previous: Optional[torch.Tensor] = None,
+        activation_current: Optional[torch.Tensor] = None,
+        activation_previous: Optional[torch.Tensor] = None,
+    ) -> float:
+        """计算混合敏感度：位置先验与实测扰动响应的凸组合。
+
+        算法（AR002 design 4.1 M3-lite）：
+            sensitivity = clamp(
+                alpha * positional_base + (1 - alpha) * tanh(raw_drift), 0, 1)
+
+        - positional_base：现有 estimate_sensitivity 结果（纯位置先验，
+          含噪声修正与 profiler 反馈调整）；
+        - raw_drift：_compute_raw_drift 的未 clamp 原始漂移值，tanh 归一化
+          后作为实测扰动响应（动态范围不再塌缩为恒 1.0）；
+        - alpha：位置先验权重，配置键 positional_prior_weight（顶层路径
+          qdrift.positional_prior_weight），默认 0.3；
+        - 四个张量参数默认 None，全部缺失时行为与 v3.3.0 的
+          estimate_sensitivity 完全一致；current 存在而 previous 缺失时
+          回退位置先验并记录 info 日志。
+
+        Args:
+            step_id: 当前 step id。
+            total_steps: 总 step 数。
+            noise_level: 当前噪声水平。
+            noise_schedule: 噪声调度策略，"linear" | "cosine" | "sigmoid"。
+            temperature: 敏感度温度参数。
+            profiler_feedback: 可选的 profiler 反馈字典，含 accuracy_delta 等。
+            query_current: 当前 step 的 query tensor（可选）。
+            query_previous: 上一 step 的 query tensor（可选）。
+            activation_current: 当前 step 的 activation tensor（可选）。
+            activation_previous: 上一 step 的 activation tensor（可选）。
+
+        Returns:
+            混合敏感度分数，范围 [0.0, 1.0]。
+        """
+        positional_base = self.estimate_sensitivity(
+            step_id=step_id,
+            total_steps=total_steps,
+            noise_level=noise_level,
+            noise_schedule=noise_schedule,
+            temperature=temperature,
+            profiler_feedback=profiler_feedback,
+        )
+
+        tensors_present = [
+            query_current,
+            query_previous,
+            activation_current,
+            activation_previous,
+        ]
+        if any(t is None for t in tensors_present):
+            # 异常回退：current 存在而 previous 缺失时记录 info 日志
+            if query_current is not None or activation_current is not None:
+                self.logger.log_alert(
+                    "info",
+                    "previous tensors missing; sensitivity falls back to " "positional prior",
+                    step_id=step_id,
+                )
+            return positional_base
+
+        raw_drift = self._compute_raw_drift(
+            query_current=query_current,
+            query_previous=query_previous,
+            activation_current=activation_current,
+            activation_previous=activation_previous,
+            method=self.drift_method,
+        )
+        measured_response = math.tanh(raw_drift)
+
+        alpha = self.positional_prior_weight
+        blended = alpha * positional_base + (1.0 - alpha) * measured_response
+        return float(max(0.0, min(1.0, blended)))
 
     # ------------------------------------------------------------------
     # 核心算法 3: 调度策略生成

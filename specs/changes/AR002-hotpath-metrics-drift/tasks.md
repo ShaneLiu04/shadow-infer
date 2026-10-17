@@ -17,7 +17,7 @@
 | T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | passing | 2026-10-17 完成；FR3.2；详见进度记录 |
 | T005 | M1 golden test：随机输入下向量化 vs reference 逐元素一致（容差 1e-6）+ 压缩耗时下降 ≥5 倍证据 | T004 | passing | 2026-10-17 完成；test_m1_vectorization.py 8 用例（含 5× perf 实测通过）；详见进度记录 |
 | T006 | M5 记忆化与记账修复：决策缓存（step 边界失效）、on_init 重置 bug 修复、memory_mb 真实节省口径；同 step 重复调用耗时下降 ≥90% 测试；含 design §7 增补的 FFN 反量化结果缓存 | T004 | passing | 2026-10-17 完成；test_m5_memoization.py 13 用例；详见进度记录 |
-| T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | pending | FR3.4 |
+| T007 | M3-lite 实测漂移灵敏度：扰动响应计算接入、位置先验 α 混合（默认 0.3）、drift_score 归一化修复、Spearman ≥ 0.9 统计测试 | T002 | passing | 2026-10-17 完成；详见进度记录 |
 | T008 | 端到端性能验收：run_optimized ≤ 1.5 × run_baseline（CPU 实测落档）；五件套门禁全绿 | T002-T007 | pending | FR NFR |
 | T009 | README 四检查点更新（v3.4.0：特性表/版本历史/性能基准实测表/结构口径）+ ROADMAP 同步 | T008 | pending | FR3.5 |
 | T010 | Review 合规检查（S/D/C 维度）+ ST 验收（st-cases.md）+ 归档 | T009 | pending | |
@@ -103,3 +103,15 @@
   - 指纹 data_ptr 跨 step 地址复用风险被 step 滚动清空消除（同 step 内层间调用输入即同一张量对象）
 - 效果佐证：全量测试套件耗时 296.8s → 214.9s（决策缓存在 orchestrator 逐层重复调用场景生效）
 - 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 623 passed / 1 skipped / 覆盖率 81.62%（fail-under 75）
+
+### 2026-10-17 T007 会话记录
+
+- 完成任务：T007（M3-lite 实测漂移灵敏度，FR3.4 + design 4.1）
+- 修改文件：
+  - qdrift/qdrift_agent.py：__init__ 新增 positional_prior_weight（配置键 positional_prior_weight，顶层路径 qdrift.positional_prior_weight，默认 0.3，clamp [0,1]）；detect_drift 重构为 _compute_raw_drift（未归一化原始值）+ tanh 归一化（修复恒 1.0 塌缩，恢复动态范围）；新增 compute_sensitivity（可选关键字 query_previous/activation_previous/query_current/activation_current，默认 None 时行为与 v3.3.0 estimate_sensitivity 完全一致；公式 clamp(α·位置先验 + (1−α)·tanh(raw_drift), 0, 1)；previous 缺失回退位置先验 + log_alert("info")）；on_step Step 1 接线 compute_sensitivity（传入四张量）
+  - tests/test_qdrift.py：新增 _spearman 手写秩相关（平均秩，无 scipy 依赖；零方差序列返回 0 以判定塌缩）+ TestComputeSensitivity 7 用例（默认缺省等价/previous 缺失回退+日志/混合公式精确对照 design/扰动幅度单调响应/动态范围恢复（2.0 vs 8.0，避开 float64 tanh 饱和区 x>19）/Spearman 50 组 ≥0.9（幅度 0.1-4.9 跨越原 clamp 塌缩区）/on_step 接线偏离纯位置先验）
+- 关键决策：
+  - tanh 饱和极限：tanh(x) 在 x>19 后 float64 下恒 1.0（浮点极限非缺陷），动态范围测试幅度选 2.0/8.0
+  - Spearman 测试固定 step_id（位置进度恒定），秩序完全由实测扰动响应决定——可同时判定 α 权重失效（全并列 → 0.0）与归一化塌缩（大幅段并列 → <0.9）两类回归
+  - drift_score 语义变更（clamp→tanh）保持 [0,1) 值域与零漂移=0，现有 3 个 drift 用例（仅断言值域与零点）无需更新；下游 test_orchestrator/test_real_backend_integration/test_scheduler 54 用例实测无 dispatch 翻转
+- 质量门禁：black/isort/flake8/mypy 全绿；全量 pytest 630 passed / 1 skipped（test_qdrift 18 用例）
