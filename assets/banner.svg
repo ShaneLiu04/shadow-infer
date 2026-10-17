@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="ShadowInfer - 面向端侧的 Diffusion LLM 推理优化框架">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1220"/>
+      <stop offset="0.55" stop-color="#0E1729"/>
+      <stop offset="1" stop-color="#10192E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="0.5" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="layerGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#3B82F6" stroke-width="0.6" opacity="0.07"/>
+    </pattern>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="300" fill="url(#grid)"/>
+
+  <!-- Ambient glows -->
+  <ellipse cx="1010" cy="150" rx="260" ry="150" fill="#8B5CF6" opacity="0.10"/>
+  <ellipse cx="180" cy="60" rx="300" ry="120" fill="#22D3EE" opacity="0.07"/>
+
+  <!-- Diagonal light streaks -->
+  <path d="M -40 285 L 470 -35" stroke="url(#accent)" stroke-width="1.6" opacity="0.5" filter="url(#glow)"/>
+  <path d="M -40 320 L 540 -35" stroke="url(#accent)" stroke-width="0.8" opacity="0.28" filter="url(#glow)"/>
+  <path d="M 700 335 L 1240 -30" stroke="url(#accent)" stroke-width="0.8" opacity="0.22" filter="url(#glow)"/>
+
+  <!-- Abstract KV-cache layers (stacked parallelograms, right side) -->
+  <g transform="translate(925,74)" opacity="0.92">
+    <path d="M0 128 L58 100 L58 72 L0 100 Z" fill="#17304E" opacity="0.55"/>
+    <path d="M0 100 L58 72 L58 44 L0 72 Z" fill="#1B3A5E" opacity="0.65"/>
+    <path d="M0 72 L58 44 L58 16 L0 44 Z" fill="#21466E" opacity="0.75"/>
+    <path d="M0 44 L58 16 L58 -12 L0 16 Z" fill="url(#layerGrad)" opacity="0.85"/>
+    <path d="M0 16 L58 -12 L58 -40 L0 -12 Z" fill="url(#layerGrad)" opacity="0.45"/>
+  </g>
+
+  <!-- Denoising step curve (bottom-right, converging upward) -->
+  <g filter="url(#glow)">
+    <polyline points="830,246 880,236 930,240 980,214 1030,204 1080,168 1130,146 1180,110"
+      fill="none" stroke="url(#accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  </g>
+  <g fill="#22D3EE" opacity="0.9">
+    <circle cx="830" cy="246" r="3.5"/>
+    <circle cx="880" cy="236" r="3.5"/>
+    <circle cx="930" cy="240" r="3.5"/>
+    <circle cx="980" cy="214" r="3.5"/>
+    <circle cx="1030" cy="204" r="3.5"/>
+    <circle cx="1080" cy="168" r="3.5"/>
+    <circle cx="1130" cy="146" r="3.5"/>
+    <circle cx="1180" cy="110" r="5" fill="#8B5CF6" filter="url(#softGlow)"/>
+  </g>
+
+  <!-- Horizon line -->
+  <rect x="0" y="292" width="1200" height="2" fill="url(#accent)" opacity="0.35"/>
+
+  <!-- Title block -->
+  <text x="84" y="152" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif"
+    font-size="62" font-weight="700" fill="#F8FAFC" letter-spacing="7">ShadowInfer</text>
+  <rect x="88" y="172" width="384" height="3.5" rx="1.75" fill="url(#accent)" filter="url(#glow)"/>
+  <text x="86" y="214" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif"
+    font-size="22" fill="#CBD5E1" letter-spacing="2">面向端侧的 Diffusion LLM 推理优化框架</text>
+  <text x="86" y="248" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif"
+    font-size="15" fill="#64748B" letter-spacing="1">ShadowKV 决策平面 · Q-drift 步感知调度 · FFN 动态剪枝 · 生产级安全网</text>
+</svg>
