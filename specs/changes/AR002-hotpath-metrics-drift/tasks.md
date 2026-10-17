@@ -11,7 +11,7 @@
 
 | ID | 任务描述 | 依赖 | 状态 | 备注 |
 |----|---------|------|------|------|
-| T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | passing | 2026-10-17 完成；证据存 baseline-profile.md（含 FFN unpack 36.2% 双热点发现） |
+| T001 | 热路径基线画像：cProfile 采集 6-step CPU 流水线，量化 ShadowKV 压缩/打包/决策/仲裁耗时占比，落档为后续验收对照基线 | - | passing | 2026-10-17 完成（optimize_full.yaml 口径复测：baseline 3817.7ms / optimized 46295.7ms = 12.1× 倒挂；shadowkv 支线 48.1%、FFN unpack 33.7% 双热点；drift_score 0.0→恒 1.0 退化实录；证据存 baseline-profile.md） |
 | T002 | M6 指标真实化：step 真实 perf_counter 计时接入 perf_data；内存对账与告警；调度器真实延迟奖励；benchmarks 移除硬编码 mock 断言 | T001 | pending | FR3.1 |
 | T003 | M6 语义测试更新：依赖零值指标的旧断言按真实语义修订（注明依据）；新增墙钟一致性测试 | T002 | pending | FR3.1 验收 |
 | T004 | M1 决策面张量化：compress_kv 按 precision 分组批量量化、reuse_mask 张量索引、packed_kv_cache 向量化；保留 reference 循环路径为兜底 | T001 | pending | FR3.2 |
