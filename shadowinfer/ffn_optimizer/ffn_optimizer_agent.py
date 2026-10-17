@@ -473,7 +473,7 @@ class FFNOptimizerAgent(BaseAgent):
         """
         分析 FFN 中间层各通道的重要性。
 
-        算法（对应 FFN_OPTIMIZER_AGENT.md §核心算法 1）：
+        算法（对应 README.md《核心算法 - FFN 通道剪枝》重要性分析）：
         - activation_magnitude: 中间激活的绝对值均值
             intermediate = linear(ffn_input, weight_up)  # [batch, seq_len, intermediate_dim]
             importance = mean(abs(intermediate), dim=[0, 1])
@@ -528,7 +528,7 @@ class FFNOptimizerAgent(BaseAgent):
         """
         对 FFN 权重进行混合精度量化。
 
-        算法（对应 FFN_OPTIMIZER_AGENT.md §核心算法 2）：
+        算法（对应 README.md《核心算法 - FFN 通道剪枝》重要性融合）：
         对每个 channel_idx:
         - importance >= 0.7: FP16（直接 half().float()）
         - 0.3 <= importance < 0.7: INT8（scale = max(abs) / 127, round, clamp）
@@ -634,7 +634,7 @@ class FFNOptimizerAgent(BaseAgent):
         """
         稀疏更新 FFN 输出。
 
-        算法（对应 FFN_OPTIMIZER_AGENT.md §核心算法 3）：
+        算法（对应 README.md《核心算法 - FFN 通道剪枝》阈值自适应）：
         1. input_delta = abs(ffn_input_current - ffn_input_previous)
         2. relative_delta = mean(input_delta, dim=-1) / (mean(abs(current), dim=-1) + 1e-8)
         3. changed_mask = relative_delta > delta_threshold
@@ -712,7 +712,7 @@ class FFNOptimizerAgent(BaseAgent):
         """
         增量重构 FFN 输出。
 
-        算法（对应 FFN_OPTIMIZER_AGENT.md §核心算法 4）：
+        算法（对应 README.md《核心算法 - FFN 通道剪枝》通道排序）：
         1. input_delta = ffn_input_current - ffn_input_previous
         2. significant_delta = where(||delta|| > threshold, delta, 0)
         3. delta_intermediate = gelu(linear(significant_delta, weight_up))
@@ -766,7 +766,7 @@ class FFNOptimizerAgent(BaseAgent):
         """
         选择 FFN 计算路径。
 
-        对应 FFN_OPTIMIZER_AGENT.md §核心算法 5：
+        对应 README.md《核心算法 - FFN 通道剪枝》掩码应用：
         - mode == "full": 直接返回 "full"
         - mode == "mixed": 返回 "mixed_full"（量化但完整计算）
         - mode == "sparse":
