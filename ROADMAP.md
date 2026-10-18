@@ -62,7 +62,17 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [ ] **FFN dequantization/unpack vectorization**: the packed-weight unpack path is
       still an element-wise Python hot path (~57% of the optimized-path profile in
       the v3.4.0 CPU benchmark); the residual end-to-end gap to the 1.5x target.
-      Next AR candidate.
+      Planned AR004 (with FFN-P1 layer-shared cache fix and FFN-P3 per-channel loop).
+- [x] **Decision-signal correctness + IRAP** (v3.5.0, AR003): explicit attention
+      contract (single normalization, KV-P2), received-attention importance axis
+      with sink protection (KV-P3), cross-step EMA with constant memory (KV-P9),
+      pre-pack budget admission + pressure-driven global eviction (KV-P4/P8/P10),
+      delta-A drift export to Q-drift. Benefit claims pending GPU experiment plan
+      (`specs/changes/AR003-irap-signal-integrity/experiment-plan.md`).
+- [ ] **AOG overhead gating** (planned AR005): device-aware adaptive overhead gating
+      with K-step decision cadence and pre-flight arbitration (ORC-P1/ORC-P3).
+- [ ] **Macroblock rate control** (planned AR006): SKIP/DELTA/REFRESH reuse modes with
+      rate-distortion control and per-precision free-list slab allocator.
 - [x] Continuous benchmarking and performance regression tracking.
 - [x] English documentation and broader internationalization — all content consolidated into the Chinese README.md.
 
@@ -96,9 +106,13 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 
 - [x] Token-level reuse decisions.
 - [x] Packed KV cache storage (real byte-level compression).
-- [x] Importance-aware eviction for long-context scenarios.
+- [x] Importance-aware eviction for long-context scenarios (production-wired in AR003:
+      pre-pack admission + memory-pressure driven cross-layer eviction).
 - [x] KV cache prefetching based on Q-drift sensitivity predictions.
 - [x] Formalize ShadowKV as Importance / Precision / Reuse planes.
+- [x] IRAP received-attention importance: column-wise received attention, EMA
+      propagation, rank normalization, sink hard protection, delta-A drift signal.
+- [ ] Wire `KVDecisionPlane` singleton as the single dispatch path (KV-P7 remainder, AR005).
 
 ### 3.5 FFN Optimization
 

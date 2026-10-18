@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.4.0 | 630 passed / 1 skipped | 81.68% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.5.0 | 697 passed / 1 skipped | 81.89% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -52,9 +52,10 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | 特性 | 说明 |
 |------|------|
 | **ShadowKV 决策平面** | 形式化 Importance / Drift / Memory-Pressure 三维平面，统一输出 precision / reuse / eviction 决策。 |
+| **IRAP 接收注意力重要性（v3.5.0，机制说明未验证）** | 重要性主信号由 query 行熵改为 KV 列向接收注意力的跨步 EMA 传播（Incremental Received-Attention Propagation）：常数内存、增量计算、对齐 H2O / StreamingLLM 语义；attention 输入契约显式化（logits / probabilities）并只归一化一次；注意力 sink 前缀硬保护。收益声称待大规模实验验证（protocol 见 `specs/changes/AR003-irap-signal-integrity/experiment-plan.md`）。 |
 | **热路径张量化** | ShadowKV 重要性评分、精度分配、复用决策、压缩与打包全链路向量化，压缩耗时较逐元素实现下降约 20x（CPU 实测）；逐元素 reference 实现保留作 golden 对照与异常兜底。 |
-| **字节级混合精度 KV Cache** | 支持 FP16 / INT8 / INT4 按需存储，per-token-head 动态分配精度。 |
-| **重要性感知驱逐** | 显存预算超限时按重要性回收低价值 token-head，支持 LRU / age 策略。 |
+| **字节级混合精度 KV Cache** | 支持 FP16 / INT8 / INT4 按需存储，per-token-head 动态分配精度；INT4 分组随 head_dim 自适应。 |
+| **预算准入与重要性感知驱逐（v3.5.0）** | 压缩前按重要性升序降档（fp32→fp16→int8→int4 阶梯）以满足层预算，单次打包零重打包；显存压力超阈时跨层驱逐最低重要性 token-head（sink 保护）；字节估算按 per-precision bits 精确记账（修复 8x 低估）。 |
 | **KV Cache 预取** | 基于 Q-drift 敏感度预测下一 step 复用 mask，提前 stage KV 数据。 |
 | **Q-drift 步感知调度** | 敏感度由位置先验与实测扰动响应凸组合（默认权重 0.3 / 0.7），结合激活漂移动态选择 ShadowKV / FFN 工作模式；扰动响应与真实扰动幅度的 Spearman 秩相关 >= 0.9。 |
 | **决策记忆化** | 同 (step, layer) 同输入的决策缓存（输入指纹校验、step 边界失效、异常旁路）与 FFN 反量化结果缓存，重复调用决策耗时下降 >= 90%。 |
@@ -296,13 +297,30 @@ Profiler  ShadowKV  Q-drift  FFN Optimizer
 
 ### ShadowKV 分层压缩
 
-1. **Importance Scoring**
+1. **Importance Scoring（v3.5.0：IRAP 接收注意力）**
+
    ```python
-   # 基于 attention entropy 计算 token-head 重要性
-   weights = F.softmax(attn_weights, dim=-1)
-   entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
-   score = (entropy / math.log(seq_len)) * (1 + 0.1 * layer_id / num_layers)
+   # 0) 契约归一化：真实后端返回 post-softmax 概率（跳过 softmax，仅行和校正）
+   #    mock / 原始 logits 路径：单次 softmax（绝不重复归一化）
+   weights = probs if attn_is_probabilities else F.softmax(attn_logits, dim=-1)
+
+   # 1) 列向接收注意力：KV token 被全部 query 关注的程度（H2O / StreamingLLM 口径）
+   received[t, h] = weights[:, h, :, t].mean()
+
+   # 2) IRAP 跨步 EMA 传播（常数内存，无历史列表）
+   A[t, h] = gamma * A_prev[t, h] + (1 - gamma) * received[t, h]   # gamma 默认 0.9
+
+   # 3) rank 归一化（逐 head 在 token 维，长尾稳健） + 行熵辅助（beta 默认 0.3）
+   rank[t, h] = dense_rank(A[:, h]) / seq_len
+   importance = clamp(((1 - beta) * rank + beta * normalized_entropy) * layer_factor, max=1)
+
+   # 4) sink 硬保护：前 sink_tokens（默认 4）个 token 强制最高档，且不可驱逐
+   importance[:sink_tokens] = 1.0
    ```
+
+   状态内存为每层 `seq_k x heads` 的张量（O(1) 于步数），跨步差分
+   `delta_a = ||A_t - A_prev|| / ||A_prev||` 作为可选漂移信号导出给 Q-drift
+   （`use_importance_drift`，默认关闭，一步滞后传递）。
 
 2. **Precision Allocation**
 
@@ -312,6 +330,12 @@ Profiler  ShadowKV  Q-drift  FFN Optimizer
    | 0.5 - 0.8 | FP16 | 半精度 |
    | 0.2 - 0.5 | INT8 | 8-bit 量化 |
    | < 0.2 | INT4 | 4-bit 量化 / 复用 |
+
+   配置显存预算（`memory_budget_mb`）时，精度分配后先做**预算准入**：
+   非 sink 条目按重要性升序逐级降档，直至该层预估字节（per-precision bits
+   + scale 精确记账）不超过 `预算 // 层数`；触底仍超时告警但保留 int4 底线。
+   `memory_pressure >= eviction_pressure_threshold`（默认 0.9）时触发跨层
+   全局驱逐（10% 迟滞带，sink 永不驱逐）。
 
 3. **复用决策**
    ```python
@@ -659,6 +683,79 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.5.0，2026-10-18，Windows / CPU fallback）
+
+**质量与测试**
+
+| 指标 | 实测值 | 说明 |
+|------|--------|------|
+| 测试通过率 | 697 passed / 1 skipped | 全量套件（新增 IRAP / 预算准入 / ΔA 信号 72 个用例） |
+| 测试覆盖率 | 81.89% | pytest-cov（门禁 fail-under 75） |
+| 静态检查 | black / isort / flake8 / mypy 全部零告警 | 提交前强制门禁 |
+| 向量化 golden 精度 | vec vs 逐元素 reference max\|Δ\| <= 1e-6 | 两契约（logits / probabilities）、sink 边界、EMA 增量 vs 全量 |
+| IRAP 常数内存 | 200 步后状态形状/字节不增长 | O(1) 于步数（事务级断言） |
+
+> **v3.5.0 端到端性能：** 本版本变更决策语义（重要性信号与预算准入），未改变
+> 压缩链路的数据通路复杂度；按当前项目指令暂停大规模端到端实验，E2E 指标以
+> v3.4.0 实测为基线（1.61x 中位，CPU fallback），v3.5.0 的收益与精度影响
+> **标记为「机制说明（未验证）」**，复现协议见下节与
+> `specs/changes/AR003-irap-signal-integrity/experiment-plan.md`。
+
+### 大规模复现实验指南（高速算力服务器）
+
+目标：在 GPU 服务器上验证 IRAP 决策平面在真实 7B 级 Diffusion LLM 上的
+压缩收益与精度影响。协议遵循仓库实验铁律（同机同参同种子、>=3 次重复取
+中位、>=3 个规模点、golden/统计证据落档）。
+
+**1. 环境**
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,cuda]"     # 或按 pyproject 安装 torch 并启用 CUDA kernel
+python -c "import torch; print(torch.cuda.get_device_name(0), torch.__version__)"
+```
+
+**2. 受测配置（3 个规模点）**
+
+| 规模点 | 模型 | seq_len | denoising steps | batch | 预算 |
+|--------|------|---------|-----------------|-------|------|
+| S1 冒烟 | SimpleDiffusionLLM（内置，CPU/GPU 均可） | 128 | 6 | 1 | 不设 |
+| S2 中等 | 开源 7B Diffusion LLM（如 LLaDA-8B / Dream-7B，HuggingFace 后端） | 512 | 32 | 1 | 6 GB |
+| S3 长上下文 | 同上 | 2048 | 32 | 1 | 6 GB（压力触发驱逐） |
+
+模型与超参见 `configs/model_fast_dllm_7b.yaml`；优化开关见
+`configs/optimize_full.yaml`（`shadowkv.irap_decay / entropy_weight /
+sink_tokens / eviction_pressure_threshold / memory_budget_mb`）。
+
+**3. 对照与运行**
+
+```bash
+# 每组配置重复 3 次（不同进程），记录中位数与区间
+for i in 1 2 3; do
+  python -m shadowinfer optimize --model <MODEL> --backend pytorch \
+    --device cuda --num-steps 32 --config configs/optimize_full.yaml \
+    --prompt "<固定提示集>" --seed 42 --output outputs/irap_r$i
+done
+python -m shadowinfer profiler --model <MODEL> --backend pytorch --device cuda \
+  --num-steps 32 --config configs/profiler_full.yaml --output outputs/profile
+```
+
+**4. 采集指标（落档到 `outputs/irap_r*/` 汇总表）**
+
+- 延迟：e2e_ms、per_step_ms（内部计时与外部墙钟对照，偏差 <= 1% 才采信）；
+- 显存：峰值显存、KV packed bytes（应 <= 预算；S3 应观察到 pressure 触发驱逐）；
+- 质量：perplexity / 任务准确率相对基线变化（对照：`attn_is_probabilities`
+  正确接线 vs 旧双重 softmax 路径）；
+- 决策质量：sink token 精度档位（应为 fp32）、精度分布（非 fp32 占比、档位种类）、
+  重要性 vs 列向接收注意力 Spearman（>= 0.9）；
+- 稳定性：`delta_a` 步序列、驱逐计数、告警计数（触底告警应为 0 除 S3 极端设置）。
+
+**5. 判定**
+
+- 延迟与显存收益：3 次中位，报告区间；
+- 精度影响：与基线差异的置信区间（>=3 种子）；
+- 任何「优于 baseline」的结论必须有上述数据落档后才可写入 README。
+
 ### 实测数据（v3.4.0，2026-10-17，Windows / CPU fallback）
 
 **质量与测试**
@@ -855,6 +952,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.5.0（2026-10）
+
+- 决策信号正确性修复（KV-P2/P3）：attention 输入契约显式化（`attn_is_probabilities`，真实后端 post-softmax 不再二次 softmax，logits 路径仅一次归一化）；重要性主体由 query 行熵改为 KV 列向接收注意力（对齐 H2O / StreamingLLM），修复 sink token 被判最低档的轴向反转；
+- IRAP 接收注意力传播（FR3.3）：跨步 EMA（`irap_decay` 默认 0.9）取代无界 `importance_history`，决策状态常数内存（实测 200 步零增长）；rank 归一化 + 行熵辅助（`entropy_weight` 默认 0.3）+ sink 前缀硬保护（`sink_tokens` 默认 4）；公式单源化（`ImportanceModel` 委托共享核心）；
+- 预算闭环（KV-P4/P8/P10）：pre-pack 降档准入（单次打包零重打包）、`memory_pressure` 消费与跨层驱逐（10% 迟滞）、per-precision 字节精确记账（修复 8x 低估）；
+- ΔA 跨步差分信号（FR3.5）：每步导出并一步滞后供 Q-drift 可选融合（`use_importance_drift` 默认关闭，关闭时逐位不变）；
+- 顺带修复：小 `head_dim`（不可被 64 整除）INT4 量化直接抛错缺陷（分组自适应）；
+- 质量门禁全绿：`697 passed, 1 skipped`，覆盖率 `81.89%`；端到端收益与精度影响标记「机制说明（未验证）」，复现协议见《大规模复现实验指南》。
 
 ### v3.4.0（2026-10）
 

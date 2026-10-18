@@ -8,6 +8,13 @@ optimization:
 shadowkv:
   enabled: true
   compression_ratio: 0.5
+  # v3.5.0 IRAP / 契约 / 预算准入（agent 扁平键映射）
+  attn_is_probabilities: true        # 真实后端返回 post-softmax；mock 后端请置 false
+  irap_decay: 0.9                    # 跨步 EMA 衰减 gamma ∈ (0,1)
+  entropy_weight: 0.3                # 行熵辅助权重 beta ∈ [0,1]
+  sink_tokens: 4                     # 前缀 sink 硬保护 token 数
+  eviction_pressure_threshold: 0.9   # memory_pressure 触发阈值 ∈ (0,1]
+  memory_budget_mb: 6144             # 端侧 6GB 预算（不设则不做预算动作）
   precision_levels:
     - "fp32"
     - "fp16"
@@ -28,6 +35,10 @@ qdrift:
   noise_schedule: "cosine"
   sensitivity_temperature: 1.0
   drift_method: "relative_l2"
+  positional_prior_weight: 0.3
+  # v3.5.0：IRAP ΔA 可选融合（默认关闭，保持既有语义）
+  use_importance_drift: false
+  importance_drift_weight: 0.3
   dispatch_matrix:
     low_sensitivity_low_drift: "aggressive_sparse"
     low_sensitivity_high_drift: "balanced_sparse"
