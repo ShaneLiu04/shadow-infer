@@ -116,8 +116,7 @@ class TestDecisionCache:
 
         assert second["precision_map"] == first["precision_map"]
         assert second_decision_time * 10 <= first_decision_time, (
-            f"决策耗时 {second_decision_time:.6f}s 应较首次 "
-            f"{first_decision_time:.6f}s 下降 >= 90%"
+            f"决策耗时 {second_decision_time:.6f}s 应较首次 " f"{first_decision_time:.6f}s 下降 >= 90%"
         )
 
     def test_different_input_same_key_no_dirty_hit(self, mock_config):

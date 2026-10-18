@@ -212,9 +212,11 @@ class FFNOptimizerAgent(BaseAgent):
                 )
 
             if self.weight_up_quantized is None:
-                self.weight_up_quantized, self.weight_down_quantized, self.precision_scales = (
-                    self.quantize_mixed_precision(weight_up, weight_down, self.channel_importance)
-                )
+                (
+                    self.weight_up_quantized,
+                    self.weight_down_quantized,
+                    self.precision_scales,
+                ) = self.quantize_mixed_precision(weight_up, weight_down, self.channel_importance)
 
             num_fp16 = sum(1 for p in self.precision_scales.values() if p[0] == "fp16")
             num_int8 = sum(1 for p in self.precision_scales.values() if p[0] == "int8")

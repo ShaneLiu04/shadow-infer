@@ -44,9 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # profiler 命令
     profiler_parser = subparsers.add_parser("profiler", help="运行性能分析")
     profiler_parser.add_argument("--model", required=True, help="模型名称")
-    profiler_parser.add_argument(
-        "--config", default="configs/profiler_full.yaml", help="配置文件路径"
-    )
+    profiler_parser.add_argument("--config", default="configs/profiler_full.yaml", help="配置文件路径")
     profiler_parser.add_argument("--output", default="outputs/profiling", help="输出目录")
     profiler_parser.add_argument("--prompt", default="Hello world", help="测试提示")
     profiler_parser.add_argument("--num-steps", type=int, default=50, help="denoising 步数")
@@ -59,9 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     profiler_parser.add_argument(
         "--device", default=_default_device(), help="运行设备（默认 cuda 若可用否则 cpu）"
     )
-    profiler_parser.add_argument(
-        "--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）"
-    )
+    profiler_parser.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）")
     profiler_parser.add_argument(
         "--scheduler", action="store_true", help="启用学习调度器覆盖 Q-drift 的 dispatch"
     )
@@ -74,9 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # optimize 命令
     optimize_parser = subparsers.add_parser("optimize", help="运行优化推理")
     optimize_parser.add_argument("--model", required=True, help="模型名称")
-    optimize_parser.add_argument(
-        "--config", default="configs/optimize_full.yaml", help="配置文件路径"
-    )
+    optimize_parser.add_argument("--config", default="configs/optimize_full.yaml", help="配置文件路径")
     optimize_parser.add_argument("--baseline", help="基线数据路径（用于对比）")
     optimize_parser.add_argument("--output", default="outputs/optimization", help="输出目录")
     optimize_parser.add_argument("--prompt", default="Hello world", help="测试提示")
@@ -90,9 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--device", default=_default_device(), help="运行设备（默认 cuda 若可用否则 cpu）"
     )
-    optimize_parser.add_argument(
-        "--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）"
-    )
+    optimize_parser.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）")
     optimize_parser.add_argument(
         "--scheduler", action="store_true", help="启用学习调度器覆盖 Q-drift 的 dispatch"
     )
@@ -118,21 +110,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="pytorch",
         help="模型后端（默认 pytorch）。可用后端见 shadowinfer --help 或 registry 文档",
     )
-    serve_parser.add_argument(
-        "--device", default=_default_device(), help="运行设备（默认 cuda 若可用否则 cpu）"
-    )
-    serve_parser.add_argument(
-        "--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）"
-    )
+    serve_parser.add_argument("--device", default=_default_device(), help="运行设备（默认 cuda 若可用否则 cpu）")
+    serve_parser.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）")
     serve_parser.add_argument("--host", default="127.0.0.1", help="服务绑定地址（默认 127.0.0.1）")
     serve_parser.add_argument("--port", type=int, default=8000, help="服务端口（默认 8000）")
     serve_parser.add_argument(
         "--serving-config",
         help="serving 运行时配置文件路径（YAML 格式）",
     )
-    serve_parser.add_argument(
-        "--num-steps", type=int, default=20, help="默认 denoising 步数（默认 20）"
-    )
+    serve_parser.add_argument("--num-steps", type=int, default=20, help="默认 denoising 步数（默认 20）")
     serve_parser.add_argument(
         "--strategy",
         choices=["baseline", "optimized", "ab"],
@@ -148,16 +134,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # dashboard 命令
     dashboard_parser = subparsers.add_parser("dashboard", help="启动交互式 Web Profiler")
-    dashboard_parser.add_argument(
-        "--port", type=int, default=8501, help="Streamlit 端口（默认 8501）"
-    )
+    dashboard_parser.add_argument("--port", type=int, default=8501, help="Streamlit 端口（默认 8501）")
 
     # benchmark 命令
     benchmark_parser = subparsers.add_parser("benchmark", help="运行 benchmark 并记录到回归历史")
     benchmark_parser.add_argument("--model", required=True, help="模型名称")
-    benchmark_parser.add_argument(
-        "--config", default="configs/optimize_full.yaml", help="配置文件路径"
-    )
+    benchmark_parser.add_argument("--config", default="configs/optimize_full.yaml", help="配置文件路径")
     benchmark_parser.add_argument("--output", default="benchmarks/results", help="输出目录")
     benchmark_parser.add_argument("--prompt", default="Hello world", help="测试提示")
     benchmark_parser.add_argument("--num-steps", type=int, default=20, help="denoising 步数")
@@ -170,9 +152,7 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--device", default=_default_device(), help="运行设备（默认 cuda 若可用否则 cpu）"
     )
-    benchmark_parser.add_argument(
-        "--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）"
-    )
+    benchmark_parser.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现的模型初始化（默认 42）")
     benchmark_parser.add_argument(
         "--history",
         default="benchmarks/results/regression_history.jsonl",

@@ -814,7 +814,8 @@ class BenchmarkReport:
         )
         html_parts.append("<title>ShadowInfer Benchmark Report</title>\n")
         html_parts.append("<style>\n")
-        html_parts.append("""
+        html_parts.append(
+            """
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
     sans-serif; margin: 40px; background: #f8f9fa; color: #333; }
 .container { max-width: 1200px; margin: 0 auto; background: white; padding: 40px;
@@ -834,7 +835,8 @@ tr:nth-child(even) { background: #fafbfc; }
     padding: 12px 16px; margin: 12px 0; border-radius: 4px; }
 .success { background: #d4edda; border-left: 4px solid #27ae60;
     padding: 12px 16px; margin: 12px 0; border-radius: 4px; }
-        """)
+        """
+        )
         html_parts.append('</style>\n</head>\n<body>\n<div class="container">\n')
         html_parts.append("<h1>ShadowInfer Benchmark Report</h1>\n")
         html_parts.append(
