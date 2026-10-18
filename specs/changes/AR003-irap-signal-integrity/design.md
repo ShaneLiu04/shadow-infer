@@ -162,6 +162,8 @@ stop
 2. **EMA 仅在缓存未命中分支更新**：orchestrator 逐层每 (step,layer) 调用一次，正常路径无命中；测试中重复调用同 (step,layer) 同输入时 EMA 不双重累积（与 AR002「决策缓存二次精确 0」口径一致）。
 3. **形状增广**：seq_k 增长 → A_prev 右侧零填充（新 token 的历史从本步起算）；seq_k 收缩 → 截断 + `log_alert("warning")`（异常场景，仅告警不中断）。
 4. **降档阶梯在 precision_map 上进行**，压缩打包只执行一次（顺带消除原「先打包再 evict 重打包」的双重量化遍数问题，KV-P6 部分收益）；`packed.evict()` 保留用于罕见全局驱逐路径与 API 兼容。
+
+   **非方形输入口径（T003 实施修订）**：重要性矩阵按 KV token 维（seq_k）输出——接收注意力、rank 归一化与 sink 保护均以 seq_k 为基准；方形自注意力（seq_q == seq_k）下与旧接口形状一致，非方形语义由 query 行改为 KV 列（反映重要性主体变化）。
 5. **首步**（`kv_previous` 缺失或 A_prev 缺失）：A = received（EMA 冷启动），ΔA = None，复用决策走既有 no_reuse 分支。
 6. **`on_init`**：重置 `_irap_state`/决策缓存（AR002 M4 口径：保留配置、清空状态）。
 

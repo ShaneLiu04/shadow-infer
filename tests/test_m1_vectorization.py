@@ -140,18 +140,19 @@ class TestM1Vectorization:
             assert matrix.shape == (seq_len, heads)
             assert torch.allclose(matrix, golden, atol=1e-6)
 
-        # 非方形 attention_scores（seq_q != seq_k）：token 维度为 shape[2]，
-        # 归一化与位置阈值以 shape[-1] 为基准（与 reference 口径一致）
+        # 非方形 attention_scores（seq_q != seq_k）：AR003 T003 起重要性矩阵
+        # 按 KV token 维（shape[-1]）输出——接收注意力/rank/sink 均以 seq_k 为
+        # 基准（根因：FR3.2 重要性主体由 query 行改为 KV 列）
         torch.manual_seed(11)
         scores = torch.softmax(torch.randn(1, 4, 4, 8), dim=-1)
-        golden = torch.zeros(4, 4)
-        for token_idx in range(4):
+        golden = torch.zeros(8, 4)
+        for token_idx in range(8):
             for head_idx in range(4):
                 golden[token_idx, head_idx] = agent.compute_importance_score(
                     scores, token_idx, head_idx, 0, 4
                 )
         matrix = agent._compute_importance_matrix(scores, 0, 4)
-        assert matrix.shape == (4, 4)
+        assert matrix.shape == (8, 4)
         assert torch.allclose(matrix, golden, atol=1e-6)
 
     def test_allocate_precision_golden(self, mock_config):

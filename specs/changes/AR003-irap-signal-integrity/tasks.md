@@ -13,7 +13,7 @@
 |----|---------|------|------|------|
 | T001 | 基线取证落档：attention 契约双路径现状（mock=logits / 真实后端=probabilities）、双重 softmax 下精度档分布熵饱和实证、无界 importance_history 增长曲线、预算/驱逐死代码取证、旧默认参数（γ/sink/阈值）校准依据 → baseline-profile.md | - | passing | 2026-10-18 完成 |
 | T002 | FR3.1 attention 契约显式化与单次归一化：配置键、orchestrator 按后端接线、标量/向量化双路径同步修复、熵饱和消除与回归锚点测试 | T001 | passing | 2026-10-18 完成（17 用例） |
-| T003 | FR3.2 接收注意力重要性轴 + sink 前缀硬保护：主信号列向、rank 归一化、行熵辅助、sink_tokens 配置、双路径同步、sink 反转回归对照测试；含 FP6 公式单源化（ImportanceModel 委托共享核心、删 _history） | T002 | pending | 与 T004 增量结构协同设计 |
+| T003 | FR3.2 接收注意力重要性轴 + sink 前缀硬保护：主信号列向、rank 归一化、行熵辅助、sink_tokens 配置、双路径同步、sink 反转回归对照测试；含 FP6 公式单源化（ImportanceModel 委托共享核心、删 _history） | T002 | passing | 2026-10-18 完成（新增 14 用例；顺带修复 int4 分组自适应缺陷） |
 | T004 | FR3.3 IRAP 跨步 EMA 传播与常数内存历史：irap_decay 配置、增量 vs 全量等价 golden、无界 history 收敛为 EMA+标量统计、on_init 重置维持、形状增广规则 | T003 | pending | |
 | T005 | FR3.4 预算准入与驱逐接线：store 同步 token-head 元数据、memory_pressure 消费与阈值动作、per-precision 字节估算修正（8x 误差）、sink 保护驱逐顺序、字节级断言测试 | T004 | pending | |
 | T006 | FR3.5 ΔA 差分信号导出与 QDrift 可选消费：信号进 metrics/返回值、可选输入默认不融合、AR002 兼容性锚点全量回归 | T004 | pending | 融合方式 design 定 |
@@ -40,6 +40,13 @@
 - 修改文件：specs/changes/AR003-irap-signal-integrity/baseline-profile.md（新增）
 - 取证要点：真实后端路径 imp 零动态范围（min=max=1.0，全 fp32）；sink token（接收 95.9% 注意力）被判 int4；历史 20 步 20 张量线性增长（投影 15.62 MB/层/千步）；预算死代码（超限 10 倍零动作）；基线 630 passed/81.68% 无回归
 - 备注：基线 E2E 1.61x 引用 AR002 T008（同 HEAD 代码）
+
+### 2026-10-18 会话记录（T002/T003）
+
+- 完成任务：T002（17 用例）、T003（新增 14 用例，累计 31）
+- 修改文件：shadowkv_agent.py（契约/IRAP 核心接入/INT4 分组自适应）、importance_model.py（compute_irap_importance 共享核心）、orchestrator.py（契约接线）、tests/test_irap_contract.py、tests/test_m1_vectorization.py（非方形口径修订）
+- 关键修复：真实后端 head_dim=16 + int4 抛错缺陷（旧实现被熵饱和掩盖）；非方形重要性矩阵口径改为 KV 列（seq_k）
+- 全量回归：661 passed / 1 skipped；black/isort/flake8/mypy 全绿（附 chore(format) 提交）
 
 ## 阶段门控记录
 

@@ -19,7 +19,7 @@ from shadowinfer.core.base_agent import BaseAgent
 from shadowinfer.core.structs import AgentState, KVCacheEntry, ProfileResult, StepConfig
 from shadowinfer.shadowkv.decision_plane import KVDecisionPlane
 from shadowinfer.shadowkv.eviction_policy import EvictionPolicy, LeastImportantEvictionPolicy
-from shadowinfer.shadowkv.importance_model import ImportanceModel
+from shadowinfer.shadowkv.importance_model import ImportanceModel, compute_irap_importance
 from shadowinfer.utils.logging_utils import StructuredLogger
 from shadowinfer.utils.metrics import Metrics
 from shadowinfer.utils.quantization import Quantizer
@@ -106,6 +106,9 @@ class ShadowKVAgent(BaseAgent):
         self._attn_contract_configured = "attn_is_probabilities" in config
         self.attn_is_probabilities = bool(config.get("attn_is_probabilities", False))
         self._attn_contract_warned = False
+        # AR003 T003/T004：IRAP 状态（T004 接入跨步持久化）
+        self._last_irap_ema: Optional[torch.Tensor] = None
+        self._last_irap_delta: Optional[float] = None
 
     def on_init(self, model_config: Dict[str, Any]) -> None:
         """初始化：加载配置，设置精度阈值和复用参数。"""
@@ -148,6 +151,10 @@ class ShadowKVAgent(BaseAgent):
         )
         self.reuse_base_threshold = self.config.get("reuse_base_threshold", 0.15)
         self.reuse_adaptive = self.config.get("reuse_adaptive", True)
+        # AR003 T003：IRAP 公式参数（sink 硬保护 / 熵辅助权重 / EMA 衰减）
+        self.sink_tokens = int(self.config.get("sink_tokens", 4))
+        self.entropy_weight = float(self.config.get("entropy_weight", 0.3))
+        self.irap_decay = float(self.config.get("irap_decay", 0.9))
 
         # Initialize new abstractions.
         self.importance_model = ImportanceModel(
@@ -235,12 +242,14 @@ class ShadowKVAgent(BaseAgent):
             precision_map = cached["precision_map"]
             reuse_decision = cached["reuse_decision"]
         else:
-            # Step 2: 计算重要性分数（AR002 M1：向量化整矩阵计算）
+            # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003 IRAP 共享核心）
             importance_map = self._compute_importance_matrix(
                 attention_scores,
                 layer_id,
                 self.num_layers,
                 attn_is_probabilities=attn_is_probabilities,
+                entropy_weight=self.entropy_weight,
+                sink_tokens=self.sink_tokens,
             )
 
             # Step 3: 分配精度
@@ -456,40 +465,70 @@ class ShadowKVAgent(BaseAgent):
         layer_index: int,
         num_layers: int,
         attn_is_probabilities: bool = False,
+        received_ema=None,
+        irap_decay: float = 0.9,
+        entropy_weight: float = 0.3,
+        sink_tokens: int = 4,
     ) -> float:
         """
         计算 per-token-head 重要性分数（逐元素参考实现 / golden 基准）。
 
-        算法（对应 README.md《核心算法》ShadowKV 分层压缩 1）：
-        1. 取该 token 在当前 head 上的 attention 权重分布
-           （AR003 T002：``attn_is_probabilities=True`` 时输入已是 softmax
-           概率，跳过 softmax 仅做行和数值安全校正）
-        2. 计算 entropy（高 entropy → 关注范围广 → 高重要性）
-        3. 层深度因子（浅层关注局部，深层关注语义）
-        4. 位置因子（开头和结尾的 token 通常更重要）
-        5. 综合打分 ∈ [0, 1]
+        AR003 T003 新公式（IRAP，与共享核心 compute_irap_importance 等价）：
+        1. 契约归一化权重（概率输入跳过 softmax，仅行和安全校正）
+        2. 列向接收注意力 received[t,h]（KV token 被关注程度，修复 KV-P3）
+        3. 逐 head 升序 dense-rank 归一化 r ∈ (0, 1]
+        4. 行熵辅助项（权重 β = entropy_weight）
+        5. imp = clamp(((1-β)·r + β·归一化熵) · 层因子, max=1)；
+           sink 前缀硬保护为 1.0；旧位置加成已移除（AR003）
         """
-        # 1. 提取该 token 的 attention 权重
-        attn_weights = attention_scores[:, head_index, token_index, :]  # [batch, seq_len]
+        # 1. 契约归一化
         if attn_is_probabilities:
-            weights = self._row_normalize(attn_weights)
+            weights = self._row_normalize(attention_scores)
         else:
-            weights = F.softmax(attn_weights, dim=-1)
+            weights = F.softmax(attention_scores, dim=-1)
 
-        # 2. 计算 entropy
-        entropy = Metrics.compute_entropy(weights)
-        normalized_entropy = entropy / math.log(weights.shape[-1])
-
-        # 3. 层深度因子
-        layer_factor = 1.0 + 0.1 * (layer_index / max(num_layers, 1))
-
-        # 4. 位置因子
         seq_len = weights.shape[-1]
-        pos_factor = 1.0
-        if token_index < 5 or token_index > seq_len - 5:
-            pos_factor = 1.2
 
-        score = normalized_entropy * layer_factor * pos_factor
+        # 2. 列向接收注意力 [heads, seq_k]（可选 EMA，与向量化路径一致）
+        received = weights.mean(dim=(0, 2))
+        if received_ema is not None:
+            prev = received_ema
+            if prev.shape[0] != seq_len:
+                if prev.shape[0] < seq_len:
+                    pad = torch.zeros(
+                        seq_len - prev.shape[0],
+                        prev.shape[1],
+                        dtype=prev.dtype,
+                        device=prev.device,
+                    )
+                    prev = torch.cat([prev, pad], dim=0)
+                else:
+                    prev = prev[:seq_len]
+            received = irap_decay * prev.transpose(0, 1) + (1.0 - irap_decay) * received
+
+        # 3. 逐 head 升序 dense-rank（排序复刻，独立于向量化 argsort 实现）
+        head_received = received[head_index]
+        sorted_idx = torch.sort(head_received).indices
+        rank_of = torch.empty(sorted_idx.shape, dtype=torch.float64)
+        rank_of[sorted_idx] = torch.arange(1, seq_len + 1, dtype=torch.float64)
+        rank_norm = float(rank_of[token_index] / seq_len)
+
+        # 4. 行熵辅助项（Metrics.compute_entropy 语义：clamp + 全局重归一化）
+        #    非方形输入下 KV token t ≥ seq_q 无对应 query 行，熵项取 0
+        if token_index < weights.shape[2]:
+            row = weights[:, head_index, token_index, :]
+            entropy = Metrics.compute_entropy(row)
+            normalized_entropy = entropy / math.log(max(seq_len, 2))
+        else:
+            normalized_entropy = 0.0
+
+        # 5. 综合评分 + sink 硬保护
+        layer_factor = 1.0 + 0.1 * (layer_index / max(num_layers, 1))
+        score = ((1.0 - entropy_weight) * rank_norm + entropy_weight * normalized_entropy) * (
+            layer_factor
+        )
+        if token_index < sink_tokens:
+            return 1.0
         return float(min(score, 1.0))
 
     @staticmethod
@@ -503,22 +542,24 @@ class ShadowKVAgent(BaseAgent):
         layer_index: int,
         num_layers: int,
         attn_is_probabilities: bool = False,
+        received_ema=None,
+        irap_decay: float = 0.9,
+        entropy_weight: float = 0.3,
+        sink_tokens: int = 4,
     ) -> torch.Tensor:
         """
-        向量化计算全 (token, head) 重要性矩阵（AR002 M1）。
+        向量化计算全 (token, head) 重要性矩阵。
 
-        与逐元素调用 compute_importance_score 语义逐元素一致（容差 1e-6）：
-        - AR003 T002（KV-P2）：``attn_is_probabilities=True`` 时输入视为
-          已 softmax 概率，跳过 softmax 仅做行和校正；False 时单次 softmax
-        - entropy 复刻 Metrics.compute_entropy 语义：clamp(min=1e-10) 后
-          对全部 (batch, seq_k) 元素重归一化，再取 -sum(p*log p) 标量
-        - normalized_entropy / log(seq_k)，乘层因子与位置因子，clamp(max=1)
+        AR003 T003（FR3.2/FP6）：委托共享核心 ``compute_irap_importance``
+        （单一公式来源）——列向接收注意力 rank 归一化为主信号、行熵辅助、
+        sink 前缀硬保护；旧位置加成已移除。与逐元素 ``compute_importance_score``
+        等价（容差 1e-6，golden 双实现对照）。
 
-        非方形输入口径（与 reference 一致）：attention_scores 形状
-        (batch, heads, seq_q, seq_k) 时，token 维度为 seq_q（shape[2]），
-        而归一化与位置阈值均以 seq_k（shape[-1]）为基准。
+        非方形输入口径：attention_scores 形状 (batch, heads, seq_q, seq_k) 时，
+        重要性矩阵按 KV token 维（seq_k）输出——接收注意力、rank 归一化与
+        sink 保护均以 seq_k 为基准（AR003 起重要性主体为 KV 列；方形自注意力
+        下 seq_q == seq_k，行为不变）。
         """
-        num_query = attention_scores.shape[2]
         seq_len = attention_scores.shape[-1]
         log_seq = math.log(seq_len)
         if log_seq == 0.0:
@@ -528,24 +569,20 @@ class ShadowKVAgent(BaseAgent):
             weights = self._row_normalize(attention_scores)
         else:
             weights = F.softmax(attention_scores, dim=-1)
-        clamped = weights.clamp(min=1e-10)
-        denom = clamped.sum(dim=(0, 3))
-        probs = clamped / denom.unsqueeze(0).unsqueeze(-1)
-        entropy = -(probs * torch.log(probs)).sum(dim=(0, 3))
-        normalized_entropy = entropy / log_seq
 
-        layer_factor = 1.0 + 0.1 * (layer_index / max(num_layers, 1))
-
-        pos_factor = torch.ones(
-            num_query, dtype=attention_scores.dtype, device=attention_scores.device
+        importance_map, new_ema, delta_a = compute_irap_importance(
+            weights,
+            received_ema_prev=received_ema,
+            irap_decay=irap_decay,
+            entropy_weight=entropy_weight,
+            sink_tokens=sink_tokens,
+            layer_index=layer_index,
+            num_layers=num_layers,
         )
-        pos_factor[:5] = 1.2
-        pos_start = max(seq_len - 4, 0)
-        if pos_start < num_query:
-            pos_factor[pos_start:] = 1.2
-
-        scores = normalized_entropy.t() * pos_factor.unsqueeze(1) * layer_factor
-        return scores.clamp(max=1.0).float()
+        # 供 T004 接入状态（当前仅暂存最近一次结果）
+        self._last_irap_ema = new_ema
+        self._last_irap_delta = delta_a
+        return importance_map
 
     def allocate_precision(
         self, importance_map: torch.Tensor, mode: str
@@ -1132,6 +1169,9 @@ class ShadowKVAgent(BaseAgent):
         v_out = torch.zeros_like(v_tensor)
         scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+        # AR003：INT4 分组自适应（与 PackedKVCache 规则一致）——head_dim 不可
+        # 被 64 整除时以 head_dim 为组（修复小 head_dim 模型 int4 直接抛错）
+        int4_group = 64 if head_dim % 64 == 0 else head_dim
 
         groups: Dict[str, List[Tuple[int, int]]] = {
             "fp32": [],
@@ -1189,8 +1229,8 @@ class ShadowKVAgent(BaseAgent):
                     qk, sk = Quantizer.quantize_int8(k_group)
                     qv, sv = Quantizer.quantize_int8(v_group)
                 else:
-                    qk, sk = Quantizer.quantize_int4(k_group)
-                    qv, sv = Quantizer.quantize_int4(v_group)
+                    qk, sk = Quantizer.quantize_int4(k_group, group_size=int4_group)
+                    qv, sv = Quantizer.quantize_int4(v_group, group_size=int4_group)
                 k_codes = qk.reshape(qk.shape[0], batch_size, head_dim).permute(1, 0, 2)
                 v_codes = qv.reshape(qv.shape[0], batch_size, head_dim).permute(1, 0, 2)
                 k_out[:, h_idx, t_idx, :] = k_codes.to(k_out.dtype)
@@ -1221,6 +1261,8 @@ class ShadowKVAgent(BaseAgent):
         v_out = torch.zeros_like(v_tensor)
         scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+        # AR003：INT4 分组自适应（与向量化路径一致）
+        int4_group = 64 if head_dim % 64 == 0 else head_dim
 
         for token_idx in range(seq_len):
             token_precision = precision_map.get(token_idx, {})
@@ -1239,8 +1281,12 @@ class ShadowKVAgent(BaseAgent):
                 k_slice = k_tensor[:, head_idx, token_idx, :]
                 v_slice = v_tensor[:, head_idx, token_idx, :]
 
-                k_quantized, scale_k = Quantizer.quantize_tensor(k_slice.unsqueeze(0), precision)
-                v_quantized, scale_v = Quantizer.quantize_tensor(v_slice.unsqueeze(0), precision)
+                k_quantized, scale_k = Quantizer.quantize_tensor(
+                    k_slice.unsqueeze(0), precision, group_size=int4_group
+                )
+                v_quantized, scale_v = Quantizer.quantize_tensor(
+                    v_slice.unsqueeze(0), precision, group_size=int4_group
+                )
 
                 k_out[:, head_idx, token_idx, :] = k_quantized.squeeze(0)
                 v_out[:, head_idx, token_idx, :] = v_quantized.squeeze(0)
