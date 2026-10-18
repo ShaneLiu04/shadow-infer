@@ -122,7 +122,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] **Real Sparse FFN Kernel**: Integrate packed INT8/INT4 weights and the existing `sparse_gemm` kernel.
 - [ ] **Real Sparse FFN Kernel**: Use CSR/CSC formats and a production-grade sparse kernel.
 - **Packed Weight Storage**: Store weights as packed INT8/INT4 with on-the-fly dequantization.
-- [ ] **Vectorized Unpack/Dequantization**: `PackedFFNWeight.unpack` / `dequantize_for_matmul` still use element-wise Python loops (v3.4.0 residual end-to-end bottleneck; result caching already added in v3.4.0).
+- [x] **Vectorized Unpack/Dequantization** (v3.6.0, AR004): grouped batched unpack and mixed-precision quantization (element-wise reference kept as golden); precision-plan fingerprint cached at pack time. CPU same-process A/B: unpack 0.044-0.070x, quantize 0.053-0.077x at 256/1024 channels.
 - **FFN-Compiler**: Lightweight compiler to generate fused kernels from FFN subgraphs.
 - [x] **Dynamic Channel Pruning**: Zero out low-contribution channels at runtime.
 

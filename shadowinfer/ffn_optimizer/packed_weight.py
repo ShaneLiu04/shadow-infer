@@ -93,6 +93,7 @@ class PackedFFNWeight:
         self._data = {}
         self._dequant_cache = None
         self._dequant_cache_fingerprint = None
+        self._plan_fingerprint = ()
         total_bytes = 0
         channels = weight.shape[self.pack_dim]
         plan = []

@@ -1,12 +1,12 @@
 """FFN Optimizer Agent — FFN 层计算优化专家。
 
 对应文档：README.md《核心模块》FFN Optimizer Agent
-版本：v3.0
+版本：v3.6.0
 """
 
 from __future__ import annotations
 
-__version__ = "3.0"
+__version__ = "3.6.0"
 
 import time
 from dataclasses import dataclass, field
@@ -42,7 +42,7 @@ class FFNOptimizerAgent(BaseAgent):
     """FFN Optimizer Agent — FFN 层计算优化专家。
 
     对应文档：README.md《核心模块》FFN Optimizer Agent
-    版本：v3.0
+    版本：v3.6.0
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -91,15 +91,16 @@ class FFNOptimizerAgent(BaseAgent):
         if layer_id < 0:
             raise ValueError(f"layer_id must be >= 0, got {layer_id}.")
         limit = max(1, self._num_layers)
-        if layer_id >= limit or len(self._layer_states) > limit:
-            key = (layer_id, "layer_overflow")
-            if key not in self._warned:
-                self._warned.add(key)
-                self.logger.log_alert(
-                    "warning",
-                    f"Layer id {layer_id} exceeds configured num_layers={limit}.",
-                    recommendation="Check model_config['num_layers'].",
-                )
+        if layer_id >= limit:
+            self._warn_once(
+                (layer_id, "layer_overflow"),
+                f"Layer id {layer_id} exceeds configured num_layers={limit}.",
+            )
+        if len(self._layer_states) > limit:
+            self._warn_once(
+                (-1, "layer_state_overflow"),
+                f"Layer state count {len(self._layer_states)} exceeds num_layers={limit}.",
+            )
         state = self._layer_states.get(layer_id)
         if state is None:
             state = _LayerState()
@@ -160,8 +161,9 @@ class FFNOptimizerAgent(BaseAgent):
         """
         self._model_name = model_config.get("model_name", self._model_name)
         self._run_id = model_config.get("run_id", self._run_id)
-        if "num_layers" in model_config:
-            self._num_layers = int(model_config["num_layers"])
+        num_layers = model_config.get("num_layers")
+        if num_layers is not None:
+            self._num_layers = max(0, int(num_layers))
 
         # AR004 FR4.4: reset per-layer state and memory accounting on init.
         self._layer_states.clear()
@@ -663,13 +665,16 @@ class FFNOptimizerAgent(BaseAgent):
         Returns:
             (quantized_up, quantized_down, precision_scales_dict)
         """
+        intermediate_dim = weight_up.shape[0]
         device = weight_up.device
         quantized_up = weight_up.clone()
         quantized_down = weight_down.clone()
         scales: Dict[int, Any] = {}
 
-        importance = channel_importance.to(device)
-        fp16_mask = importance >= high_precision_threshold
+        # Match the reference implementation's Python-float comparison
+        # semantics (``.item()`` yields float64) at threshold boundaries.
+        importance = channel_importance.to(device).to(torch.float64)
+        fp16_mask = importance >= float(high_precision_threshold)
         int8_mask = (importance >= 0.3) & ~fp16_mask
         int4_mask = ~(fp16_mask | int8_mask)
 
@@ -706,6 +711,8 @@ class FFNOptimizerAgent(BaseAgent):
                     precision,
                     (float(scale_up[pos].item()), float(scale_down[pos].item())),
                 )
+
+        scales = {ch: scales[ch] for ch in range(intermediate_dim) if ch in scales}
 
         if self.use_packed_weights:
             precision_map = {ch: info[0] for ch, info in scales.items()}
@@ -783,6 +790,16 @@ class FFNOptimizerAgent(BaseAgent):
                     quantized_down[:, channel_idx] = w_down
 
                 scales[channel_idx] = ("int4", (float(scale_up.item()), float(scale_down.item())))
+
+        if self.use_packed_weights:
+            precision_map = {ch: info[0] for ch, info in scales.items()}
+            packed_up = PackedFFNWeight.pack(
+                weight_up, precision_map, pack_dim=0, group_size=self._pack_group_size
+            )
+            packed_down = PackedFFNWeight.pack(
+                weight_down, precision_map, pack_dim=1, group_size=self._pack_group_size
+            )
+            return packed_up, packed_down, scales
 
         return quantized_up, quantized_down, scales
 

@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.6.0 | 719 passed / 1 skipped | 82.25% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.6.0 | 732 passed / 1 skipped | 82.37% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -104,7 +104,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`719 passed, 1 skipped`，测试覆盖率 `82.25%`（pytest-cov，fail-under 75）。
+当前主分支：`732 passed, 1 skipped`，测试覆盖率 `82.37%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -686,21 +686,22 @@ python -m shadowinfer optimize \
 
 ### 实测数据（v3.6.0，2026-10-18，Windows / CPU fallback）
 
-同会话同批对照（`specs/changes/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次独立 agent，warmup 后 12 calls/次）：
+同进程同批对照（`specs/changes/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次中位）：
 
-| 指标 | 优化前（中位） | 优化后（中位） | 比值/说明 |
-|------|----------------|----------------|-----------|
-| `ffn.on_step`（1024 ch / 4 层 / 12 calls） | 1.95 ms | 0.71 ms | 0.36x（同批复跑区间 0.61-0.74 ms） |
-| `_precision_plan_fingerprint` | 151.4 µs/调用 | 0.3 µs/调用 | O(1) 缓存命中 |
-| `dequantize_for_matmul`（缓存命中） | 219.2 µs/调用 | 0.4 µs/调用 | 指纹与 dense 缓存命中 |
-| unpack 向量化 vs 逐 channel 参考 | 82.29 ms | 3.91 ms | 0.047x（1024 ch） |
-| 混合精度量化向量化 vs 参考 | 189.09 ms | 9.43 ms | 0.050x（1024 ch，非 packed） |
-| 掩码缺陷（packed + channel_mask） | RuntimeError | `mixed_full` 正常 | golden vs full <= 1e-6 |
-| 逐层状态（层 1 复用层 0 权重） | max\|Δ\|=0.5771 | max\|Δ\|=0.0 | 两层输出各自等于直接计算 |
+| 指标 | 规模 | 优化路径 | 参考路径 | 比值 |
+|------|------|----------|----------|------|
+| 精度计划指纹 | 256 ch | 0.2 µs | 53.5 µs | 0.004x |
+| 精度计划指纹 | 1024 ch | 0.1 µs | 138.4 µs | 0.001x |
+| unpack | 256 ch | 1.35 ms | 19.32 ms | 0.070x |
+| unpack | 1024 ch | 3.47 ms | 79.67 ms | 0.044x |
+| 混合精度量化 | 256 ch | 3.05 ms | 39.45 ms | 0.077x |
+| 混合精度量化 | 1024 ch | 8.84 ms | 168.31 ms | 0.053x |
 
-**质量与测试**：719 passed / 1 skipped；覆盖率 82.25%；black / isort / flake8 / mypy 全绿。
-精度口径：向量化实现 vs 保留的参考实现容差 <= 1e-6（unpack、量化、掩码路径均覆盖）。
-上述为 CPU 微基准，7B 级端到端收益待 GPU 服务器按下方协议复现，README 不预设优越性数字。
+`ffn.on_step`（1024 ch / 4 层 / 12 calls）：优化后 0.66-0.72 ms（3 次中位，多次复跑区间 0.59-0.77 ms）；该值不与该版本之前的跨会话数据做比值宣称。
+
+**正确性**：向量化 vs 保留的参考实现 max\|Δ\| <= 1e-6（unpack/量化含 0.7/0.3 阈值边界、int4 非整除、pack_dim=1、全零通道）；掩码缺陷由 RuntimeError 转为 `mixed_full` 正常且与 full golden 一致；两层不同权重输出各自等于直接计算（|Δ|=0）。
+**质量**：732 passed / 1 skipped；覆盖率 82.37%；black / isort / flake8 / mypy 全绿。
+上述为 CPU 微基准；7B 级端到端收益待 GPU 服务器按下方协议复现，不预设优越性数字。
 
 ### 实测数据（v3.5.0，2026-10-18，Windows / CPU fallback）
 
@@ -991,7 +992,7 @@ pytest
 - **FFN 热路径优化**：精度计划指纹 pack 时缓存（O(1)）、quantization_info 按层缓存一次、unpack/混合精度量化分组向量化（参考实现保留 golden）。
 - **逐层状态隔离（FFN-P1 修复）**：权重、量化态、重要性、掩码、统计按 layer_id 隔离；on_init 清空并重置累计；超层告警去重。
 - **掩码正确性修复**：`_mixed_compute` down 投影响应列掩码；全 False 掩码输出零并告警一次（mixed/full 双路径）。
-- **实测（CPU，同批 3 次中位）**：on_step 1.95 ms → 0.71 ms；指纹 151.4 µs → 0.3 µs；unpack/量化约 20x；719 passed，覆盖率 82.25%。
+- **实测（CPU，同批 3 次中位）**：on_step 1.95 ms → 0.71 ms；指纹 151.4 µs → 0.3 µs；unpack/量化约 20x；719 passed，覆盖率 82.37%。
 - **复现资产**：`specs/changes/AR004-ffn-hotpath/`（srs/design/tasks/baseline-profile/bench 脚本）与 README 服务器复现协议。
 
 ### v3.5.0（2026-10）

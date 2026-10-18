@@ -178,5 +178,75 @@ def repro_layer_state_defect():
     )
 
 
+# ---------------------------------------------------------------------------
+# Same-process A/B (rule 1.1): structural metrics at 256 and 1024 channels
+# ---------------------------------------------------------------------------
+from shadowinfer.ffn_optimizer.ffn_optimizer_agent import (  # noqa: E402
+    FFNOptimizerAgent as _ABAgent,
+)
+from shadowinfer.ffn_optimizer.packed_weight import PackedFFNWeight  # noqa: E402
+
+
+def _median(values):
+    return sorted(values)[len(values) // 2]
+
+
+def structural_ab():
+    def legacy_fingerprint(pw):
+        return tuple((ch, d["precision"]) for ch, d in sorted(pw._data.items()))
+
+    agent_ab = _ABAgent({"use_packed_weights": False, "num_layers": 4})
+    for channels, dim in ((256, 256), (1024, 256)):
+        torch.manual_seed(0)
+        w_up = torch.randn(channels, dim)
+        w_down = torch.randn(dim, channels)
+        imp = torch.linspace(0.0, 1.0, channels)
+        pmap = {i: ("fp16" if i % 4 == 0 else ("int8" if i % 4 == 1 else "int4")) for i in range(channels)}
+        pw = PackedFFNWeight.pack(w_up, pmap, group_size=64)
+        pw.dequantize_for_matmul()
+        pw._unpack_reference()
+
+        vec_fp, legacy_fp, vec_up, ref_up, vec_q, ref_q = [], [], [], [], [], []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for _ in range(50):
+                pw._precision_plan_fingerprint()
+            vec_fp.append((time.perf_counter() - t0) / 50)
+            t0 = time.perf_counter()
+            for _ in range(50):
+                legacy_fingerprint(pw)
+            legacy_fp.append((time.perf_counter() - t0) / 50)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                pw.unpack()
+            vec_up.append((time.perf_counter() - t0) / 3)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                pw._unpack_reference()
+            ref_up.append((time.perf_counter() - t0) / 3)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                agent_ab.quantize_mixed_precision(w_up, w_down, imp)
+            vec_q.append((time.perf_counter() - t0) / 3)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                agent_ab._quantize_mixed_precision_reference(w_up, w_down, imp)
+            ref_q.append((time.perf_counter() - t0) / 3)
+
+        print(
+            f"AB ch={channels}: fingerprint_us vec={_median(vec_fp)*1e6:.1f} "
+            f"legacy={_median(legacy_fp)*1e6:.1f} ratio={_median(vec_fp)/_median(legacy_fp):.3f}"
+        )
+        print(
+            f"AB ch={channels}: unpack_ms vec={_median(vec_up)*1e3:.2f} "
+            f"ref={_median(ref_up)*1e3:.2f} ratio={_median(vec_up)/_median(ref_up):.3f}"
+        )
+        print(
+            f"AB ch={channels}: quantize_ms vec={_median(vec_q)*1e3:.2f} "
+            f"ref={_median(ref_q)*1e3:.2f} ratio={_median(vec_q)/_median(ref_q):.3f}"
+        )
+
+
+structural_ab()
 repro_mixed_mask_defect()
 repro_layer_state_defect()

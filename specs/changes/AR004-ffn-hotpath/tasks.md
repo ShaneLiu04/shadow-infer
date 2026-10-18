@@ -18,8 +18,8 @@
 | T004 | FR4.4 逐层状态隔离（`_LayerState` 骨架 + 层级读写点）+ on_init 清空 + 超层告警 | T002a | passing | 2026-10-18（UT-6/6b/6c/16） |
 | T005 | FR4.5 `_mixed_compute` 列掩码修复 + 全 False 告警 | T004 | passing | 2026-10-18（缺陷复现转通过；UT-8/9/21） |
 | T006 | FR4.6 向量化 quantize_mixed_precision + 参考 golden；性能微基准 | T003, T005 | passing | 2026-10-18（20x，UT-10/11） |
-| T007 | 微基准对照 + 全量回归 + 五件套 | T006 | passing | 2026-10-18：on_step 1.95→0.71ms（0.36x）、指纹 151.4→0.3µs、unpack 0.047x、quantize 0.050x；719 passed / 82.25% |
-| T008 | README v3.6.0 四检查点 + pyproject/`__version__`/ROADMAP | T007 | passing | 2026-10-18：特性表/版本历史/基准/复现协议；版本号三处 3.6.0；当前口径 719/82.25%，历史 v3.4.0 行保留 |
+| T007 | 微基准对照 + 全量回归 + 五件套 | T006 | passing | 2026-10-18 同进程同批：指纹 256/1024 ch = 0.004x/0.001x；unpack 0.070x/0.044x；quantize 0.077x/0.053x；on_step 0.66-0.72ms（绝对中位）；719 passed / 82.37% |
+| T008 | README v3.6.0 四检查点 + pyproject/`__version__`/ROADMAP | T007 | passing | 2026-10-18：特性表/版本历史/基准/复现协议；版本号三处 3.6.0；当前口径 719/82.37%，历史 v3.4.0 行保留 |
 | T009 | Review + ST（st-cases.md）+ 归档 + Gitee 推送（a Review；b ST；c 归档；d 推送三核验） | T008 | pending | 规则二 |
 
 ## 状态说明
@@ -127,5 +127,5 @@
 - T004/T002b：`_LayerState` + 10 处读写点归层；`on_init` 先清空/重置再预载 layer 0；`_warned` 键去重。
 - T003/T006：unpack 分组批量（int4 批量解包）+ 参考实现保留；量化按重要性掩码向量化 + `_quantize_mixed_precision_reference`。
 - T005：`_linear_forward(mask_dim)`、down 列掩码、全 False 零输出 + 告警一次（mixed/full）。
-- T007 实测（同会话同批，CPU）：on_step 1.95→0.71ms（0.36x）；指纹 151.4→0.3µs；unpack 82.29→3.91ms（0.047x）；quantize 189.09→9.43ms（0.050x）；`719 passed, 1 skipped`，覆盖率 82.25%。
+- T007 实测（同会话同批，CPU）：on_step 1.95→0.71ms（0.36x）；指纹 151.4→0.3µs；unpack 82.29→3.91ms（0.047x）；quantize 189.09→9.43ms（0.050x）；`732 passed, 1 skipped`，覆盖率 82.37%。
 - T008：README v3.6.0 四检查点 + 服务器复现协议；pyproject/`__version__`/README 徽章 3.6.0 同步；ROADMAP AR004 勾选。

@@ -299,3 +299,271 @@ def test_ut10_zero_channel_preserved():
     assert torch.count_nonzero(q_up[3]) == 0
     assert torch.count_nonzero(q_down[:, 3]) == 0
     assert scales[3] == ("int4", (0.0, 0.0))
+
+
+def test_ut3_quantization_info_cached_and_complete():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    outs = [_step(agent, x, up, down, sensitivity=0.5, mode="mixed") for _ in range(3)]
+    infos = [o["quantization"] for o in outs]
+    assert infos[0] == infos[1] == infos[2]
+    info = infos[0]
+    assert info["num_fp16_channels"] + info["num_int8_channels"] + info["num_int4_channels"] == 64
+    assert "compression_ratio" in info
+
+
+def test_ut3b_stats_reads_zero_iteration_after_warmup():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    _step(agent, x, up, down, sensitivity=0.5, mode="mixed")
+    state = agent._layer_state(0)
+
+    class CountingDict(dict):
+        iterations = 0
+
+        def items(self):
+            type(self).iterations += 1
+            return super().items()
+
+    counting = CountingDict(state.precision_scales)
+    state.precision_scales = counting
+    out = _step(agent, x, up, down, sensitivity=0.5, mode="mixed")
+    assert out["quantization"]["num_fp16_channels"] >= 1
+    assert CountingDict.iterations == 0
+
+
+def test_ut6c_sparse_and_incremental_layer_isolation():
+    torch.manual_seed(0)
+    x_prev = torch.randn(1, 8, 32)
+    x_cur = x_prev + 0.001
+    up1, down1 = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    up2, down2 = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+
+    def call(x, layer, up, down, mode):
+        from shadowinfer.core.structs import StepConfig
+
+        out_prev = agent._full_compute(x, up, down)
+        for sens in (0.2, 0.5):
+            ret = agent.on_step(
+                StepConfig(
+                    step_id=0,
+                    total_steps=1,
+                    noise_level=0.5,
+                    shadowkv_mode="balanced",
+                    ffn_mode=mode,
+                ),
+                {
+                    "ffn_input_current": x,
+                    "ffn_input_previous": x_prev,
+                    "ffn_output_previous": out_prev,
+                    "weights": {"up": up, "down": down},
+                    "layer_id": layer,
+                    "qdrift_signal": {"sensitivity_score": sens, "ffn_mode": mode},
+                },
+            )
+            if ret["compute_path"] == mode:
+                return
+
+    call(x_cur, 0, up1, down1, "sparse")
+    call(x_cur, 1, up2, down2, "sparse")
+    call(x_cur, 0, up1, down1, "incremental")
+    call(x_cur, 1, up2, down2, "incremental")
+    assert torch.equal(agent._layer_state(0).weight_up, up1)
+    assert torch.equal(agent._layer_state(1).weight_up, up2)
+
+
+def test_ut9_mask_exception_resets_state():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent(channel_pruning_enabled=True, channel_pruning_ratio=0.5)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    agent.compute_channel_mask = boom
+    out = _step(agent, x, up, down, sensitivity=0.5, mode="mixed")
+    state = agent._layer_state(0)
+    assert state.channel_mask is None
+    assert state.active_channels == 0
+    assert out["output"].shape == (1, 4, 32)
+
+
+def test_ut14_threshold_boundary_matches_reference():
+    from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent
+
+    torch.manual_seed(0)
+    up = torch.randn(8, 16)
+    down = torch.randn(16, 8)
+    for value in (0.7, 0.3, 0.6999999, 0.3000001, 0.0, 1.0):
+        imp = torch.full((8,), value, dtype=torch.float32)
+        agent = FFNOptimizerAgent(
+            {"use_packed_weights": False, "hidden_dim": 16, "intermediate_dim": 8}
+        )
+        q_up, q_down, scales = agent.quantize_mixed_precision(up, down, imp)
+        r_up, r_down, r_scales = agent._quantize_mixed_precision_reference(up, down, imp)
+        assert torch.allclose(q_up, r_up, atol=1e-6), value
+        assert torch.allclose(q_down, r_down, atol=1e-6), value
+        assert scales == r_scales, value
+
+
+def test_ut18a_num_layers_none_and_bounds():
+    agent = _agent()
+    agent.on_init({"num_layers": None})
+    assert agent._num_layers == 0
+    agent.on_init({"num_layers": 0})
+    assert agent._num_layers == 0
+
+
+def test_ut18b_memory_accounting_once_per_layer():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent(num_layers=4)
+    _step(agent, x, up, down, layer_id=0, sensitivity=0.5, mode="mixed")
+    first = agent._total_memory_bytes_saved
+    _step(agent, x, up, down, layer_id=0, sensitivity=0.5, mode="mixed")
+    assert agent._total_memory_bytes_saved == first
+    _step(agent, x, up, down, layer_id=1, sensitivity=0.5, mode="mixed")
+    assert agent._total_memory_bytes_saved == first * 2
+    agent.on_init({"num_layers": 4})
+    assert agent._total_memory_bytes_saved == 0.0
+
+
+def test_ut20_sensitivity_threshold_paths():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    out_hi = _step(agent, x, up, down, sensitivity=0.7, mode="mixed")
+    assert out_hi["compute_path"] == "full"
+    assert out_hi["quantization"] == {}
+    agent2 = _agent()
+    out_lo = _step(agent2, x, up, down, sensitivity=0.69, mode="mixed")
+    assert out_lo["compute_path"] == "mixed_full"
+    assert out_lo["quantization"] != {}
+
+
+def test_ut5_ut11_vectorization_speedup():
+    torch.manual_seed(0)
+    for channels, dim in ((256, 128),):
+        w = torch.randn(channels, dim)
+        imp = torch.linspace(0.0, 1.0, channels)
+        from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent as _Agent
+
+        agent = _Agent(
+            {"use_packed_weights": False, "hidden_dim": dim, "intermediate_dim": channels}
+        )
+
+        def median_time(fn, n=3):
+            samples = []
+            for _ in range(n):
+                start = time.perf_counter()
+                fn()
+                samples.append(time.perf_counter() - start)
+            return sorted(samples)[len(samples) // 2]
+
+        vec_q = median_time(lambda: agent.quantize_mixed_precision(w, w.T, imp))
+        ref_q = median_time(lambda: agent._quantize_mixed_precision_reference(w, w.T, imp))
+        assert vec_q <= ref_q * 0.5
+
+        pmap = {i: ("fp16" if i % 3 == 0 else "int8") for i in range(channels)}
+        packed = PackedFFNWeight.pack(w, pmap, group_size=16)
+        vec_u = median_time(packed.unpack)
+        ref_u = median_time(packed._unpack_reference)
+        assert vec_u <= ref_u * 0.5
+
+
+def test_ut13b_invalid_method_and_non_2d():
+    agent = _agent()
+    x = torch.randn(1, 4, 32)
+    up = torch.randn(64, 32)
+    mask = agent.compute_channel_mask(x, up, method="dynamic_activation")
+    assert mask.shape == (64,)
+
+    agent.channel_pruning_ratio = 0.5
+    agent.channel_pruning_method = "static_importance"
+    agent.channel_importance = torch.rand(64)
+    fallback = agent.compute_channel_mask(x, up, method="unknown_method")
+    assert fallback.shape == (64,)
+    agent.channel_importance = None
+    try:
+        agent.compute_channel_mask(x, up, method="unknown_method")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("missing importance must raise RuntimeError")
+
+    wide = torch.randn(64, 32)
+    agent._precompute_weights(wide, wide.T, layer_id=2)
+    assert agent._layer_state(2).weight_up is wide
+
+
+def test_ut15_reuse_returns_previous():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    prev = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    from shadowinfer.core.structs import StepConfig
+
+    out = agent.on_step(
+        StepConfig(
+            step_id=0, total_steps=1, noise_level=0.5, shadowkv_mode="balanced", ffn_mode="sparse"
+        ),
+        {
+            "ffn_input_current": x,
+            "ffn_input_previous": x,
+            "ffn_output_previous": prev,
+            "weights": {"up": up, "down": down},
+            "layer_id": 0,
+            "qdrift_signal": {"sensitivity_score": 0.1, "ffn_mode": "sparse"},
+        },
+    )
+    assert out["compute_path"] == "reuse"
+    assert torch.equal(out["output"], prev)
+
+
+def test_ut19_missing_previous_falls_back_to_full():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    from shadowinfer.core.structs import StepConfig
+
+    original = agent.select_compute_path
+    for mode in ("reuse", "incremental", "sparse"):
+        agent.select_compute_path = lambda *a, m=mode, **k: m
+        out = agent.on_step(
+            StepConfig(
+                step_id=0,
+                total_steps=1,
+                noise_level=0.5,
+                shadowkv_mode="balanced",
+                ffn_mode="sparse",
+            ),
+            {
+                "ffn_input_current": x,
+                "weights": {"up": up, "down": down},
+                "layer_id": 0,
+                "qdrift_signal": {"sensitivity_score": 0.4, "ffn_mode": "sparse"},
+            },
+        )
+        assert out["compute_path"] == "full", mode
+    agent.select_compute_path = original
+
+
+def test_ut17_version_strings_consistent():
+    import tomllib
+    from pathlib import Path
+
+    import shadowinfer
+
+    root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["version"] == shadowinfer.__version__ == "3.6.0"

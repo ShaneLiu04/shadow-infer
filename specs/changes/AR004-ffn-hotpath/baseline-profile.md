@@ -65,17 +65,18 @@ python specs/changes/AR004-ffn-hotpath/ar004_bench.py
 | 统计开销 | cProfile 20% of on_step | 迭代次数 0 + 计时 ≤20µs |
 | 向量化 unpack/量化 | 参考实现 1x | ≤ 50%（同批 3 次中位） |
 
-## 6. T007 优化后对照（2026-10-18，同会话同批）
+## 6. T007 优化后对照（2026-10-18，同进程同批，3 次中位）
 
-| 指标 | 优化前（中位） | 优化后（中位） | 比值 | 证据 |
-|------|----------------|----------------|------|------|
-| `per_on_step_ms`（1024 ch/4 层/12 calls） | 1.95 ms | 0.71 ms | 0.36x | ar004_bench.py 复跑 [0.61, 0.71, 0.74] |
-| `_precision_plan_fingerprint` | 151.4 µs | 0.3 µs | 0.002x | 同上 |
-| `dequantize_for_matmul`（缓存命中） | 219.2 µs | 0.4 µs | 0.002x | 同上 |
-| unpack（1024 ch，vec vs reference） | 82.29 ms | 3.91 ms | 0.047x | 3 次均值，`_unpack_reference` 对照 |
-| quantize（1024 ch，vec vs reference） | 189.09 ms | 9.43 ms | 0.050x | `use_packed_weights=False`，3 次均值 |
-| 掩码缺陷 | RuntimeError | `mixed_full` 正常 | — | 缺陷复现段转通过 |
-| 层状态隔离 | max\|Δ\|=0.5771 | max\|Δ\|=0.0 | — | 层 2 输出等于直接计算 |
+| 指标 | 规模 | 优化路径 | 参考路径 | 比值 | 证据 |
+|------|------|----------|----------|------|------|
+| fingerprint | 256 ch | 0.2 µs | 53.5 µs | 0.004x | ar004_bench.py::structural_ab |
+| fingerprint | 1024 ch | 0.1 µs | 138.4 µs | 0.001x | 同上 |
+| unpack | 256 ch | 1.35 ms | 19.32 ms | 0.070x | `_unpack_reference` 同批 |
+| unpack | 1024 ch | 3.47 ms | 79.67 ms | 0.044x | 同上 |
+| quantize | 256 ch | 3.05 ms | 39.45 ms | 0.077x | `_quantize_mixed_precision_reference` 同批 |
+| quantize | 1024 ch | 8.84 ms | 168.31 ms | 0.053x | 同上 |
+| per_on_step_ms | 1024 ch/4 层/12 calls | 0.66-0.72 ms（复跑 0.59-0.77） | — | — | 绝对中位，不做跨会话比值 |
 
-测试与覆盖率：`719 passed, 1 skipped`，82.25%（当次 pytest --cov）。
-说明：CPU 微基准；unpack/quantize 之比为同进程参考实现对照，不含 profiler 开销。
+正确性：unpack/量化 golden <= 1e-6（含阈值 0.7/0.3、int4 非整除、pack_dim=1、全零通道）；掩码缺陷转 `mixed_full` 正常；层 2 输出 |直接计算差|=0.0。
+测试与覆盖率：`732 passed, 1 skipped`，82.37%（当次 pytest --cov）。
+说明：CPU 微基准；比值来自同进程参考实现对照，不设跨会话固定基线。
