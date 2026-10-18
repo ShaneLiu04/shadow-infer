@@ -43,9 +43,9 @@ class ShadowKVAgent(BaseAgent):
         self.precision_map: Dict[
             int, Dict[int, Dict[int, str]]
         ] = {}  # layer_id -> token -> head -> precision
-        self.importance_history: Dict[
-            int, List[torch.Tensor]
-        ] = {}  # layer_id -> [importance_map, ...]
+        # AR003 T004：IRAP 跨步 EMA 状态（layer_id -> [seq_k, heads]，常数内存）；
+        # 取代原无界 importance_history（KV-P9）
+        self._irap_state: Dict[int, torch.Tensor] = {}
         self.logger = StructuredLogger("shadowkv", config.get("log_dir", "logs/"))
 
         # New abstractions (lazy-initialized in on_init).
@@ -142,6 +142,7 @@ class ShadowKVAgent(BaseAgent):
         self._decision_cache = {}
         self._decision_cache_step = None
         self._attn_contract_warned = False
+        self._irap_state = {}
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
@@ -155,6 +156,13 @@ class ShadowKVAgent(BaseAgent):
         self.sink_tokens = int(self.config.get("sink_tokens", 4))
         self.entropy_weight = float(self.config.get("entropy_weight", 0.3))
         self.irap_decay = float(self.config.get("irap_decay", 0.9))
+        # AR003 T004：参数校验（srs FR3.3 / design 4.3.1）
+        if not 0.0 < self.irap_decay < 1.0:
+            raise ValueError(f"irap_decay must be in (0, 1), got {self.irap_decay}")
+        if not 0.0 <= self.entropy_weight <= 1.0:
+            raise ValueError(f"entropy_weight must be in [0, 1], got {self.entropy_weight}")
+        if self.sink_tokens < 0:
+            raise ValueError(f"sink_tokens must be >= 0, got {self.sink_tokens}")
 
         # Initialize new abstractions.
         self.importance_model = ImportanceModel(
@@ -242,12 +250,14 @@ class ShadowKVAgent(BaseAgent):
             precision_map = cached["precision_map"]
             reuse_decision = cached["reuse_decision"]
         else:
-            # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003 IRAP 共享核心）
+            # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003/T004 IRAP）
             importance_map = self._compute_importance_matrix(
                 attention_scores,
                 layer_id,
                 self.num_layers,
                 attn_is_probabilities=attn_is_probabilities,
+                received_ema=self._irap_state.get(layer_id),
+                irap_decay=self.irap_decay,
                 entropy_weight=self.entropy_weight,
                 sink_tokens=self.sink_tokens,
             )
@@ -284,10 +294,17 @@ class ShadowKVAgent(BaseAgent):
                     "reuse_decision": reuse_decision,
                 }
 
-        # 记录历史（缓存命中路径同样记录，保持逐次调用语义不变）
-        if layer_id not in self.importance_history:
-            self.importance_history[layer_id] = []
-        self.importance_history[layer_id].append(importance_map.detach().cpu())
+        # AR003 T004：IRAP 状态更新（仅缓存未命中分支；命中路径不重复累积）
+        prev_state = self._irap_state.get(layer_id)
+        new_ema = self._last_irap_ema
+        if new_ema is not None:
+            if prev_state is not None and prev_state.shape[0] > new_ema.shape[0]:
+                self.logger.log_alert(
+                    "warning",
+                    f"IRAP state truncated: seq_k {prev_state.shape[0]} -> {new_ema.shape[0]}",
+                )
+            self._irap_state[layer_id] = new_ema
+            self._last_irap_ema = None  # 消费后清空，避免命中路径误更新
 
         # Step 5: 压缩 KV
         compressed_kv = self.compress_kv(

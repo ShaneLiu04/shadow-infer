@@ -943,3 +943,326 @@ class TestEntropyWeightBoundary:
 
         diff = (imp - expected).abs().max().item()
         assert diff <= 1e-6, f"纯 rank 公式差异 {diff:.3e} 应 <= 1e-6"
+
+
+# =============================================================================
+# AR003 T004 / FR3.3：IRAP 跨步 EMA 传播与常数内存历史（替代 importance_history）
+#
+# TDD Red 阶段：以下目标行为实现尚未存在——per-layer EMA 状态
+# ``_irap_state: Dict[int, Tensor]``（[seq_k, heads]）、每步成功更新、
+# 形状增广/截断、无界 ``importance_history`` 删除、EMA 参数校验与
+# on_init 重置，均为 design 4.2.2 点 2/3/6、4.3.1 与任务书规定的目标行为。
+# 本段只写测试，不写实现。
+# 覆盖 design 6.1 的 UT-6 / UT-7 / UT-8 / UT-9 / UT-20 及 on_init 重置。
+# =============================================================================
+
+IRAP_SEQ = 32
+IRAP_TOL = 1e-6
+
+
+def _make_light_attention(seq=IRAP_SEQ, seed=SEED + 100):
+    """轻量注意力构造（seq/heads 可控，返回行归一化概率）。"""
+    torch.manual_seed(seed)
+    logits = torch.randn(BATCH, HEADS, seq, seq)
+    return torch.softmax(logits, dim=-1)
+
+
+def _make_light_inputs(attention, seed=SEED + 200, **extra):
+    """轻量 on_step 输入（kv 按 attention 的 seq 对齐）。"""
+    seq = attention.shape[-1]
+    torch.manual_seed(seed)
+    inputs = {
+        "attention_scores": attention,
+        "kv_current": {
+            "k": torch.randn(BATCH, HEADS, seq, HEAD_DIM),
+            "v": torch.randn(BATCH, HEADS, seq, HEAD_DIM),
+        },
+        "layer_id": LAYER_ID,
+        "attn_is_probabilities": True,
+        "qdrift_signal": {"sensitivity_score": 0.3, "drift_score": 0.1},
+    }
+    inputs.update(extra)
+    return inputs
+
+
+def _received_state_from_probs(probs):
+    """由概率权重得到 [seq_k, heads] 的 received 状态（与 EMA 状态同形）。"""
+    return probs.mean(dim=(0, 2)).transpose(0, 1)
+
+
+def _expected_ema(received_list, gamma):
+    """全量重算等效定义：首步 A_1 = received_1，之后 A_t = γ·A_{t-1} + (1-γ)·received_t。"""
+    ema = received_list[0]
+    for received in received_list[1:]:
+        ema = gamma * ema + (1.0 - gamma) * received
+    return ema
+
+
+def _assert_state_close(actual, expected, context=""):
+    actual_cpu = actual.detach().cpu().double()
+    expected_cpu = expected.detach().cpu().double()
+    assert actual_cpu.shape == expected_cpu.shape, (
+        f"{context} EMA 状态形状 {tuple(actual_cpu.shape)} "
+        f"应为 {tuple(expected_cpu.shape)}"
+    )
+    diff = (actual_cpu - expected_cpu).abs().max().item()
+    assert diff <= IRAP_TOL, f"{context} EMA 状态差异 {diff:.3e} 应 <= {IRAP_TOL}"
+
+
+class TestIRAPStateEMA:
+    """UT-6 增量 EMA 等价 + importance_history 删除。"""
+
+    def test_ut6_no_unbounded_importance_history(self, mock_config):
+        """无界 importance_history 属性必须不存在（常数内存历史，KV-P9）。"""
+        agent = _make_agent(mock_config, attn_is_probabilities=True)
+        assert not hasattr(agent, "importance_history"), (
+            "ShadowKVAgent 不应再持有无界 importance_history"
+        )
+        assert isinstance(agent._irap_state, dict), "_irap_state 应为 per-layer 状态字典"
+
+    def test_ut6_first_step_cold_start_equals_received(self, mock_config):
+        """首步冷启动：A_1 = received_1（无历史时直接取本步接收注意力）。"""
+        agent = _make_agent(mock_config, attn_is_probabilities=True)
+        probs = _make_light_attention(seed=SEED + 301)
+
+        agent.on_step(_step_config(step_id=0, total_steps=3), _make_light_inputs(probs))
+
+        state = agent._irap_state[LAYER_ID]
+        assert tuple(state.shape) == (IRAP_SEQ, HEADS), "EMA 状态形状应为 [seq_k, heads]"
+        _assert_state_close(state, _received_state_from_probs(probs), "首步冷启动")
+
+    def test_ut6_incremental_ema_matches_full_recompute(self, mock_config):
+        """3 步增量 EMA == 全量重算 Σ 等效定义（首步特例，容差 1e-6）。"""
+        gamma = 0.9
+        agent = _make_agent(
+            mock_config, attn_is_probabilities=True, irap_decay=gamma
+        )
+
+        probs_list = []
+        for step_id in range(3):
+            probs = _make_light_attention(seed=SEED + 400 + step_id)
+            probs_list.append(probs)
+            agent.on_step(
+                _step_config(step_id=step_id, total_steps=3),
+                _make_light_inputs(probs, seed=SEED + 500 + step_id),
+            )
+
+        received = [_received_state_from_probs(probs) for probs in probs_list]
+        expected = _expected_ema(received, gamma)
+        # 闭式展开（γ²·r1 + γ(1-γ)·r2 + (1-γ)·r3）与首步特例等价
+        closed_form = (
+            (gamma**2) * received[0]
+            + gamma * (1.0 - gamma) * received[1]
+            + (1.0 - gamma) * received[2]
+        )
+        _assert_state_close(closed_form, expected, "闭式展开自检")
+
+        _assert_state_close(agent._irap_state[LAYER_ID], expected, "第 3 步后")
+
+
+class TestIRAPConstantMemory:
+    """UT-7 常数内存：200 步后状态形状/元素数不随步数增长。"""
+
+    def test_ut7_state_size_constant_over_200_steps(self, mock_config):
+        agent = _make_agent(mock_config, attn_is_probabilities=True)
+
+        first_shape = None
+        first_numel = None
+        first_bytes = None
+        for step_id in range(200):
+            probs = _make_light_attention(seed=SEED + 1000 + step_id)
+            agent.on_step(
+                _step_config(step_id=step_id, total_steps=200),
+                _make_light_inputs(probs, seed=SEED + 2000 + step_id),
+            )
+            if step_id == 0:
+                state = agent._irap_state[LAYER_ID]
+                first_shape = tuple(state.shape)
+                first_numel = state.numel()
+                first_bytes = state.element_size() * first_numel
+
+        final = agent._irap_state[LAYER_ID]
+        assert tuple(final.shape) == first_shape, (
+            f"200 步后状态形状 {tuple(final.shape)} 应与首步 {first_shape} 相同"
+        )
+        assert final.numel() == first_numel, "200 步后状态元素数不应增长"
+        assert final.element_size() * final.numel() == first_bytes, (
+            "200 步后状态字节数不应增长（O(1) 常数内存）"
+        )
+        assert set(agent._irap_state.keys()) == {LAYER_ID}, "状态字典键数不应随步数增长"
+
+
+class TestIRAPShapeGrowth:
+    """UT-8 形状增广：seq 增长零填充、收缩截断 + warning 不中断。"""
+
+    def test_ut8_seq_growth_zero_pads_new_tokens(self, mock_config):
+        gamma = 0.9
+        agent = _make_agent(
+            mock_config, attn_is_probabilities=True, irap_decay=gamma
+        )
+
+        old_probs = _make_light_attention(seq=16, seed=SEED + 600)
+        agent.on_step(
+            _step_config(step_id=0, total_steps=2),
+            _make_light_inputs(old_probs, seed=SEED + 601),
+        )
+        prev = agent._irap_state[LAYER_ID].detach().clone()
+        assert tuple(prev.shape) == (16, HEADS)
+
+        new_probs = _make_light_attention(seq=IRAP_SEQ, seed=SEED + 602)
+        agent.on_step(
+            _step_config(step_id=1, total_steps=2),
+            _make_light_inputs(new_probs, seed=SEED + 603),
+        )
+        state = agent._irap_state[LAYER_ID]
+        assert tuple(state.shape) == (IRAP_SEQ, HEADS), "增长后状态应增广到新 seq_k"
+
+        received = _received_state_from_probs(new_probs)
+        expected = torch.cat(
+            [
+                gamma * prev + (1.0 - gamma) * received[:16],
+                (1.0 - gamma) * received[16:],
+            ],
+            dim=0,
+        )
+        _assert_state_close(state, expected, "seq 增长零填充")
+
+    def test_ut8_seq_shrink_truncates_with_warning(self, mock_config, monkeypatch):
+        gamma = 0.9
+        agent = _make_agent(
+            mock_config, attn_is_probabilities=True, irap_decay=gamma
+        )
+
+        alerts = []
+        monkeypatch.setattr(
+            agent.logger,
+            "log_alert",
+            lambda level, msg, **kw: alerts.append((level, msg)),
+        )
+
+        old_probs = _make_light_attention(seq=IRAP_SEQ, seed=SEED + 700)
+        agent.on_step(
+            _step_config(step_id=0, total_steps=2),
+            _make_light_inputs(old_probs, seed=SEED + 701),
+        )
+        prev = agent._irap_state[LAYER_ID].detach().clone()
+
+        new_probs = _make_light_attention(seq=16, seed=SEED + 702)
+        result = agent.on_step(
+            _step_config(step_id=1, total_steps=2),
+            _make_light_inputs(new_probs, seed=SEED + 703),
+        )
+
+        assert result is not None, "seq 收缩应告警但不中断执行"
+        state = agent._irap_state[LAYER_ID]
+        assert tuple(state.shape) == (16, HEADS), "收缩后状态应截断到新 seq_k"
+
+        received = _received_state_from_probs(new_probs)
+        expected = gamma * prev[:16] + (1.0 - gamma) * received
+        _assert_state_close(state, expected, "seq 收缩截断")
+
+        warnings = [a for a in alerts if a[0] == "warning"]
+        assert warnings, "seq 收缩应至少产生一条 warning 告警"
+        combined = " ".join(str(msg).lower() for _, msg in warnings)
+        assert any(key in combined for key in ("seq", "truncat", "shrink", "shape")), (
+            f"收缩告警应说明形状/截断语义，实际 {combined!r}"
+        )
+
+
+class TestIRAPValidation:
+    """UT-9 参数校验：γ∉(0,1)、β∉[0,1]、sink<0 -> on_init ValueError。"""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"irap_decay": 0.0},
+            {"irap_decay": 1.0},
+            {"irap_decay": -0.5},
+            {"irap_decay": 1.5},
+        ],
+    )
+    def test_ut9_invalid_irap_decay_raises(self, mock_config, overrides):
+        with pytest.raises(ValueError):
+            _make_agent(mock_config, **overrides)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"entropy_weight": -0.1},
+            {"entropy_weight": 1.1},
+        ],
+    )
+    def test_ut9_invalid_entropy_weight_raises(self, mock_config, overrides):
+        with pytest.raises(ValueError):
+            _make_agent(mock_config, **overrides)
+
+    def test_ut9_negative_sink_tokens_raises(self, mock_config):
+        with pytest.raises(ValueError):
+            _make_agent(mock_config, sink_tokens=-1)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"irap_decay": 0.5},
+            {"entropy_weight": 0.0},
+            {"entropy_weight": 1.0},
+            {"sink_tokens": 0},
+        ],
+    )
+    def test_ut9_legal_boundaries_do_not_raise(self, mock_config, overrides):
+        agent = _make_agent(mock_config, **overrides)
+        assert agent is not None
+
+
+class TestOnInitResetEMA:
+    """design 4.2.2 点 6 / AR002 M4：on_init 清空状态、保留配置。"""
+
+    def test_on_init_resets_irap_state_and_decision_cache(self, mock_config):
+        agent = _make_agent(
+            mock_config,
+            attn_is_probabilities=True,
+            irap_decay=0.8,
+            entropy_weight=0.4,
+            sink_tokens=2,
+        )
+        probs = _make_light_attention(seed=SEED + 800)
+        agent.on_step(
+            _step_config(step_id=0, total_steps=2),
+            _make_light_inputs(probs, seed=SEED + 801),
+        )
+
+        assert agent._irap_state, "完成步后应有 EMA 状态"
+        assert agent._decision_cache, "完成步后应有决策缓存"
+
+        agent.on_init(dict(MODEL_CONFIG))
+
+        assert agent._irap_state == {}, "on_init 应清空 _irap_state"
+        assert agent._decision_cache == {}, "on_init 应清空决策缓存"
+        assert agent._decision_cache_step is None
+        assert agent.irap_decay == pytest.approx(0.8), "on_init 应保留 irap_decay 配置"
+        assert agent.entropy_weight == pytest.approx(0.4), "on_init 应保留 entropy_weight 配置"
+        assert agent.sink_tokens == 2, "on_init 应保留 sink_tokens 配置"
+
+
+class TestIRAPDecisionCacheEMA:
+    """UT-20 决策缓存-EMA：同 (step,layer) 重复调用不二次累积。"""
+
+    def test_ut20_cache_hit_does_not_accumulate_ema(self, mock_config):
+        agent, calls = _counting_agent(mock_config, attn_is_probabilities=True)
+        probs = _make_light_attention(seed=SEED + 900)
+        inputs = _make_light_inputs(probs, seed=SEED + 901)
+        step = _step_config(step_id=0, total_steps=2)
+
+        first = agent.on_step(step, inputs)
+        assert calls["count"] == 1, "首次调用应计算重要性矩阵"
+        state_after_first = agent._irap_state[LAYER_ID].detach().clone()
+
+        second = agent.on_step(step, inputs)
+        assert calls["count"] == 1, "同 (step,layer) 同输入二次调用应命中决策缓存"
+        state_after_second = agent._irap_state[LAYER_ID].detach().cpu()
+
+        assert torch.equal(state_after_second, state_after_first.detach().cpu()), (
+            "缓存命中不得重复累积 EMA（状态数值应逐位不变）"
+        )
+        assert second["precision_map"] == first["precision_map"]
+        assert second["importance_stats"] == pytest.approx(first["importance_stats"])
