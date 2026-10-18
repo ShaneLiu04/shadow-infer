@@ -60,7 +60,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **Q-drift 步感知调度** | 敏感度由位置先验与实测扰动响应凸组合（默认权重 0.3 / 0.7），结合激活漂移动态选择 ShadowKV / FFN 工作模式；扰动响应与真实扰动幅度的 Spearman 秩相关 >= 0.9。 |
 | **决策记忆化** | 同 (step, layer) 同输入的决策缓存（输入指纹校验、step 边界失效、异常旁路）与 FFN 反量化结果缓存，重复调用决策耗时下降 >= 90%。 |
 | **真实性能记账** | latency.e2e_ms / per_step_ms 真实测量（内部计时与外部墙钟对照偏差 0.02%），KV memory 按真实节省字节记账。 |
-| **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，实测 151µs → 0.3µs）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/changes/AR004-ffn-hotpath/`。 |
+| **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
 | **Agent 插件系统** | 通过 `shadowinfer.agents` entry-point 注册第三方 Agent，Orchestrator 自动调度并收集输出。 |
@@ -686,7 +686,7 @@ python -m shadowinfer optimize \
 
 ### 实测数据（v3.6.0，2026-10-18，Windows / CPU fallback）
 
-同进程同批对照（`specs/changes/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次中位）：
+同进程同批对照（`specs/archive/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次中位）：
 
 | 指标 | 规模 | 优化路径 | 参考路径 | 比值 |
 |------|------|----------|----------|------|
@@ -787,8 +787,8 @@ python -m shadowinfer profiler --model <MODEL> --backend pytorch --device cuda \
 | 层数 | 4 层不同权重（必须不同，用于 FFN-P1 回归） |
 | 重复 | 同会话同批，优化路径 vs 参考路径（`_unpack_reference` / `_quantize_mixed_precision_reference`）各 3 次，报告中位与区间 |
 | 硬门禁 | 指纹 <= 10 µs；向量化 <= 参考 50%；golden max|Δ| <= 1e-6；层 2 输出 == 直接计算 |
-| 命令 | `python specs/changes/AR004-ffn-hotpath/ar004_bench.py`（可按 `HID/INT/LAYERS` 修改规模） |
-| 落档 | 原始输出与配置写入 `specs/changes/AR004-ffn-hotpath/`，结论回写 README 性能基准 |
+| 命令 | `python specs/archive/AR004-ffn-hotpath/ar004_bench.py`（可按 `HID/INT/LAYERS` 修改规模） |
+| 落档 | 原始输出与配置写入 `specs/archive/AR004-ffn-hotpath/`，结论回写 README 性能基准 |
 
 ### 实测数据（v3.4.0，2026-10-17，Windows / CPU fallback）
 
@@ -992,8 +992,8 @@ pytest
 - **FFN 热路径优化**：精度计划指纹 pack 时缓存（O(1)）、quantization_info 按层缓存一次、unpack/混合精度量化分组向量化（参考实现保留 golden）。
 - **逐层状态隔离（FFN-P1 修复）**：权重、量化态、重要性、掩码、统计按 layer_id 隔离；on_init 清空并重置累计；超层告警去重。
 - **掩码正确性修复**：`_mixed_compute` down 投影响应列掩码；全 False 掩码输出零并告警一次（mixed/full 双路径）。
-- **实测（CPU，同批 3 次中位）**：on_step 1.95 ms → 0.71 ms；指纹 151.4 µs → 0.3 µs；unpack/量化约 20x；719 passed，覆盖率 82.37%。
-- **复现资产**：`specs/changes/AR004-ffn-hotpath/`（srs/design/tasks/baseline-profile/bench 脚本）与 README 服务器复现协议。
+- **实测（CPU，同进程同批 3 次中位）**：on_step 0.66-0.72 ms（绝对中位）；指纹同批比值 0.001-0.004x；unpack 0.044-0.070x；量化 0.053-0.077x；732 passed，覆盖率 82.37%。
+- **复现资产**：`specs/archive/AR004-ffn-hotpath/`（srs/design/tasks/baseline-profile/bench 脚本）与 README 服务器复现协议。
 
 ### v3.5.0（2026-10）
 

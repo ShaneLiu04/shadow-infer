@@ -65,7 +65,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       kept as golden), per-layer state isolation (FFN-P1), and down-projection
       column-mask fix. CPU same-batch microbench: on_step 1.95 ms -> 0.71 ms;
       fingerprint 151.4 us -> 0.3 us; unpack/quantize ~20x. 7B end-to-end benefit
-      pending the server protocol in `specs/changes/AR004-ffn-hotpath/`.
+      pending the server protocol in `specs/archive/AR004-ffn-hotpath/`.
 - [x] **Decision-signal correctness + IRAP** (v3.5.0, AR003): explicit attention
       contract (single normalization, KV-P2), received-attention importance axis
       with sink protection (KV-P3), cross-step EMA with constant memory (KV-P9),

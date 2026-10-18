@@ -5,7 +5,7 @@
 | 取证日期 | 2026-10-18 |
 | 执行设备 | CPU（Windows，torch 2.5.1 CPU-only） |
 | 性质 | 缺陷与热点取证（微基准，非大型模型实验；收益对照于 T007 执行） |
-| 复现脚本 | `specs/changes/AR004-ffn-hotpath/ar004_bench.py`（同目录，seed=42） |
+| 复现脚本 | `specs/archive/AR004-ffn-hotpath/ar004_bench.py`（同目录，seed=42） |
 
 ## 1. 微基准配置
 
@@ -49,7 +49,7 @@ layer 1 输出与「w1 直接计算」max|Δ| = 0.0，与「w2 直接计算」ma
 ## 4. 复现命令
 
 ```powershell
-python specs/changes/AR004-ffn-hotpath/ar004_bench.py
+python specs/archive/AR004-ffn-hotpath/ar004_bench.py
 ```
 
 脚本输出：cProfile top 12、3 次 per_on_step 中位（计时前每 agent warmup）、指纹/dequant 微秒级耗时、掩码缺陷与 FFN-P1 复现结果。结果确定性（seed=42，CPU）。
