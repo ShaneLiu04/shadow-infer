@@ -448,7 +448,9 @@ class PackedKVCache:
                     new_precision_map[token_idx][head_idx] = original
 
         self.packed_data = {}
-        self._do_pack(k_full, v_full, new_precision_map, group_size=self.head_dim)
+        # review I5：重打包沿用 pack 默认分组（group_size=16），避免驱逐后
+        # 非驱逐 int4 条目被换组重量化、字节口径与准入估算脱节
+        self._do_pack(k_full, v_full, new_precision_map)
 
     def _precision_for(self, token_idx: int, head_idx: int) -> str:
         """Return the precision string for a token-head from packed_data."""

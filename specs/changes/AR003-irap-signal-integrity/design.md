@@ -77,7 +77,7 @@ received[t,h] = W[:, h, :, t].mean() ∈ [0,1]                # 列向接收注�
 EMA（IRAP，γ=irap_decay 默认 0.9）：
   A_prev 按新 seq_k 零增广；A = γ·A_prev + (1-γ)·received   # 常数内存，修复 KV-P9
 
-rank 归一化（逐 head 在 token 维）：
+rank 归一化（逐 head 在 token 维，按排序位次；并列值按排序顺序占位）：
   r[t,h] = (argsort(argsort(A[:,h])) + 1) / seq_k ∈ (0,1]
 
 importance = clamp( ((1-β)·r + β·normalized_entropy(W)) · layer_factor, max=1 )

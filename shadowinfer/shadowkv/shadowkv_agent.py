@@ -106,9 +106,11 @@ class ShadowKVAgent(BaseAgent):
         self._attn_contract_configured = "attn_is_probabilities" in config
         self.attn_is_probabilities = bool(config.get("attn_is_probabilities", False))
         self._attn_contract_warned = False
-        # AR003 T003/T004：IRAP 状态（T004 接入跨步持久化）
-        self._last_irap_ema: Optional[torch.Tensor] = None
-        self._last_irap_delta: Optional[float] = None
+        # AR003 T003/T004：IRAP 状态（跨步 EMA，per-layer 常数内存）
+        self._irap_processed = set()
+        self._sink_warned = False
+        self._pressure_warned = False
+        self._pressure_step: Optional[int] = None
 
     def on_init(self, model_config: Dict[str, Any]) -> None:
         """初始化：加载配置，设置精度阈值和复用参数。"""
@@ -143,6 +145,10 @@ class ShadowKVAgent(BaseAgent):
         self._decision_cache_step = None
         self._attn_contract_warned = False
         self._irap_state = {}
+        self._irap_processed = set()
+        self._sink_warned = False
+        self._pressure_warned = False
+        self._pressure_step = None
         self._eviction_warned = False
 
         # 加载优化配置
@@ -238,6 +244,14 @@ class ShadowKVAgent(BaseAgent):
         # AR003 T002：契约解析（inputs 键 > config 键 > 缺省告警路径）
         attn_is_probabilities = self._resolve_attn_contract(inputs)
         memory_pressure = inputs.get("memory_pressure", 0.0)
+        # review I10：sink 配置覆盖全序列时告警（配置错误提示，一次）
+        if self.sink_tokens >= seq_len and not self._sink_warned:
+            self.logger.log_alert(
+                "warning",
+                f"sink_tokens ({self.sink_tokens}) >= seq_len ({seq_len}); "
+                "all tokens protected at top tier",
+            )
+            self._sink_warned = True
 
         if step_id != self._decision_cache_step:
             self._decision_cache = {}
@@ -257,14 +271,17 @@ class ShadowKVAgent(BaseAgent):
         )
         cached = self._decision_cache.get(cache_key) if fingerprint is not None else None
         step_delta = None
+        new_ema: Optional[torch.Tensor] = None
         if cached is not None and cached.get("fingerprint") == fingerprint:
             importance_map = cached["importance_map"]
-            precision_map = cached["precision_map"]
+            # review M4：副本隔离，避免准入/调用方修改污染缓存对象
+            precision_map = {t: dict(m) for t, m in cached["precision_map"].items()}
             reuse_decision = cached["reuse_decision"]
             step_delta = cached.get("importance_drift")
         else:
             # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003/T004 IRAP）
-            importance_map = self._compute_importance_matrix(
+            # review I3：EMA/ΔA 通过局部变量传递，不落全局单槽（异常中断不残留）
+            importance_map, new_ema, step_delta = self._compute_importance_with_state(
                 attention_scores,
                 layer_id,
                 self.num_layers,
@@ -279,9 +296,12 @@ class ShadowKVAgent(BaseAgent):
             precision_map = self.allocate_precision(importance_map, mode)
 
             # 如果 drift_score > 0.5，保留每 token top 20% head 为 FP16
+            # （review I1：sink 前缀硬保护优先，永不降档）
             if drift_score > 0.5:
                 num_fp16_heads = max(1, int(num_heads * 0.2))
                 for token_idx in range(seq_len):
+                    if token_idx < self.sink_tokens:
+                        continue
                     top_heads = torch.topk(
                         importance_map[token_idx], num_fp16_heads
                     ).indices.tolist()
@@ -300,31 +320,30 @@ class ShadowKVAgent(BaseAgent):
             )
 
             if fingerprint is not None:
+                # review M4：缓存副本（准入在缓存之外原地进行）
                 self._decision_cache[cache_key] = {
                     "fingerprint": fingerprint,
                     "importance_map": importance_map,
-                    "precision_map": precision_map,
+                    "precision_map": {t: dict(m) for t, m in precision_map.items()},
                     "reuse_decision": reuse_decision,
-                    "importance_drift": self._last_irap_delta,
+                    "importance_drift": step_delta,
                 }
 
         # AR003 T005：预算准入（pre-pack 降档阶梯，先于压缩）
         precision_map = self._admit_precision_budget(importance_map, precision_map, kv_current)
 
-        # 记录状态（AR003 T004：EMA 状态在未命中分支更新，命中路径不重复累积）
-        prev_state = self._irap_state.get(layer_id)
-        new_ema = self._last_irap_ema
-        if new_ema is not None:
+        # 记录状态（AR003 T004；review I2：按 (step, layer) 幂等，pressure/契约
+        # 变化导致的重放不得二次推进 EMA）
+        processed_key = (step_id, layer_id)
+        if new_ema is not None and processed_key not in self._irap_processed:
+            prev_state = self._irap_state.get(layer_id)
             if prev_state is not None and prev_state.shape[0] > new_ema.shape[0]:
                 self.logger.log_alert(
                     "warning",
                     f"IRAP state truncated: seq_k {prev_state.shape[0]} -> {new_ema.shape[0]}",
                 )
             self._irap_state[layer_id] = new_ema
-            self._last_irap_ema = None  # 消费后清空，避免命中路径误更新
-            # AR003 T006：ΔA 跨步差分（首步 None）
-            step_delta = self._last_irap_delta
-            self._last_irap_delta = None
+            self._irap_processed.add(processed_key)
 
         # Step 5: 压缩 KV
         compressed_kv = self.compress_kv(
@@ -356,7 +375,8 @@ class ShadowKVAgent(BaseAgent):
         # AR003 T005：写入张量级重要性元数据（全局驱逐依据）
         self.cache_manager.set_importance_matrix(layer_id, importance_map.detach().cpu())
         # AR003 T005：消费 memory_pressure（超阈跨层驱逐；无预算仅告警一次）
-        self._consume_memory_pressure(memory_pressure)
+        # review I4：每步最多触发一次全局驱逐（逐层循环内去重）
+        self._consume_memory_pressure(memory_pressure, step_id)
 
         # 记录 step 统计
         latency_ms = (time.perf_counter() - start_time) * 1000.0
@@ -581,13 +601,28 @@ class ShadowKVAgent(BaseAgent):
             )
         return precision_map
 
-    def _consume_memory_pressure(self, memory_pressure: float) -> None:
-        """消费 orchestrator 的 memory_pressure 信号（AR003 T005，FR3.4/KV-P8）。"""
+    def _consume_memory_pressure(
+        self, memory_pressure: float, step_id: Optional[int] = None
+    ) -> None:
+        """消费 orchestrator 的 memory_pressure 信号（AR003 T005，FR3.4/KV-P8）。
+
+        review I4：同一 step 内最多执行一次全局驱逐（逐层循环去重）。
+        review M2：非有限 / 非法压力值忽略并告警一次。
+        """
+        if step_id is not None:
+            if self._pressure_step == step_id:
+                return
+            self._pressure_step = step_id
         try:
             pressure = float(memory_pressure)
         except (TypeError, ValueError):
-            pressure = 0.0
-        if pressure != pressure or pressure < 0:  # NaN / 非法负值
+            pressure = float("nan")
+        if not math.isfinite(pressure) or pressure < 0.0:
+            if not self._pressure_warned:
+                self.logger.log_alert(
+                    "warning", f"invalid memory_pressure ignored: {memory_pressure!r}"
+                )
+                self._pressure_warned = True
             return
         if pressure < self.eviction_pressure_threshold:
             return
@@ -608,6 +643,20 @@ class ShadowKVAgent(BaseAgent):
                 "no eviction action taken",
             )
             self._eviction_warned = True
+
+    def reset_state(self) -> None:
+        """重置步级/跨步决策状态（review I7：跨 run 复用 orchestrator 时冷启动）。
+
+        保留配置与累计统计（on_init 负责完整重置）。
+        """
+        self._irap_state = {}
+        self._irap_processed = set()
+        self._decision_cache = {}
+        self._decision_cache_step = None
+        self._pressure_step = None
+        self.precision_map = {}
+        if self.cache_manager is not None:
+            self.cache_manager.clear()
 
     def _resolve_attn_contract(self, inputs: Dict[str, Any]) -> bool:
         """解析 attention 输入契约（AR003 T002，FR3.1）。
@@ -718,29 +767,49 @@ class ShadowKVAgent(BaseAgent):
         sink_tokens: int = 4,
     ) -> torch.Tensor:
         """
-        向量化计算全 (token, head) 重要性矩阵。
+        向量化计算全 (token, head) 重要性矩阵（仅返回重要性）。
 
         AR003 T003（FR3.2/FP6）：委托共享核心 ``compute_irap_importance``
-        （单一公式来源）——列向接收注意力 rank 归一化为主信号、行熵辅助、
-        sink 前缀硬保护；旧位置加成已移除。与逐元素 ``compute_importance_score``
-        等价（容差 1e-6，golden 双实现对照）。
+        （单一公式来源）——列向接收注意力 EMA 状态的 rank 归一化为主信号、
+        行熵辅助、sink 前缀硬保护；旧位置加成已移除。与逐元素
+        ``compute_importance_score`` 等价（容差 1e-6，golden 双实现对照）。
 
         非方形输入口径：attention_scores 形状 (batch, heads, seq_q, seq_k) 时，
         重要性矩阵按 KV token 维（seq_k）输出——接收注意力、rank 归一化与
         sink 保护均以 seq_k 为基准（AR003 起重要性主体为 KV 列；方形自注意力
         下 seq_q == seq_k，行为不变）。
         """
-        seq_len = attention_scores.shape[-1]
-        log_seq = math.log(seq_len)
-        if log_seq == 0.0:
-            raise ZeroDivisionError("float division by zero")
+        importance_map, _, _ = self._compute_importance_with_state(
+            attention_scores,
+            layer_index,
+            num_layers,
+            attn_is_probabilities=attn_is_probabilities,
+            received_ema=received_ema,
+            irap_decay=irap_decay,
+            entropy_weight=entropy_weight,
+            sink_tokens=sink_tokens,
+        )
+        return importance_map
 
+    def _compute_importance_with_state(
+        self,
+        attention_scores: torch.Tensor,
+        layer_index: int,
+        num_layers: int,
+        attn_is_probabilities: bool = False,
+        received_ema=None,
+        irap_decay: float = 0.9,
+        entropy_weight: float = 0.3,
+        sink_tokens: int = 4,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[float]]:
+        """向量化重要性 + 新 EMA 状态 + ΔA（review I3：局部返回，无全局单槽）。"""
         if attn_is_probabilities:
             weights = self._row_normalize(attention_scores)
         else:
-            weights = F.softmax(attention_scores, dim=-1)
+            # 数值安全：logits 含 NaN/Inf 时置零后再 softmax
+            weights = F.softmax(torch.nan_to_num(attention_scores), dim=-1)
 
-        importance_map, new_ema, delta_a = compute_irap_importance(
+        return compute_irap_importance(
             weights,
             received_ema_prev=received_ema,
             irap_decay=irap_decay,
@@ -749,10 +818,6 @@ class ShadowKVAgent(BaseAgent):
             layer_index=layer_index,
             num_layers=num_layers,
         )
-        # 供 T004 接入状态（当前仅暂存最近一次结果）
-        self._last_irap_ema = new_ema
-        self._last_irap_delta = delta_a
-        return importance_map
 
     def allocate_precision(
         self, importance_map: torch.Tensor, mode: str

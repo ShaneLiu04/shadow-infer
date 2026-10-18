@@ -53,13 +53,15 @@ class TestDecisionCache:
         agent = ShadowKVAgent(config=config)
         agent.on_init({"num_layers": 4, "num_heads": 8, "head_dim": 16, "model_name": "t"})
         calls = {"count": 0}
-        original = agent._compute_importance_matrix
+        # AR003 review 修复：on_step 内部入口改为 `_compute_importance_with_state`
+        # （返回 (importance, new_ema, delta_a)），计数包装该入口
+        original = agent._compute_importance_with_state
 
         def _counting(*args, **kwargs):
             calls["count"] += 1
             return original(*args, **kwargs)
 
-        agent._compute_importance_matrix = _counting
+        agent._compute_importance_with_state = _counting
         return agent, calls
 
     def test_same_input_second_call_hits_cache(self, mock_config):
@@ -88,7 +90,8 @@ class TestDecisionCache:
         agent, _ = self._counting_agent(mock_config)
         timers = {"total": 0.0}
         for name in (
-            "_compute_importance_matrix",
+            # AR003 review 修复：入口改为 `_compute_importance_with_state`
+            "_compute_importance_with_state",
             "allocate_precision",
             "_build_reuse_decision",
         ):

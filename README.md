@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.5.0 | 697 passed / 1 skipped | 81.89% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.5.0 | 704 passed / 1 skipped | 82.04% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -310,8 +310,8 @@ Profiler  ShadowKV  Q-drift  FFN Optimizer
    # 2) IRAP 跨步 EMA 传播（常数内存，无历史列表）
    A[t, h] = gamma * A_prev[t, h] + (1 - gamma) * received[t, h]   # gamma 默认 0.9
 
-   # 3) rank 归一化（逐 head 在 token 维，长尾稳健） + 行熵辅助（beta 默认 0.3）
-   rank[t, h] = dense_rank(A[:, h]) / seq_len
+   # 3) rank 归一化（逐 head 在 token 维，按排序位次；长尾稳健） + 行熵辅助（beta 默认 0.3）
+   rank[t, h] = argsort(argsort(A[:, h]))[t] / seq_len
    importance = clamp(((1 - beta) * rank + beta * normalized_entropy) * layer_factor, max=1)
 
    # 4) sink 硬保护：前 sink_tokens（默认 4）个 token 强制最高档，且不可驱逐
@@ -689,8 +689,8 @@ python -m shadowinfer optimize \
 
 | 指标 | 实测值 | 说明 |
 |------|--------|------|
-| 测试通过率 | 697 passed / 1 skipped | 全量套件（新增 IRAP / 预算准入 / ΔA 信号 72 个用例） |
-| 测试覆盖率 | 81.89% | pytest-cov（门禁 fail-under 75） |
+| 测试通过率 | 704 passed / 1 skipped | 全量套件（新增 IRAP / 预算准入 / ΔA 信号 79 个用例） |
+| 测试覆盖率 | 82.04% | pytest-cov（门禁 fail-under 75） |
 | 静态检查 | black / isort / flake8 / mypy 全部零告警 | 提交前强制门禁 |
 | 向量化 golden 精度 | vec vs 逐元素 reference max\|Δ\| <= 1e-6 | 两契约（logits / probabilities）、sink 边界、EMA 增量 vs 全量 |
 | IRAP 常数内存 | 200 步后状态形状/字节不增长 | O(1) 于步数（事务级断言） |
@@ -960,7 +960,7 @@ pytest
 - 预算闭环（KV-P4/P8/P10）：pre-pack 降档准入（单次打包零重打包）、`memory_pressure` 消费与跨层驱逐（10% 迟滞）、per-precision 字节精确记账（修复 8x 低估）；
 - ΔA 跨步差分信号（FR3.5）：每步导出并一步滞后供 Q-drift 可选融合（`use_importance_drift` 默认关闭，关闭时逐位不变）；
 - 顺带修复：小 `head_dim`（不可被 64 整除）INT4 量化直接抛错缺陷（分组自适应）；
-- 质量门禁全绿：`697 passed, 1 skipped`，覆盖率 `81.89%`；端到端收益与精度影响标记「机制说明（未验证）」，复现协议见《大规模复现实验指南》。
+- 质量门禁全绿：`704 passed, 1 skipped`，覆盖率 `82.04%`；端到端收益与精度影响标记「机制说明（未验证）」，复现协议见《大规模复现实验指南》。
 
 ### v3.4.0（2026-10）
 

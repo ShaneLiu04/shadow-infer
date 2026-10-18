@@ -8,8 +8,9 @@ optimization:
 shadowkv:
   enabled: true
   compression_ratio: 0.5
-  # v3.5.0 IRAP / 契约 / 预算准入（agent 扁平键映射）
-  attn_is_probabilities: true        # 真实后端返回 post-softmax；mock 后端请置 false
+  # v3.5.0 IRAP / 预算准入（agent 扁平键映射）
+  # attention 契约默认随后端自动接线（真实后端=probabilities / mock=logits）；
+  # 仅在实验需要强制覆盖时显式设置 attn_is_probabilities（true/false）
   irap_decay: 0.9                    # 跨步 EMA 衰减 gamma ∈ (0,1)
   entropy_weight: 0.3                # 行熵辅助权重 beta ∈ [0,1]
   sink_tokens: 4                     # 前缀 sink 硬保护 token 数

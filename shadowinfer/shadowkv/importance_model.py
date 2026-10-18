@@ -61,9 +61,18 @@ def compute_irap_importance(
     供 QDrift 可选消费）。
     """
     seq_len = weights.shape[-1]
-    log_seq = math.log(seq_len)
-    if log_seq == 0.0:
-        raise ZeroDivisionError("float division by zero")
+    if weights.dim() != 4:
+        raise ValueError(f"weights must be 4-D (batch, heads, seq_q, seq_k), got {weights.dim()}-D")
+    if not 0.0 < irap_decay < 1.0:
+        raise ValueError(f"irap_decay must be in (0, 1), got {irap_decay}")
+    if not 0.0 <= entropy_weight <= 1.0:
+        raise ValueError(f"entropy_weight must be in [0, 1], got {entropy_weight}")
+    if sink_tokens < 0:
+        raise ValueError(f"sink_tokens must be >= 0, got {sink_tokens}")
+    log_seq = math.log(max(seq_len, 2))
+
+    # 数值安全：NaN/Inf 置零（异常输入不得外泄到决策与打包）
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
     # 列向接收注意力 [heads, seq_k]：对 batch 与 query 维取 mean
     received = weights.mean(dim=(0, 2))
@@ -89,7 +98,9 @@ def compute_irap_importance(
         delta_a = float(torch.norm(ema - prev_t) / (torch.norm(prev_t) + 1e-12))
 
     # 逐 head 在 token 维的升序 dense-rank 归一化 ∈ (0, 1]
-    order = received.argsort(dim=-1)
+    # AR003 review 修复（C1）：rank 作用于 EMA 状态 A（跨步传播结果），
+    # 否则 EMA 只影响状态/ΔA 而不影响决策，重要性将退化为单步信号
+    order = ema.argsort(dim=-1)
     ranks = order.argsort(dim=-1).to(torch.float64)
     rank_norm = (ranks + 1.0) / seq_len
 

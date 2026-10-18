@@ -142,6 +142,8 @@ class KVCacheManager:
             return 0
 
         target = int(budget_bytes * 0.9)
+        if self.get_memory_usage() <= target:
+            return 0
         evicted_total = 0
         evicted: set = set()
 
@@ -160,14 +162,20 @@ class KVCacheManager:
                     )
         candidates.sort(key=lambda item: item[0])
 
+        # review I4：按需批量驱逐（估计每批释放量），每层每次 evict 只重打包一次；
+        # 循环迭代次数受候选集大小约束，且用量达标即停。
         idx = 0
         while self.get_memory_usage() > target and idx < len(candidates):
+            usage = self.get_memory_usage()
+            remaining = usage - target
+            avg_entry = max(1, usage // max(1, len(candidates)))
+            batch_size = max(1, min(len(candidates) - idx, remaining // avg_entry + 1))
             chunk: Dict[int, set] = {}
-            for _, layer_id, token_idx, head_idx in candidates[idx : idx + 64]:
+            for _, layer_id, token_idx, head_idx in candidates[idx : idx + batch_size]:
                 if (layer_id, token_idx, head_idx) in evicted:
                     continue
                 chunk.setdefault(layer_id, set()).add((token_idx, head_idx))
-            idx += 64
+            idx += batch_size
             if not chunk:
                 continue
             for layer_id, token_heads in chunk.items():

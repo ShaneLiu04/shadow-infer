@@ -82,12 +82,16 @@ def _fixed_importance(layer_id=0, seed=SEED + 11):
 
 
 def _patch_importance(agent, monkeypatch, matrices):
-    """固定 on_step 的重要性矩阵（隔离 IRAP 计算，聚焦预算接线）。"""
+    """固定 on_step 的重要性矩阵（隔离 IRAP 计算，聚焦预算接线）。
+
+    AR003 review 修复：内部 API 已改为 `_compute_importance_with_state`
+    （返回 (importance, new_ema, delta_a)），此处返回固定矩阵且不推进 EMA。
+    """
 
     def fake(attention_scores, layer_index, num_layers, **kwargs):
-        return matrices[layer_index].clone()
+        return matrices[layer_index].clone(), None, None
 
-    monkeypatch.setattr(agent, "_compute_importance_matrix", fake)
+    monkeypatch.setattr(agent, "_compute_importance_with_state", fake)
 
 
 def _make_agent(mock_config, monkeypatch, budget_mb=None, matrices=None, **overrides):

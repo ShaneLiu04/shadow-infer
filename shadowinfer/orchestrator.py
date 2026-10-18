@@ -1112,6 +1112,13 @@ class Orchestrator:
         total_steps = state.total_steps
         inputs = state.inputs
 
+        # review I7：每个 run 的 step 0 冷启动（ΔA 一步滞后语义 + IRAP 状态重置）
+        if step_id == 0:
+            self._last_importance_drift = None
+            reset_state = getattr(self.shadowkv, "reset_state", None)
+            if callable(reset_state):
+                reset_state()
+
         # AR002 M6：step 真实计时起点（perf_counter 口径，供 Profiler 消费）
         step_wall_start = time.perf_counter()
 
@@ -1352,8 +1359,13 @@ class Orchestrator:
         dispatch = inputs.get("qdrift_signal", {})
 
         # Compute memory pressure for the decision plane / eviction.
+        # review I6：压力口径与 agent 实际预算一致（agent 未配置时回退全局预算）
         total_mb = self.shadowkv.cache_manager.get_memory_usage_mb()
-        budget_mb = max(1.0, self.global_state.get("memory_budget_mb", 8192.0))
+        agent_budget = self.shadowkv.cache_manager.memory_budget_bytes
+        if agent_budget and agent_budget > 0:
+            budget_mb = max(1.0, agent_budget / (1024.0 * 1024.0))
+        else:
+            budget_mb = max(1.0, self.global_state.get("memory_budget_mb", 8192.0))
         memory_pressure = min(1.0, total_mb / budget_mb)
 
         all_kv_results: List[Dict[str, Any]] = []
@@ -1367,8 +1379,13 @@ class Orchestrator:
                 "total_steps": step_config.total_steps,
                 "memory_pressure": memory_pressure,
                 # AR003 T002（FR3.1）：attention 输入契约随后端显式传递；
-                # 真实后端返回 post-softmax 权重，mock 路径为 logits
-                "attn_is_probabilities": self._is_real_backend(),
+                # 真实后端返回 post-softmax 权重，mock 路径为 logits。
+                # review M3：shadowkv 显式配置优先（实验对照可切换），否则随后端
+                "attn_is_probabilities": (
+                    self.shadowkv.attn_is_probabilities
+                    if getattr(self.shadowkv, "_attn_contract_configured", False)
+                    else self._is_real_backend()
+                ),
                 "qdrift_signal": {
                     "sensitivity_score": sensitivity_score,
                     "drift_score": drift_score,

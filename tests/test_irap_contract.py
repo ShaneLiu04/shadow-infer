@@ -75,16 +75,20 @@ def _make_agent(mock_config, **overrides):
 
 
 def _counting_agent(mock_config, **overrides):
-    """构造带 _compute_importance_matrix 调用计数的 agent（缓存命中观测）。"""
+    """构造带重要性计算调用计数的 agent（缓存命中观测）。
+
+    AR003 review 修复：on_step 内部入口为 `_compute_importance_with_state`
+    （返回 (importance, new_ema, delta_a)），计数包装该入口。
+    """
     agent = _make_agent(mock_config, **overrides)
     calls = {"count": 0}
-    original = agent._compute_importance_matrix
+    original = agent._compute_importance_with_state
 
     def _counting(*args, **kwargs):
         calls["count"] += 1
         return original(*args, **kwargs)
 
-    agent._compute_importance_matrix = _counting
+    agent._compute_importance_with_state = _counting
     return agent, calls
 
 
@@ -383,39 +387,45 @@ class TestContractKeyPriority:
     """inputs 键优先级高于 config 键（design 4.3.1）。"""
 
     def test_inputs_true_overrides_config_false(self, mock_config):
-        agent = _make_agent(mock_config, attn_is_probabilities=False)
+        """inputs 键 True 覆盖 config False；两次契约调用用独立 agent（避免 EMA 跨调用）。"""
         _, probs = _make_hetero_probs()
         inputs = _make_inputs(probs)
 
-        result_true = agent.on_step(_step_config(), dict(inputs, attn_is_probabilities=True))
-        result_false = agent.on_step(_step_config(), dict(inputs, attn_is_probabilities=False))
-
-        expected_true = agent._compute_importance_matrix(
+        agent_true = _make_agent(mock_config, attn_is_probabilities=False)
+        result_true = agent_true.on_step(_step_config(), dict(inputs, attn_is_probabilities=True))
+        expected_true = agent_true._compute_importance_matrix(
             probs, LAYER_ID, NUM_LAYERS, attn_is_probabilities=True
         )
         assert result_true["importance_stats"]["mean"] == pytest.approx(
             float(expected_true.mean()), abs=1e-6
         ), "inputs 键 True 应覆盖 config False"
 
+        agent_false = _make_agent(mock_config, attn_is_probabilities=False)
+        result_false = agent_false.on_step(
+            _step_config(), dict(inputs, attn_is_probabilities=False)
+        )
         mean_true = result_true["importance_stats"]["mean"]
         mean_false = result_false["importance_stats"]["mean"]
         assert abs(mean_true - mean_false) > 1e-3, "两契约结果应可区分"
 
     def test_inputs_false_overrides_config_true(self, mock_config):
-        agent = _make_agent(mock_config, attn_is_probabilities=True)
+        """inputs 键 False 覆盖 config True；两次契约调用用独立 agent（避免 EMA 跨调用）。"""
         _, probs = _make_hetero_probs()
         inputs = _make_inputs(probs)
 
-        result_true = agent.on_step(_step_config(), dict(inputs, attn_is_probabilities=True))
-        result_false = agent.on_step(_step_config(), dict(inputs, attn_is_probabilities=False))
-
-        expected_false = agent._compute_importance_matrix(
+        agent_false = _make_agent(mock_config, attn_is_probabilities=True)
+        result_false = agent_false.on_step(
+            _step_config(), dict(inputs, attn_is_probabilities=False)
+        )
+        expected_false = agent_false._compute_importance_matrix(
             probs, LAYER_ID, NUM_LAYERS, attn_is_probabilities=False
         )
         assert result_false["importance_stats"]["mean"] == pytest.approx(
             float(expected_false.mean()), abs=1e-6
         ), "inputs 键 False 应覆盖 config True"
 
+        agent_true = _make_agent(mock_config, attn_is_probabilities=True)
+        result_true = agent_true.on_step(_step_config(), dict(inputs, attn_is_probabilities=True))
         mean_true = result_true["importance_stats"]["mean"]
         mean_false = result_false["importance_stats"]["mean"]
         assert abs(mean_true - mean_false) > 1e-3, "两契约结果应可区分"
@@ -1255,3 +1265,131 @@ class TestIRAPDecisionCacheEMA:
         ), "缓存命中不得重复累积 EMA（状态数值应逐位不变）"
         assert second["precision_map"] == first["precision_map"]
         assert second["importance_stats"] == pytest.approx(first["importance_stats"])
+
+
+# =============================================================================
+# Review 回归用例（AR003 审查修复 C1 / I1 / I2 / I8 / I9 / I10 + 多 run 冷启动）
+# =============================================================================
+
+
+class TestReviewFixes:
+    def test_review_c1_rank_uses_ema_state(self, mock_config):
+        """C1：rank 必须作用于 EMA 状态 A；带 EMA 时 vec 与参考实现 <= 1e-6。"""
+        agent = _make_agent(mock_config)
+        logits1, _ = _make_hetero_probs(seed=SEED + 21)
+        logits2, _ = _make_hetero_probs(seed=SEED + 22)
+        weights1 = F.softmax(logits1, dim=-1)
+        from shadowinfer.shadowkv.importance_model import compute_irap_importance
+
+        _, state1, _ = compute_irap_importance(weights1, None, 0.9, 0.3, 4, 0, 4)
+
+        vec = agent._compute_importance_matrix(
+            logits2, LAYER_ID, NUM_LAYERS, attn_is_probabilities=False, received_ema=state1
+        )
+        seq_q = logits2.shape[2]
+        ref = torch.zeros(seq_q, HEADS)
+        for token_idx in range(seq_q):
+            for head_idx in range(HEADS):
+                ref[token_idx, head_idx] = agent.compute_importance_score(
+                    logits2,
+                    token_idx,
+                    head_idx,
+                    LAYER_ID,
+                    NUM_LAYERS,
+                    attn_is_probabilities=False,
+                    received_ema=state1,
+                )
+        diff = (vec - ref).abs().max().item()
+        assert diff <= 1e-6, f"带 EMA 的 vec/ref 差异 {diff:.3e} 应 <= 1e-6"
+
+        no_ema = agent._compute_importance_matrix(
+            logits2, LAYER_ID, NUM_LAYERS, attn_is_probabilities=False
+        )
+        assert (vec - no_ema).abs().max().item() > 1e-3, "EMA 必须实际影响重要性"
+
+    def test_review_i1_sink_survives_high_drift(self, mock_config):
+        """I1：drift > 0.5 的 top-20% fp16 覆写不得降低 sink token-head。"""
+        agent = _make_agent(mock_config, sink_tokens=2)
+        logits, _ = _make_hetero_probs()
+        inputs = _make_inputs(logits, attn_is_probabilities=False)
+        inputs["qdrift_signal"] = {"sensitivity_score": 0.3, "drift_score": 0.9}
+        result = agent.on_step(_step_config(), inputs)
+        for token_idx in range(2):
+            for head_idx in range(HEADS):
+                assert result["precision_map"][token_idx][head_idx] == "fp32"
+
+    def test_review_i2_replay_does_not_double_advance_ema(self, mock_config):
+        """I2：pressure/契约变化导致同 (step, layer) 重放时 EMA 不得二次推进。"""
+        agent = _make_agent(mock_config)
+        logits, _ = _make_hetero_probs()
+        inputs = _make_inputs(logits, attn_is_probabilities=False)
+        agent.on_step(_step_config(step_id=0), dict(inputs, memory_pressure=0.0))
+        state_after_first = agent._irap_state[LAYER_ID].clone()
+        agent.on_step(_step_config(step_id=0), dict(inputs, memory_pressure=0.5))
+        state_after_replay = agent._irap_state[LAYER_ID]
+        assert torch.allclose(state_after_first, state_after_replay, atol=1e-8), "重放不得二次推进 EMA"
+
+    def test_review_i8_single_token_sequence(self, mock_config):
+        """I8：seq_k=1 合法，不得抛 ZeroDivisionError，输出有限。"""
+        agent = _make_agent(mock_config)
+        probs = torch.ones(1, HEADS, 1, 1)
+        imp = agent._compute_importance_matrix(
+            probs, LAYER_ID, NUM_LAYERS, attn_is_probabilities=True
+        )
+        assert imp.shape == (1, HEADS)
+        assert torch.isfinite(imp).all()
+
+    def test_review_i9_nan_attention_sanitized(self, mock_config):
+        """I9：NaN/Inf attention 不得外泄到重要性（输出有限）。"""
+        agent = _make_agent(mock_config)
+        _, probs = _make_hetero_probs()
+        probs = probs.clone()
+        probs[:, :, 7, :] = float("nan")
+        probs[:, :, 9, 3] = float("inf")
+        imp = agent._compute_importance_matrix(
+            probs, LAYER_ID, NUM_LAYERS, attn_is_probabilities=True
+        )
+        assert torch.isfinite(imp).all()
+
+    def test_review_i10_sink_ge_seq_warns_once(self, mock_config, monkeypatch):
+        """I10：sink_tokens >= seq_len 时告警恰好一次（配置错误提示）。"""
+        agent = _make_agent(mock_config, sink_tokens=4)
+        alerts = []
+        monkeypatch.setattr(
+            agent.logger, "log_alert", lambda level, msg, **kw: alerts.append((level, msg))
+        )
+        probs = torch.softmax(torch.randn(1, HEADS, 4, 4), dim=-1)
+        kv = {"k": torch.randn(1, HEADS, 4, HEAD_DIM), "v": torch.randn(1, HEADS, 4, HEAD_DIM)}
+        for step in (0, 1):
+            agent.on_step(
+                _step_config(step_id=step),
+                {
+                    "attention_scores": probs,
+                    "kv_current": kv,
+                    "layer_id": LAYER_ID,
+                    "attn_is_probabilities": True,
+                    "memory_pressure": 0.0,
+                },
+            )
+        warnings = [a for a in alerts if "sink_tokens" in a[1]]
+        assert len(warnings) == 1
+
+    def test_review_i7_multi_run_cold_start(self, monkeypatch):
+        """I7：同一 orchestrator 第二次 run 的 step 0 ΔA 必须为 None（冷启动）。"""
+        from shadowinfer.orchestrator import Orchestrator
+
+        orch = Orchestrator(config="configs/optimize_full.yaml")
+        orch.initialize()
+        seen = []
+        original = orch.qdrift.on_step
+
+        def spy(step_config, inputs):
+            seen.append((step_config.step_id, inputs.get("importance_drift")))
+            return original(step_config, inputs)
+
+        monkeypatch.setattr(orch.qdrift, "on_step", spy)
+        orch.run_optimized(prompt="test", num_steps=2)
+        orch.run_optimized(prompt="test", num_steps=2)
+        step0 = [d for s, d in seen if s == 0]
+        assert len(step0) >= 2
+        assert all(d is None for d in step0), f"多 run step0 ΔA 应为 None，实际 {step0}"
