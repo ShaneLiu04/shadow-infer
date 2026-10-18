@@ -12,7 +12,7 @@
 | ID | 任务描述 | 依赖 | 状态 | 备注 |
 |----|---------|------|------|------|
 | T001 | 基线取证落档：attention 契约双路径现状（mock=logits / 真实后端=probabilities）、双重 softmax 下精度档分布熵饱和实证、无界 importance_history 增长曲线、预算/驱逐死代码取证、旧默认参数（γ/sink/阈值）校准依据 → baseline-profile.md | - | passing | 2026-10-18 完成 |
-| T002 | FR3.1 attention 契约显式化与单次归一化：配置键、orchestrator 按后端接线、标量/向量化双路径同步修复、熵饱和消除与回归锚点测试 | T001 | pending | |
+| T002 | FR3.1 attention 契约显式化与单次归一化：配置键、orchestrator 按后端接线、标量/向量化双路径同步修复、熵饱和消除与回归锚点测试 | T001 | passing | 2026-10-18 完成（17 用例） |
 | T003 | FR3.2 接收注意力重要性轴 + sink 前缀硬保护：主信号列向、rank 归一化、行熵辅助、sink_tokens 配置、双路径同步、sink 反转回归对照测试；含 FP6 公式单源化（ImportanceModel 委托共享核心、删 _history） | T002 | pending | 与 T004 增量结构协同设计 |
 | T004 | FR3.3 IRAP 跨步 EMA 传播与常数内存历史：irap_decay 配置、增量 vs 全量等价 golden、无界 history 收敛为 EMA+标量统计、on_init 重置维持、形状增广规则 | T003 | pending | |
 | T005 | FR3.4 预算准入与驱逐接线：store 同步 token-head 元数据、memory_pressure 消费与阈值动作、per-precision 字节估算修正（8x 误差）、sink 保护驱逐顺序、字节级断言测试 | T004 | pending | |

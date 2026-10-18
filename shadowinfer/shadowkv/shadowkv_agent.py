@@ -37,15 +37,15 @@ class ShadowKVAgent(BaseAgent):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config, name="shadowkv")
-        self.kv_cache: Dict[int, Dict[str, Any]] = (
-            {}
-        )  # layer_id -> {k: Tensor, v: Tensor, precision: str}
-        self.precision_map: Dict[int, Dict[int, Dict[int, str]]] = (
-            {}
-        )  # layer_id -> token -> head -> precision
-        self.importance_history: Dict[int, List[torch.Tensor]] = (
-            {}
-        )  # layer_id -> [importance_map, ...]
+        self.kv_cache: Dict[
+            int, Dict[str, Any]
+        ] = {}  # layer_id -> {k: Tensor, v: Tensor, precision: str}
+        self.precision_map: Dict[
+            int, Dict[int, Dict[int, str]]
+        ] = {}  # layer_id -> token -> head -> precision
+        self.importance_history: Dict[
+            int, List[torch.Tensor]
+        ] = {}  # layer_id -> [importance_map, ...]
         self.logger = StructuredLogger("shadowkv", config.get("log_dir", "logs/"))
 
         # New abstractions (lazy-initialized in on_init).
@@ -102,6 +102,10 @@ class ShadowKVAgent(BaseAgent):
         # AR002 M5：决策缓存（(step_id, layer_id) 定位键 + 输入指纹校验）
         self._decision_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._decision_cache_step: Optional[int] = None
+        # AR003 T002：attention 输入契约（KV-P2）。显式配置优先于缺省告警路径
+        self._attn_contract_configured = "attn_is_probabilities" in config
+        self.attn_is_probabilities = bool(config.get("attn_is_probabilities", False))
+        self._attn_contract_warned = False
 
     def on_init(self, model_config: Dict[str, Any]) -> None:
         """初始化：加载配置，设置精度阈值和复用参数。"""
@@ -134,6 +138,7 @@ class ShadowKVAgent(BaseAgent):
         }
         self._decision_cache = {}
         self._decision_cache_step = None
+        self._attn_contract_warned = False
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
@@ -204,6 +209,10 @@ class ShadowKVAgent(BaseAgent):
         # 命中且指纹一致时直接复用，指纹异常旁路，step 滚动自动失效）
         batch_size, num_heads, seq_len, _ = attention_scores.shape
 
+        # AR003 T002：契约解析（inputs 键 > config 键 > 缺省告警路径）
+        attn_is_probabilities = self._resolve_attn_contract(inputs)
+        memory_pressure = inputs.get("memory_pressure", 0.0)
+
         if step_id != self._decision_cache_step:
             self._decision_cache = {}
             self._decision_cache_step = step_id
@@ -217,6 +226,8 @@ class ShadowKVAgent(BaseAgent):
             sensitivity_score,
             drift_score,
             mode,
+            attn_is_probabilities=attn_is_probabilities,
+            memory_pressure=memory_pressure,
         )
         cached = self._decision_cache.get(cache_key) if fingerprint is not None else None
         if cached is not None and cached.get("fingerprint") == fingerprint:
@@ -226,7 +237,10 @@ class ShadowKVAgent(BaseAgent):
         else:
             # Step 2: 计算重要性分数（AR002 M1：向量化整矩阵计算）
             importance_map = self._compute_importance_matrix(
-                attention_scores, layer_id, self.num_layers
+                attention_scores,
+                layer_id,
+                self.num_layers,
+                attn_is_probabilities=attn_is_probabilities,
             )
 
             # Step 3: 分配精度
@@ -416,6 +430,24 @@ class ShadowKVAgent(BaseAgent):
 
     # === 核心算法 ===
 
+    def _resolve_attn_contract(self, inputs: Dict[str, Any]) -> bool:
+        """解析 attention 输入契约（AR003 T002，FR3.1）。
+
+        优先级：on_step inputs 键 > agent 配置键 > 缺省（logits，mock 语义）。
+        缺省路径每次 agent 生命周期内仅告警一次。
+        """
+        if "attn_is_probabilities" in inputs:
+            return bool(inputs["attn_is_probabilities"])
+        if self._attn_contract_configured:
+            return self.attn_is_probabilities
+        if not self._attn_contract_warned:
+            self.logger.log_alert(
+                "warning",
+                "attn_is_probabilities not configured; assuming logits (mock semantics)",
+            )
+            self._attn_contract_warned = True
+        return False
+
     def compute_importance_score(
         self,
         attention_scores: torch.Tensor,
@@ -423,12 +455,15 @@ class ShadowKVAgent(BaseAgent):
         head_index: int,
         layer_index: int,
         num_layers: int,
+        attn_is_probabilities: bool = False,
     ) -> float:
         """
-        计算 per-token-head 重要性分数。
+        计算 per-token-head 重要性分数（逐元素参考实现 / golden 基准）。
 
         算法（对应 README.md《核心算法》ShadowKV 分层压缩 1）：
         1. 取该 token 在当前 head 上的 attention 权重分布
+           （AR003 T002：``attn_is_probabilities=True`` 时输入已是 softmax
+           概率，跳过 softmax 仅做行和数值安全校正）
         2. 计算 entropy（高 entropy → 关注范围广 → 高重要性）
         3. 层深度因子（浅层关注局部，深层关注语义）
         4. 位置因子（开头和结尾的 token 通常更重要）
@@ -436,7 +471,10 @@ class ShadowKVAgent(BaseAgent):
         """
         # 1. 提取该 token 的 attention 权重
         attn_weights = attention_scores[:, head_index, token_index, :]  # [batch, seq_len]
-        weights = F.softmax(attn_weights, dim=-1)
+        if attn_is_probabilities:
+            weights = self._row_normalize(attn_weights)
+        else:
+            weights = F.softmax(attn_weights, dim=-1)
 
         # 2. 计算 entropy
         entropy = Metrics.compute_entropy(weights)
@@ -454,17 +492,24 @@ class ShadowKVAgent(BaseAgent):
         score = normalized_entropy * layer_factor * pos_factor
         return float(min(score, 1.0))
 
+    @staticmethod
+    def _row_normalize(tensor: torch.Tensor) -> torch.Tensor:
+        """行和数值安全校正（AR003 T002）：概率契约输入不再 softmax。"""
+        return tensor / tensor.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
     def _compute_importance_matrix(
         self,
         attention_scores: torch.Tensor,
         layer_index: int,
         num_layers: int,
+        attn_is_probabilities: bool = False,
     ) -> torch.Tensor:
         """
         向量化计算全 (token, head) 重要性矩阵（AR002 M1）。
 
         与逐元素调用 compute_importance_score 语义逐元素一致（容差 1e-6）：
-        - weights = softmax(attention_scores, dim=-1)（保留双重 softmax 现状）
+        - AR003 T002（KV-P2）：``attn_is_probabilities=True`` 时输入视为
+          已 softmax 概率，跳过 softmax 仅做行和校正；False 时单次 softmax
         - entropy 复刻 Metrics.compute_entropy 语义：clamp(min=1e-10) 后
           对全部 (batch, seq_k) 元素重归一化，再取 -sum(p*log p) 标量
         - normalized_entropy / log(seq_k)，乘层因子与位置因子，clamp(max=1)
@@ -479,7 +524,10 @@ class ShadowKVAgent(BaseAgent):
         if log_seq == 0.0:
             raise ZeroDivisionError("float division by zero")
 
-        weights = F.softmax(attention_scores, dim=-1)
+        if attn_is_probabilities:
+            weights = self._row_normalize(attention_scores)
+        else:
+            weights = F.softmax(attention_scores, dim=-1)
         clamped = weights.clamp(min=1e-10)
         denom = clamped.sum(dim=(0, 3))
         probs = clamped / denom.unsqueeze(0).unsqueeze(-1)
@@ -849,9 +897,11 @@ class ShadowKVAgent(BaseAgent):
         sensitivity_score: float,
         drift_score: float,
         mode: str,
+        attn_is_probabilities: bool = False,
+        memory_pressure: float = 0.0,
     ) -> Optional[tuple]:
         """
-        决策输入指纹（AR002 M5，design 4.2.2 点 5）。
+        决策输入指纹（AR002 M5，design 4.2.2 点 5；AR003 T002 扩展契约与压力标量）。
 
         各输入张量的 (shape 元组, dtype, data_ptr) + 标量输入元组；
         计算抛异常时返回 None（调用方旁路缓存：不命中、不写入）。
@@ -871,7 +921,16 @@ class ShadowKVAgent(BaseAgent):
                 )
             else:
                 parts.append(None)
-            parts.extend((total_steps, float(sensitivity_score), float(drift_score), mode))
+            parts.extend(
+                (
+                    total_steps,
+                    float(sensitivity_score),
+                    float(drift_score),
+                    mode,
+                    bool(attn_is_probabilities),
+                    float(memory_pressure),
+                )
+            )
             return tuple(parts)
         except Exception:
             return None

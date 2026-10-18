@@ -1359,6 +1359,9 @@ class Orchestrator:
                 "step_id": step_config.step_id,
                 "total_steps": step_config.total_steps,
                 "memory_pressure": memory_pressure,
+                # AR003 T002（FR3.1）：attention 输入契约随后端显式传递；
+                # 真实后端返回 post-softmax 权重，mock 路径为 logits
+                "attn_is_probabilities": self._is_real_backend(),
                 "qdrift_signal": {
                     "sensitivity_score": sensitivity_score,
                     "drift_score": drift_score,
