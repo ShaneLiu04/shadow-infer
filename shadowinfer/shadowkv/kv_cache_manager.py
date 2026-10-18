@@ -48,6 +48,8 @@ class KVCacheManager:
 
         # Per-token-head metadata used for eviction decisions.
         self._token_head_meta: Dict[int, Dict[Tuple[int, int], TokenHeadScore]] = {}
+        # AR003 T005：张量级重要性矩阵（[seq_k, heads]），生产驱逐路径使用
+        self._importance_matrices: Dict[int, torch.Tensor] = {}
 
         # Prefetch buffer keyed by (layer_id, predicted_step_id) or
         # (layer_id, "next") for the immediate next step.
@@ -102,6 +104,91 @@ class KVCacheManager:
         """Return stored per-token-head metadata for a layer."""
         return dict(self._token_head_meta.get(layer_id, {}))
 
+    def set_importance_matrix(self, layer_id: int, importance: torch.Tensor) -> None:
+        """存储张量级重要性矩阵（AR003 T005，FR3.4）。
+
+        生产路径替代逐对象 ``set_token_head_meta``（对象级 API 保留兼容）。
+        形状与既有层记录不一致时以最新为准并告警。
+        """
+        previous = self._importance_matrices.get(layer_id)
+        if previous is not None and tuple(previous.shape) != tuple(importance.shape):
+            import logging
+
+            logging.getLogger("kv_cache_manager").warning(
+                "importance matrix shape changed for layer %s: %s -> %s",
+                layer_id,
+                tuple(previous.shape),
+                tuple(importance.shape),
+            )
+        self._importance_matrices[layer_id] = importance.detach().cpu()
+
+    def get_importance_matrix(self, layer_id: int) -> Optional[torch.Tensor]:
+        """返回层的重要性矩阵；未存储层返回 None。"""
+        return self._importance_matrices.get(layer_id)
+
+    def enforce_global_budget(self, budget_bytes: int, sink_tokens: int = 0) -> int:
+        """跨层全局驱逐（AR003 T005）：按重要性升序驱逐非 sink token-head。
+
+        目标用量为 ``budget_bytes * 0.9``（10% 迟滞）。驱逐通过
+        ``PackedKVCache.evict`` 完成（降档至 int4 并清零），属于罕见路径，
+        允许 O(全量) 重打包。sink 前缀（token_idx < sink_tokens）永不驱逐。
+
+        Returns:
+            实际驱逐的 token-head 条数；无 packed 层或无候选时为 0。
+        """
+        if budget_bytes is None or budget_bytes <= 0:
+            return 0
+        if not self._packed_cache:
+            return 0
+
+        target = int(budget_bytes * 0.9)
+        evicted_total = 0
+        evicted: set = set()
+
+        candidates: List[Tuple[float, int, int, int]] = []
+        for layer_id, matrix in self._importance_matrices.items():
+            if layer_id not in self._packed_cache:
+                continue
+            values = matrix.detach().cpu()
+            seq_len, num_heads = values.shape
+            for token_idx in range(seq_len):
+                if token_idx < sink_tokens:
+                    continue
+                for head_idx in range(num_heads):
+                    candidates.append(
+                        (float(values[token_idx, head_idx]), layer_id, token_idx, head_idx)
+                    )
+        candidates.sort(key=lambda item: item[0])
+
+        idx = 0
+        while self.get_memory_usage() > target and idx < len(candidates):
+            chunk: Dict[int, set] = {}
+            for _, layer_id, token_idx, head_idx in candidates[idx : idx + 64]:
+                if (layer_id, token_idx, head_idx) in evicted:
+                    continue
+                chunk.setdefault(layer_id, set()).add((token_idx, head_idx))
+            idx += 64
+            if not chunk:
+                continue
+            for layer_id, token_heads in chunk.items():
+                packed = self._packed_cache.get(layer_id)
+                if packed is None:
+                    continue
+                packed.evict(token_heads)
+                for token_idx, head_idx in token_heads:
+                    evicted.add((layer_id, token_idx, head_idx))
+                    evicted_total += 1
+
+        if self.get_memory_usage() > target and idx >= len(candidates):
+            import logging
+
+            logging.getLogger("kv_cache_manager").warning(
+                "global budget enforcement reached floor: usage=%s target=%s",
+                self.get_memory_usage(),
+                target,
+            )
+        return evicted_total
+
     def _enforce_budget(self, layer_id: int) -> None:
         """Evict token-heads if the cache exceeds the configured budget."""
         if self.memory_budget_bytes is None or self.memory_budget_bytes <= 0:
@@ -120,10 +207,18 @@ class KVCacheManager:
             return
 
         packed = entry.packed_kv
-        head_dim = packed.head_dim
-        batch_size = packed.batch_size
-        # Rough per-token-head byte estimate (mixed precision average).
-        estimated_entry_bytes = batch_size * head_dim  # ~1 byte/value on average
+        # AR003 T005（KV-P10）：per-precision 字节估算修正——以实际 packed 字节
+        # 均摊到每条 token-head（含 scale），替代旧 batch*head_dim（≈1B/值，
+        # fp32 下低估 8x）
+        seq_len = getattr(packed, "seq_len", 0) or 0
+        num_heads = getattr(packed, "num_heads", 0) or 0
+        total_entries = max(1, seq_len * num_heads)
+        if hasattr(packed, "memory_bytes"):
+            estimated_entry_bytes = max(1, int(packed.memory_bytes()) // total_entries)
+        else:
+            batch_size = getattr(packed, "batch_size", 1) or 1
+            head_dim = getattr(packed, "head_dim", 1) or 1
+            estimated_entry_bytes = batch_size * head_dim
 
         candidates = list(meta.values())
         to_evict = self.eviction_policy.select_for_eviction(
@@ -174,6 +269,7 @@ class KVCacheManager:
         self._total_access = 0
         self._reuse_history.clear()
         self._token_head_meta.clear()
+        self._importance_matrices.clear()
         self._prefetch_buffer.clear()
 
     # ------------------------------------------------------------------

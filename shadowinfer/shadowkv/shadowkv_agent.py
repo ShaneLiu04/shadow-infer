@@ -143,6 +143,7 @@ class ShadowKVAgent(BaseAgent):
         self._decision_cache_step = None
         self._attn_contract_warned = False
         self._irap_state = {}
+        self._eviction_warned = False
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
@@ -163,6 +164,16 @@ class ShadowKVAgent(BaseAgent):
             raise ValueError(f"entropy_weight must be in [0, 1], got {self.entropy_weight}")
         if self.sink_tokens < 0:
             raise ValueError(f"sink_tokens must be >= 0, got {self.sink_tokens}")
+        # AR003 T005：预算准入与全局驱逐阈值
+        self.eviction_pressure_threshold = float(
+            self.config.get("eviction_pressure_threshold", 0.9)
+        )
+        if not 0.0 < self.eviction_pressure_threshold <= 1.0:
+            raise ValueError(
+                "eviction_pressure_threshold must be in (0, 1], "
+                f"got {self.eviction_pressure_threshold}"
+            )
+        self._eviction_warned = False
 
         # Initialize new abstractions.
         self.importance_model = ImportanceModel(
@@ -294,7 +305,10 @@ class ShadowKVAgent(BaseAgent):
                     "reuse_decision": reuse_decision,
                 }
 
-        # AR003 T004：IRAP 状态更新（仅缓存未命中分支；命中路径不重复累积）
+        # AR003 T005：预算准入（pre-pack 降档阶梯，先于压缩）
+        precision_map = self._admit_precision_budget(importance_map, precision_map, kv_current)
+
+        # 记录状态（AR003 T004：EMA 状态在未命中分支更新，命中路径不重复累积）
         prev_state = self._irap_state.get(layer_id)
         new_ema = self._last_irap_ema
         if new_ema is not None:
@@ -332,6 +346,11 @@ class ShadowKVAgent(BaseAgent):
             packed_kv=compressed_kv.get("packed_kv"),
         )
         self.precision_map[layer_id] = precision_map
+
+        # AR003 T005：写入张量级重要性元数据（全局驱逐依据）
+        self.cache_manager.set_importance_matrix(layer_id, importance_map.detach().cpu())
+        # AR003 T005：消费 memory_pressure（超阈跨层驱逐；无预算仅告警一次）
+        self._consume_memory_pressure(memory_pressure)
 
         # 记录 step 统计
         latency_ms = (time.perf_counter() - start_time) * 1000.0
@@ -455,6 +474,125 @@ class ShadowKVAgent(BaseAgent):
         return profile_result
 
     # === 核心算法 ===
+
+    PRECISION_BITS = {"fp32": 32, "fp16": 16, "int8": 8, "int4": 4}
+    DOWNGRADE_LADDER = {"fp32": "fp16", "fp16": "int8", "int8": "int4"}
+
+    def _entry_bytes(self, precision: str, batch: int, head_dim: int) -> float:
+        """单条 token-head 的 k+v 存储字节（含 int8/int4 scale，与 packed 一致）。
+
+        INT4 分组与 ``PackedKVCache.pack`` 默认 group_size=16 对齐
+        （head_dim 不可整除时退化为 head_dim）。
+        """
+        if precision == "int4":
+            group = 16 if head_dim % 16 == 0 else head_dim
+            per_tensor = batch * head_dim / 2.0 + batch * (head_dim // group) * 4
+        elif precision == "int8":
+            per_tensor = batch * head_dim + batch * 4
+        elif precision == "fp32":
+            per_tensor = batch * head_dim * 4
+        else:  # fp16
+            per_tensor = batch * head_dim * 2
+        return per_tensor * 2.0
+
+    def _estimate_precision_bytes(
+        self, precision_map: Dict[int, Dict[int, str]], batch: int, seq_len: int, head_dim: int
+    ) -> int:
+        """按 per-precision bits 口径估算字节（修复 KV-P10 的 8x 低估）。"""
+        total = 0.0
+        for token_map in precision_map.values():
+            for precision in token_map.values():
+                total += self._entry_bytes(precision, batch, head_dim)
+        return int(math.ceil(total))
+
+    def _admit_precision_budget(
+        self,
+        importance_map: torch.Tensor,
+        precision_map: Dict[int, Dict[int, str]],
+        kv_current: Dict[str, torch.Tensor],
+    ) -> Dict[int, Dict[int, str]]:
+        """预算准入（AR003 T005，FR3.4）：pre-pack 降档阶梯。
+
+        非 sink 条目按重要性升序逐级降档（fp32→fp16→int8→int4），直至
+        predicted_bytes ≤ layer_budget（= memory_budget_bytes // num_layers）
+        或全部触底；触底仍超时告警并保留底线档。压缩打包仅执行一次。
+        """
+        budget = self.cache_manager.memory_budget_bytes
+        if not budget or budget <= 0:
+            return precision_map
+
+        layer_budget = max(1, int(budget) // max(1, self.num_layers))
+        k_tensor = kv_current["k"]
+        batch, _, seq_len, head_dim = k_tensor.shape
+        predicted = self._estimate_precision_bytes(precision_map, batch, seq_len, head_dim)
+        if predicted <= layer_budget:
+            return precision_map
+
+        scores = importance_map.detach().cpu()
+        seq = min(scores.shape[0], seq_len)
+        heads = min(scores.shape[1], self.num_heads)
+        candidates = sorted(
+            (
+                (float(scores[token_idx, head_idx]), token_idx, head_idx)
+                for token_idx in range(seq)
+                for head_idx in range(heads)
+                if token_idx >= self.sink_tokens
+            ),
+            key=lambda item: item[0],
+        )
+
+        idx = 0
+        while predicted > layer_budget and idx < len(candidates):
+            _, token_idx, head_idx = candidates[idx]
+            token_map = precision_map.setdefault(token_idx, {})
+            current = token_map.get(head_idx, "fp16")
+            next_precision = self.DOWNGRADE_LADDER.get(current)
+            if next_precision is None:
+                idx += 1
+                continue
+            freed = self._entry_bytes(current, batch, head_dim) - self._entry_bytes(
+                next_precision, batch, head_dim
+            )
+            predicted -= int(freed)
+            token_map[head_idx] = next_precision
+            if next_precision == "int4":
+                idx += 1
+
+        if predicted > layer_budget:
+            self.logger.log_alert(
+                "warning",
+                f"layer budget floor reached: predicted={predicted} "
+                f"layer_budget={layer_budget} (all non-sink at int4)",
+            )
+        return precision_map
+
+    def _consume_memory_pressure(self, memory_pressure: float) -> None:
+        """消费 orchestrator 的 memory_pressure 信号（AR003 T005，FR3.4/KV-P8）。"""
+        try:
+            pressure = float(memory_pressure)
+        except (TypeError, ValueError):
+            pressure = 0.0
+        if pressure != pressure or pressure < 0:  # NaN / 非法负值
+            return
+        if pressure < self.eviction_pressure_threshold:
+            return
+
+        budget = self.cache_manager.memory_budget_bytes
+        if budget and budget > 0:
+            evicted = self.cache_manager.enforce_global_budget(budget, self.sink_tokens)
+            if evicted:
+                self.logger.log_event(
+                    "global_eviction",
+                    f"memory_pressure={pressure:.3f} evicted {evicted} token-heads",
+                    data={"evicted": evicted, "pressure": pressure},
+                )
+        elif not self._eviction_warned:
+            self.logger.log_alert(
+                "warning",
+                "memory_pressure >= threshold but memory_budget_mb is not configured; "
+                "no eviction action taken",
+            )
+            self._eviction_warned = True
 
     def _resolve_attn_contract(self, inputs: Dict[str, Any]) -> bool:
         """解析 attention 输入契约（AR003 T002，FR3.1）。
