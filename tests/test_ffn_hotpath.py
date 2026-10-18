@@ -451,7 +451,7 @@ def test_ut20_sensitivity_threshold_paths():
 
 def test_ut5_ut11_vectorization_speedup():
     torch.manual_seed(0)
-    for channels, dim in ((256, 128),):
+    for channels, dim in ((256, 128), (1024, 256)):
         w = torch.randn(channels, dim)
         imp = torch.linspace(0.0, 1.0, channels)
         from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent as _Agent
