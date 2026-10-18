@@ -51,12 +51,12 @@ class PackedFFNWeight:
         # 调用后缓存稠密权重与精度计划指纹；_do_pack 重建精度计划时失效。
         self._dequant_cache: Optional[torch.Tensor] = None
         self._dequant_cache_fingerprint: Optional[tuple] = None
+        # AR004 FR4.1：精度计划指纹在打包时构建一次，热路径 O(1) 读取。
+        self._plan_fingerprint: tuple = ()
 
     def _precision_plan_fingerprint(self) -> tuple:
-        """当前精度计划指纹：(channel_idx, precision) 有序元组。"""
-        return tuple(
-            (channel_idx, data["precision"]) for channel_idx, data in sorted(self._data.items())
-        )
+        """当前精度计划指纹：(channel_idx, precision) 有序元组（O(1) 读取缓存）。"""
+        return self._plan_fingerprint
 
     @classmethod
     def pack(
@@ -95,11 +95,13 @@ class PackedFFNWeight:
         self._dequant_cache_fingerprint = None
         total_bytes = 0
         channels = weight.shape[self.pack_dim]
+        plan = []
 
         for channel_idx in range(channels):
             precision = precision_map.get(channel_idx, "fp16").lower()
             if precision not in self.PRECISION_BITS:
                 precision = "fp16"
+            plan.append((channel_idx, precision))
 
             # Extract the channel slice and flatten it.
             slice_tensor = weight.select(self.pack_dim, channel_idx)
@@ -148,6 +150,7 @@ class PackedFFNWeight:
                 }
 
         self._memory_bytes = total_bytes
+        self._plan_fingerprint = tuple(plan)
 
     def unpack(self) -> torch.Tensor:
         """Unpack the weight back to a dense FP32 tensor.
@@ -189,7 +192,8 @@ class PackedFFNWeight:
         缓存为空时重算并写回缓存。
         """
         fingerprint = self._precision_plan_fingerprint()
-        if self._dequant_cache is not None and self._dequant_cache_fingerprint == fingerprint:
+        cache_fp = self._dequant_cache_fingerprint
+        if self._dequant_cache is not None and (cache_fp is fingerprint or cache_fp == fingerprint):
             return self._dequant_cache
         dense = self.unpack()
         self._dequant_cache = dense
