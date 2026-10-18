@@ -256,10 +256,12 @@ class ShadowKVAgent(BaseAgent):
             memory_pressure=memory_pressure,
         )
         cached = self._decision_cache.get(cache_key) if fingerprint is not None else None
+        step_delta = None
         if cached is not None and cached.get("fingerprint") == fingerprint:
             importance_map = cached["importance_map"]
             precision_map = cached["precision_map"]
             reuse_decision = cached["reuse_decision"]
+            step_delta = cached.get("importance_drift")
         else:
             # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003/T004 IRAP）
             importance_map = self._compute_importance_matrix(
@@ -303,6 +305,7 @@ class ShadowKVAgent(BaseAgent):
                     "importance_map": importance_map,
                     "precision_map": precision_map,
                     "reuse_decision": reuse_decision,
+                    "importance_drift": self._last_irap_delta,
                 }
 
         # AR003 T005：预算准入（pre-pack 降档阶梯，先于压缩）
@@ -319,6 +322,9 @@ class ShadowKVAgent(BaseAgent):
                 )
             self._irap_state[layer_id] = new_ema
             self._last_irap_ema = None  # 消费后清空，避免命中路径误更新
+            # AR003 T006：ΔA 跨步差分（首步 None）
+            step_delta = self._last_irap_delta
+            self._last_irap_delta = None
 
         # Step 5: 压缩 KV
         compressed_kv = self.compress_kv(
@@ -372,6 +378,8 @@ class ShadowKVAgent(BaseAgent):
                     "drift_score": drift_score,
                     "sensitivity_score": sensitivity_score,
                     "reuse_strategy": reuse_decision["strategy"],
+                    # AR003 T006：ΔA 跨步差分信号
+                    "importance_drift": step_delta,
                 },
             },
         )
@@ -402,6 +410,13 @@ class ShadowKVAgent(BaseAgent):
             "precision_map": precision_map,
             "reuse_decision": reuse_decision,
             "importance_stats": importance_stats,
+            # AR003 T006：ΔA 跨步差分信号（FR3.5；首步 None）
+            "importance_drift": step_delta,
+            "irap_stats": {
+                "delta_a": step_delta,
+                "gamma": self.irap_decay,
+                "seq_k": int(seq_len),
+            },
         }
 
     def on_shutdown(self) -> Optional[ProfileResult]:

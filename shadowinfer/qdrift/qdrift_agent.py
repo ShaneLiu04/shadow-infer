@@ -41,6 +41,10 @@ class QDriftAgent(BaseAgent):
         self.positional_prior_weight: float = min(
             max(float(config.get("positional_prior_weight", 0.3)), 0.0), 1.0
         )
+        # AR003 T006：IRAP ΔA 信号可选融合（默认关闭，AR002 语义逐位不变）
+        self.use_importance_drift: bool = bool(config.get("use_importance_drift", False))
+        self.importance_drift_weight: float = float(config.get("importance_drift_weight", 0.3))
+        self._importance_drift_warned = False
         self.logger: StructuredLogger = StructuredLogger("qdrift", config.get("log_dir", "logs/"))
 
     # ------------------------------------------------------------------
@@ -53,6 +57,11 @@ class QDriftAgent(BaseAgent):
         Args:
             model_config: 模型级配置字典（如层数、hidden_dim 等）。
         """
+        # AR003 T006：importance_drift_weight 校验（[0,1]）
+        if not 0.0 <= self.importance_drift_weight <= 1.0:
+            raise ValueError(
+                "importance_drift_weight must be in [0, 1], " f"got {self.importance_drift_weight}"
+            )
         self.logger.log_event(
             event_type="agent_init",
             message="QDriftAgent initialized.",
@@ -96,6 +105,8 @@ class QDriftAgent(BaseAgent):
         activation_current = inputs.get("activation_current")
         activation_previous = inputs.get("activation_previous")
         profiler_feedback: Optional[Dict] = inputs.get("profiler_feedback")
+        # AR003 T006：IRAP ΔA 信号（orchestrator 一步滞后传入，可选）
+        importance_drift = inputs.get("importance_drift")
 
         # 1. Step Sensitivity Estimation（M3-lite：提供 previous/current 张量时
         #    混入实测扰动响应，缺失时回退纯位置先验，行为与 v3.3.0 一致）
@@ -110,6 +121,7 @@ class QDriftAgent(BaseAgent):
             query_previous=query_previous,
             activation_current=activation_current,
             activation_previous=activation_previous,
+            importance_drift=importance_drift,
         )
 
         # 2. Activation Drift Detection
@@ -119,6 +131,7 @@ class QDriftAgent(BaseAgent):
             activation_current=activation_current,
             activation_previous=activation_previous,
             method=self.drift_method,
+            importance_drift=importance_drift,
         )
 
         # 3. Dispatch Strategy Generation
@@ -343,6 +356,7 @@ class QDriftAgent(BaseAgent):
         activation_current: torch.Tensor,
         activation_previous: torch.Tensor,
         method: str = "relative_l2",
+        importance_drift: Optional[float] = None,
     ) -> float:
         """检测相邻 step 间的激活漂移。
 
@@ -370,6 +384,7 @@ class QDriftAgent(BaseAgent):
             activation_current: 当前 step 的 activation tensor。
             activation_previous: 上一 step 的 activation tensor（可能为 None）。
             method: 漂移检测方法，"relative_l2" | "cosine_similarity" | "kl_divergence"。
+            importance_drift: IRAP ΔA 信号（可选，AR003 T006）。
 
         Returns:
             漂移分数，范围 [0.0, 1.0)。
@@ -380,6 +395,7 @@ class QDriftAgent(BaseAgent):
             activation_current=activation_current,
             activation_previous=activation_previous,
             method=method,
+            importance_drift=importance_drift,
         )
         return float(math.tanh(raw_drift))
 
@@ -390,6 +406,7 @@ class QDriftAgent(BaseAgent):
         activation_current: torch.Tensor,
         activation_previous: torch.Tensor,
         method: str = "relative_l2",
+        importance_drift: Optional[float] = None,
     ) -> float:
         """计算未归一化的原始漂移值（供 detect_drift 与 compute_sensitivity 复用）。
 
@@ -436,6 +453,23 @@ class QDriftAgent(BaseAgent):
 
         # 综合原始漂移值（未 clamp，由调用方决定归一化方式）
         raw_drift = 0.6 * query_drift + 0.4 * activation_drift
+
+        # AR003 T006：IRAP ΔA 可选融合（默认关闭；非法值忽略并告警一次）
+        if importance_drift is not None and self.use_importance_drift:
+            valid_value: Optional[float]
+            try:
+                valid_value = float(importance_drift)
+            except (TypeError, ValueError):
+                valid_value = None
+            if valid_value is not None and math.isfinite(valid_value) and valid_value >= 0.0:
+                weight = self.importance_drift_weight
+                raw_drift = (1.0 - weight) * raw_drift + weight * valid_value
+            elif not self._importance_drift_warned:
+                self.logger.log_alert(
+                    "warning",
+                    f"invalid importance_drift ignored: {importance_drift!r}",
+                )
+                self._importance_drift_warned = True
         return float(max(0.0, raw_drift))
 
     # ------------------------------------------------------------------
@@ -454,6 +488,7 @@ class QDriftAgent(BaseAgent):
         query_previous: Optional[torch.Tensor] = None,
         activation_current: Optional[torch.Tensor] = None,
         activation_previous: Optional[torch.Tensor] = None,
+        importance_drift: Optional[float] = None,
     ) -> float:
         """计算混合敏感度：位置先验与实测扰动响应的凸组合。
 
@@ -517,6 +552,7 @@ class QDriftAgent(BaseAgent):
             activation_current=activation_current,
             activation_previous=activation_previous,
             method=self.drift_method,
+            importance_drift=importance_drift,
         )
         measured_response = math.tanh(raw_drift)
 

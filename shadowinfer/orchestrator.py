@@ -122,6 +122,8 @@ class Orchestrator:
             "memory_mb": 0.0,
             "accuracy_drop": 0.0,
         }
+        # AR003 T006：上一步 ShadowKV 聚合 ΔA（一步滞后喂 QDrift）
+        self._last_importance_drift: Optional[float] = None
         self.policy: PolicyEngine = self._load_policy()
         self.safety_net: Optional[ProductionSafetyNet] = None
         self.early_stopper: Optional[UncertaintyEarlyStopper] = None
@@ -1178,6 +1180,9 @@ class Orchestrator:
             inputs["kv_previous"] = None
         state.kv_result = self._run_shadowkv(step_config, inputs, sensitivity_score, drift_score)
 
+        # AR003 T006：缓存本步聚合 ΔA，供下一步 _run_qdrift 消费（一步滞后）
+        self._last_importance_drift = state.kv_result.get("importance_drift")
+
         # Step 4: FFN Optimizer Agent 执行（逐层）
         state.ffn_result = self._run_ffn(step_config, inputs, sensitivity_score)
 
@@ -1305,6 +1310,8 @@ class Orchestrator:
             "activation_current": inputs["activation_current"],
             "activation_previous": inputs.get("activation_previous"),
             "profiler_feedback": None,
+            # AR003 T006：上一步 ShadowKV 的 ΔA（step 0 为 None）
+            "importance_drift": getattr(self, "_last_importance_drift", None),
         }
         qdrift_dummy_step = StepConfig(
             step_id=step_id,
@@ -1376,6 +1383,7 @@ class Orchestrator:
             "reuse_decision": {},
             "memory_mb": 0.0,
             "per_layer_memory": {},
+            "importance_drift": None,
         }
         for lid, kv_res in enumerate(all_kv_results):
             aggregated_kv["precision_map"][lid] = kv_res.get("precision_map", {})
@@ -1383,6 +1391,15 @@ class Orchestrator:
             mem_mb = kv_res.get("compressed_kv", {}).get("memory_mb", 0.0)
             aggregated_kv["per_layer_memory"][lid] = mem_mb
             aggregated_kv["memory_mb"] += mem_mb
+
+        # AR003 T006：ΔA 跨层聚合（各层 delta_a 均值；全 None 时保持 None）
+        layer_deltas = [
+            kv_res.get("importance_drift")
+            for kv_res in all_kv_results
+            if kv_res.get("importance_drift") is not None
+        ]
+        if layer_deltas:
+            aggregated_kv["importance_drift"] = float(sum(layer_deltas) / len(layer_deltas))
 
         # Optional: prefetch KV cache for the next step based on Q-drift.
         if self.shadowkv.prefetch_enabled and not self._is_real_backend():

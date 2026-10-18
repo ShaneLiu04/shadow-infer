@@ -1002,8 +1002,7 @@ def _assert_state_close(actual, expected, context=""):
     actual_cpu = actual.detach().cpu().double()
     expected_cpu = expected.detach().cpu().double()
     assert actual_cpu.shape == expected_cpu.shape, (
-        f"{context} EMA 状态形状 {tuple(actual_cpu.shape)} "
-        f"应为 {tuple(expected_cpu.shape)}"
+        f"{context} EMA 状态形状 {tuple(actual_cpu.shape)} " f"应为 {tuple(expected_cpu.shape)}"
     )
     diff = (actual_cpu - expected_cpu).abs().max().item()
     assert diff <= IRAP_TOL, f"{context} EMA 状态差异 {diff:.3e} 应 <= {IRAP_TOL}"
@@ -1015,9 +1014,7 @@ class TestIRAPStateEMA:
     def test_ut6_no_unbounded_importance_history(self, mock_config):
         """无界 importance_history 属性必须不存在（常数内存历史，KV-P9）。"""
         agent = _make_agent(mock_config, attn_is_probabilities=True)
-        assert not hasattr(agent, "importance_history"), (
-            "ShadowKVAgent 不应再持有无界 importance_history"
-        )
+        assert not hasattr(agent, "importance_history"), "ShadowKVAgent 不应再持有无界 importance_history"
         assert isinstance(agent._irap_state, dict), "_irap_state 应为 per-layer 状态字典"
 
     def test_ut6_first_step_cold_start_equals_received(self, mock_config):
@@ -1034,9 +1031,7 @@ class TestIRAPStateEMA:
     def test_ut6_incremental_ema_matches_full_recompute(self, mock_config):
         """3 步增量 EMA == 全量重算 Σ 等效定义（首步特例，容差 1e-6）。"""
         gamma = 0.9
-        agent = _make_agent(
-            mock_config, attn_is_probabilities=True, irap_decay=gamma
-        )
+        agent = _make_agent(mock_config, attn_is_probabilities=True, irap_decay=gamma)
 
         probs_list = []
         for step_id in range(3):
@@ -1082,13 +1077,11 @@ class TestIRAPConstantMemory:
                 first_bytes = state.element_size() * first_numel
 
         final = agent._irap_state[LAYER_ID]
-        assert tuple(final.shape) == first_shape, (
-            f"200 步后状态形状 {tuple(final.shape)} 应与首步 {first_shape} 相同"
-        )
+        assert (
+            tuple(final.shape) == first_shape
+        ), f"200 步后状态形状 {tuple(final.shape)} 应与首步 {first_shape} 相同"
         assert final.numel() == first_numel, "200 步后状态元素数不应增长"
-        assert final.element_size() * final.numel() == first_bytes, (
-            "200 步后状态字节数不应增长（O(1) 常数内存）"
-        )
+        assert final.element_size() * final.numel() == first_bytes, "200 步后状态字节数不应增长（O(1) 常数内存）"
         assert set(agent._irap_state.keys()) == {LAYER_ID}, "状态字典键数不应随步数增长"
 
 
@@ -1097,9 +1090,7 @@ class TestIRAPShapeGrowth:
 
     def test_ut8_seq_growth_zero_pads_new_tokens(self, mock_config):
         gamma = 0.9
-        agent = _make_agent(
-            mock_config, attn_is_probabilities=True, irap_decay=gamma
-        )
+        agent = _make_agent(mock_config, attn_is_probabilities=True, irap_decay=gamma)
 
         old_probs = _make_light_attention(seq=16, seed=SEED + 600)
         agent.on_step(
@@ -1129,9 +1120,7 @@ class TestIRAPShapeGrowth:
 
     def test_ut8_seq_shrink_truncates_with_warning(self, mock_config, monkeypatch):
         gamma = 0.9
-        agent = _make_agent(
-            mock_config, attn_is_probabilities=True, irap_decay=gamma
-        )
+        agent = _make_agent(mock_config, attn_is_probabilities=True, irap_decay=gamma)
 
         alerts = []
         monkeypatch.setattr(
@@ -1164,9 +1153,9 @@ class TestIRAPShapeGrowth:
         warnings = [a for a in alerts if a[0] == "warning"]
         assert warnings, "seq 收缩应至少产生一条 warning 告警"
         combined = " ".join(str(msg).lower() for _, msg in warnings)
-        assert any(key in combined for key in ("seq", "truncat", "shrink", "shape")), (
-            f"收缩告警应说明形状/截断语义，实际 {combined!r}"
-        )
+        assert any(
+            key in combined for key in ("seq", "truncat", "shrink", "shape")
+        ), f"收缩告警应说明形状/截断语义，实际 {combined!r}"
 
 
 class TestIRAPValidation:
@@ -1261,8 +1250,8 @@ class TestIRAPDecisionCacheEMA:
         assert calls["count"] == 1, "同 (step,layer) 同输入二次调用应命中决策缓存"
         state_after_second = agent._irap_state[LAYER_ID].detach().cpu()
 
-        assert torch.equal(state_after_second, state_after_first.detach().cpu()), (
-            "缓存命中不得重复累积 EMA（状态数值应逐位不变）"
-        )
+        assert torch.equal(
+            state_after_second, state_after_first.detach().cpu()
+        ), "缓存命中不得重复累积 EMA（状态数值应逐位不变）"
         assert second["precision_map"] == first["precision_map"]
         assert second["importance_stats"] == pytest.approx(first["importance_stats"])
