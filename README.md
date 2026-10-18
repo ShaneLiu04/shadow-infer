@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.5.0 | 704 passed / 1 skipped | 82.04% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.6.0 | 719 passed / 1 skipped | 82.25% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -60,6 +60,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **Q-drift 步感知调度** | 敏感度由位置先验与实测扰动响应凸组合（默认权重 0.3 / 0.7），结合激活漂移动态选择 ShadowKV / FFN 工作模式；扰动响应与真实扰动幅度的 Spearman 秩相关 >= 0.9。 |
 | **决策记忆化** | 同 (step, layer) 同输入的决策缓存（输入指纹校验、step 边界失效、异常旁路）与 FFN 反量化结果缓存，重复调用决策耗时下降 >= 90%。 |
 | **真实性能记账** | latency.e2e_ms / per_step_ms 真实测量（内部计时与外部墙钟对照偏差 0.02%），KV memory 按真实节省字节记账。 |
+| **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，实测 151µs → 0.3µs）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/changes/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
 | **Agent 插件系统** | 通过 `shadowinfer.agents` entry-point 注册第三方 Agent，Orchestrator 自动调度并收集输出。 |
@@ -103,7 +104,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`630 passed, 1 skipped`，测试覆盖率 `81.68%`（pytest-cov，fail-under 75）。
+当前主分支：`719 passed, 1 skipped`，测试覆盖率 `82.25%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -683,6 +684,24 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.6.0，2026-10-18，Windows / CPU fallback）
+
+同会话同批对照（`specs/changes/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次独立 agent，warmup 后 12 calls/次）：
+
+| 指标 | 优化前（中位） | 优化后（中位） | 比值/说明 |
+|------|----------------|----------------|-----------|
+| `ffn.on_step`（1024 ch / 4 层 / 12 calls） | 1.95 ms | 0.71 ms | 0.36x（同批复跑区间 0.61-0.74 ms） |
+| `_precision_plan_fingerprint` | 151.4 µs/调用 | 0.3 µs/调用 | O(1) 缓存命中 |
+| `dequantize_for_matmul`（缓存命中） | 219.2 µs/调用 | 0.4 µs/调用 | 指纹与 dense 缓存命中 |
+| unpack 向量化 vs 逐 channel 参考 | 82.29 ms | 3.91 ms | 0.047x（1024 ch） |
+| 混合精度量化向量化 vs 参考 | 189.09 ms | 9.43 ms | 0.050x（1024 ch，非 packed） |
+| 掩码缺陷（packed + channel_mask） | RuntimeError | `mixed_full` 正常 | golden vs full <= 1e-6 |
+| 逐层状态（层 1 复用层 0 权重） | max\|Δ\|=0.5771 | max\|Δ\|=0.0 | 两层输出各自等于直接计算 |
+
+**质量与测试**：719 passed / 1 skipped；覆盖率 82.25%；black / isort / flake8 / mypy 全绿。
+精度口径：向量化实现 vs 保留的参考实现容差 <= 1e-6（unpack、量化、掩码路径均覆盖）。
+上述为 CPU 微基准，7B 级端到端收益待 GPU 服务器按下方协议复现，README 不预设优越性数字。
+
 ### 实测数据（v3.5.0，2026-10-18，Windows / CPU fallback）
 
 **质量与测试**
@@ -755,6 +774,20 @@ python -m shadowinfer profiler --model <MODEL> --backend pytorch --device cuda \
 - 延迟与显存收益：3 次中位，报告区间；
 - 精度影响：与基线差异的置信区间（>=3 种子）；
 - 任何「优于 baseline」的结论必须有上述数据落档后才可写入 README。
+
+### FFN 热路径复现协议（服务器）
+
+目的：在 GPU 服务器上确认 v3.6.0 FFN 优化在真实维度下的冷启动与稳态收益，并复核多层状态隔离。
+
+| 项 | 配置 |
+|----|------|
+| 规模点 | intermediate_dim / hidden_dim：256/256、1024/256、11008/4096（7B 级） |
+| 路径 | `ffn_mode=mixed`，`use_packed_weights=True`，通道剪枝开/关各一组 |
+| 层数 | 4 层不同权重（必须不同，用于 FFN-P1 回归） |
+| 重复 | 同会话同批，优化路径 vs 参考路径（`_unpack_reference` / `_quantize_mixed_precision_reference`）各 3 次，报告中位与区间 |
+| 硬门禁 | 指纹 <= 10 µs；向量化 <= 参考 50%；golden max|Δ| <= 1e-6；层 2 输出 == 直接计算 |
+| 命令 | `python specs/changes/AR004-ffn-hotpath/ar004_bench.py`（可按 `HID/INT/LAYERS` 修改规模） |
+| 落档 | 原始输出与配置写入 `specs/changes/AR004-ffn-hotpath/`，结论回写 README 性能基准 |
 
 ### 实测数据（v3.4.0，2026-10-17，Windows / CPU fallback）
 
@@ -952,6 +985,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.6.0（2026-10）
+
+- **FFN 热路径优化**：精度计划指纹 pack 时缓存（O(1)）、quantization_info 按层缓存一次、unpack/混合精度量化分组向量化（参考实现保留 golden）。
+- **逐层状态隔离（FFN-P1 修复）**：权重、量化态、重要性、掩码、统计按 layer_id 隔离；on_init 清空并重置累计；超层告警去重。
+- **掩码正确性修复**：`_mixed_compute` down 投影响应列掩码；全 False 掩码输出零并告警一次（mixed/full 双路径）。
+- **实测（CPU，同批 3 次中位）**：on_step 1.95 ms → 0.71 ms；指纹 151.4 µs → 0.3 µs；unpack/量化约 20x；719 passed，覆盖率 82.25%。
+- **复现资产**：`specs/changes/AR004-ffn-hotpath/`（srs/design/tasks/baseline-profile/bench 脚本）与 README 服务器复现协议。
 
 ### v3.5.0（2026-10）
 

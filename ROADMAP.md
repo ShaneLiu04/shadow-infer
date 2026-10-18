@@ -59,10 +59,13 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       19.9x on the 6-step CPU benchmark); optimized-vs-baseline ratio improved from
       7.29x to 1.61x. Element-wise reference implementations retained as golden
       tests and exception fallbacks.
-- [ ] **FFN dequantization/unpack vectorization**: the packed-weight unpack path is
-      still an element-wise Python hot path (~57% of the optimized-path profile in
-      the v3.4.0 CPU benchmark); the residual end-to-end gap to the 1.5x target.
-      Planned AR004 (with FFN-P1 layer-shared cache fix and FFN-P3 per-channel loop).
+- [x] **FFN hot path + per-layer state** (v3.6.0, AR004): precision-plan
+      fingerprint cached at pack time (O(1)), per-layer quantization statistics,
+      vectorized unpack / mixed-precision quantization (reference implementations
+      kept as golden), per-layer state isolation (FFN-P1), and down-projection
+      column-mask fix. CPU same-batch microbench: on_step 1.95 ms -> 0.71 ms;
+      fingerprint 151.4 us -> 0.3 us; unpack/quantize ~20x. 7B end-to-end benefit
+      pending the server protocol in `specs/changes/AR004-ffn-hotpath/`.
 - [x] **Decision-signal correctness + IRAP** (v3.5.0, AR003): explicit attention
       contract (single normalization, KV-P2), received-attention importance axis
       with sink protection (KV-P3), cross-step EMA with constant memory (KV-P9),

@@ -153,11 +153,60 @@ class PackedFFNWeight:
         self._plan_fingerprint = tuple(plan)
 
     def unpack(self) -> torch.Tensor:
-        """Unpack the weight back to a dense FP32 tensor.
+        """Unpack the weight back to a dense FP32 tensor (vectorized).
 
-        Returns:
-            Dense FP32 tensor with the original ``self.shape``.
+        Channels are grouped by precision and dequantized in batched form,
+        then scattered back into the dense tensor. ``_unpack_reference`` keeps
+        the original per-channel implementation as a golden reference.
         """
+        out = torch.zeros(self.shape, dtype=torch.float32, device=self.device)
+        if not self._data:
+            return out
+
+        groups: Dict[str, list] = {}
+        for channel_idx, data in self._data.items():
+            groups.setdefault(data["precision"], []).append(channel_idx)
+
+        for precision, channels in groups.items():
+            indices = torch.tensor(channels, dtype=torch.long, device=self.device)
+            if precision in ("fp32", "fp16"):
+                block = torch.stack([self._data[ch]["tensor"] for ch in channels]).float()
+            elif precision == "int8":
+                q = torch.stack([self._data[ch]["q"] for ch in channels])
+                scale = torch.stack([self._data[ch]["scale"] for ch in channels])
+                block = Quantizer.dequantize_int8(q, scale)
+            elif precision == "int4":
+                block = self._dequantize_int4_batch(channels)
+            else:
+                block = torch.stack([self._data[ch]["tensor"] for ch in channels]).float()
+
+            if self.pack_dim == 0:
+                out[indices] = block
+            else:
+                out[:, indices] = block.transpose(0, 1)
+        return out
+
+    def _dequantize_int4_batch(self, channels: list) -> torch.Tensor:
+        """Batched INT4 dequantization for channels sharing grouping layout."""
+        sample = self._data[channels[0]]
+        num_groups = sample["num_groups"]
+        group_size = sample["group_size"]
+        channel_len = num_groups * group_size
+
+        packed = torch.stack([self._data[ch]["packed"] for ch in channels])
+        high = (packed >> 4) & 0x0F
+        low = packed & 0x0F
+        interleaved = torch.stack([high, low], dim=-1).reshape(packed.shape[0], -1)
+        int8_tensor = (interleaved.to(torch.int16) - 8).to(torch.int8)
+        quantized = int8_tensor[:, :channel_len].reshape(-1, num_groups, group_size)
+
+        scales = [self._data[ch]["scale"].reshape(num_groups, 1) for ch in channels]
+        scale = torch.stack(scales)
+        dequantized = quantized.float() * scale
+        return dequantized.reshape(len(channels), channel_len)
+
+    def _unpack_reference(self) -> torch.Tensor:
+        """Golden per-channel unpack (pre-AR004 implementation)."""
         out = torch.zeros(self.shape, dtype=torch.float32, device=self.device)
 
         for channel_idx, data in self._data.items():

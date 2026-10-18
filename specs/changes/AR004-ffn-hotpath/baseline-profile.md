@@ -64,3 +64,18 @@ python specs/changes/AR004-ffn-hotpath/ar004_bench.py
 | fingerprint | 145.4~194.6 µs | ≤ 10 µs（同机同批） |
 | 统计开销 | cProfile 20% of on_step | 迭代次数 0 + 计时 ≤20µs |
 | 向量化 unpack/量化 | 参考实现 1x | ≤ 50%（同批 3 次中位） |
+
+## 6. T007 优化后对照（2026-10-18，同会话同批）
+
+| 指标 | 优化前（中位） | 优化后（中位） | 比值 | 证据 |
+|------|----------------|----------------|------|------|
+| `per_on_step_ms`（1024 ch/4 层/12 calls） | 1.95 ms | 0.71 ms | 0.36x | ar004_bench.py 复跑 [0.61, 0.71, 0.74] |
+| `_precision_plan_fingerprint` | 151.4 µs | 0.3 µs | 0.002x | 同上 |
+| `dequantize_for_matmul`（缓存命中） | 219.2 µs | 0.4 µs | 0.002x | 同上 |
+| unpack（1024 ch，vec vs reference） | 82.29 ms | 3.91 ms | 0.047x | 3 次均值，`_unpack_reference` 对照 |
+| quantize（1024 ch，vec vs reference） | 189.09 ms | 9.43 ms | 0.050x | `use_packed_weights=False`，3 次均值 |
+| 掩码缺陷 | RuntimeError | `mixed_full` 正常 | — | 缺陷复现段转通过 |
+| 层状态隔离 | max\|Δ\|=0.5771 | max\|Δ\|=0.0 | — | 层 2 输出等于直接计算 |
+
+测试与覆盖率：`719 passed, 1 skipped`，82.25%（当次 pytest --cov）。
+说明：CPU 微基准；unpack/quantize 之比为同进程参考实现对照，不含 profiler 开销。

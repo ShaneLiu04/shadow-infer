@@ -79,3 +79,223 @@ def test_ut2_repack_invalidates_cache():
 def test_ut13b_empty_unpack_all_zeros():
     empty = PackedFFNWeight((8, 16))
     assert torch.count_nonzero(empty.unpack()) == 0
+
+
+def _agent(**overrides):
+    from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent
+
+    cfg = {
+        "hidden_dim": 32,
+        "intermediate_dim": 64,
+        "channel_pruning_enabled": False,
+        "channel_pruning_ratio": 0.0,
+        "use_packed_weights": True,
+    }
+    cfg.update(overrides)
+    return FFNOptimizerAgent(cfg)
+
+
+def _step(agent, x, up, down, layer_id=0, sensitivity=0.9, mode="full"):
+    from shadowinfer.core.structs import StepConfig
+
+    return agent.on_step(
+        StepConfig(
+            step_id=0,
+            total_steps=1,
+            noise_level=0.5,
+            shadowkv_mode="balanced",
+            ffn_mode=mode,
+        ),
+        {
+            "ffn_input_current": x,
+            "weights": {"up": up, "down": down},
+            "layer_id": layer_id,
+            "qdrift_signal": {"sensitivity_score": sensitivity, "ffn_mode": mode},
+        },
+    )
+
+
+def test_ut6_layer_isolation_full_path():
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 32)
+    up1, down1 = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    up2, down2 = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+
+    out1 = _step(agent, x, up1, down1, layer_id=0)["output"]
+    out2 = _step(agent, x, up2, down2, layer_id=1)["output"]
+    out1_again = _step(agent, x, up1, down1, layer_id=0)["output"]
+
+    def direct(up, down):
+        return torch.nn.functional.linear(
+            torch.nn.functional.gelu(torch.nn.functional.linear(x, up)), down
+        )
+
+    assert torch.allclose(out1, direct(up1, down1), atol=1e-6)
+    assert torch.allclose(out2, direct(up2, down2), atol=1e-6)
+    assert torch.equal(out1, out1_again)
+
+
+def test_ut6b_lifecycle_and_overflow_warning():
+    agent = _agent(num_layers=2)
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    _step(agent, x, up, down, layer_id=0)
+    assert 0 in agent._layer_states
+
+    for _ in range(3):
+        _step(agent, x, up, down, layer_id=99)
+    overflow_keys = [k for k in agent._warned if k == (99, "layer_overflow")]
+    assert len(overflow_keys) == 1
+
+    try:
+        _step(agent, x, up, down, layer_id=-1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("negative layer_id must raise ValueError")
+
+    agent.on_init({"num_layers": 2})
+    assert agent._layer_states == {}
+    assert agent._warned == set()
+
+
+def test_ut16_static_pruning_uses_per_layer_importance():
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent(channel_pruning_enabled=True, channel_pruning_ratio=0.5)
+
+    imp1 = torch.zeros(64)
+    imp1[:64] = torch.linspace(1.0, 0.0, 64)
+    imp2 = torch.zeros(64)
+    imp2[:64] = torch.linspace(0.0, 1.0, 64)
+
+    agent._layer_state(0).channel_importance = imp1
+    agent._layer_state(1).channel_importance = imp2
+
+    _step(agent, x, up, down, layer_id=0, sensitivity=0.5, mode="mixed")
+    mask0 = agent._layer_state(0).channel_mask.clone()
+    _step(agent, x, up, down, layer_id=1, sensitivity=0.5, mode="mixed")
+    mask1 = agent._layer_state(1).channel_mask.clone()
+
+    k = 32
+    assert set(torch.topk(imp1, k).indices.tolist()) == set(mask0.nonzero().flatten().tolist())
+    assert set(torch.topk(imp2, k).indices.tolist()) == set(mask1.nonzero().flatten().tolist())
+    assert agent._layer_state(1).channel_importance is imp2
+
+
+def test_ut8_mixed_mask_golden():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    mask = torch.zeros(64, dtype=torch.bool)
+    mask[torch.randperm(64)[:48]] = True
+
+    packed_up = PackedFFNWeight.pack(up, {i: "fp16" for i in range(64)})
+    packed_down = PackedFFNWeight.pack(down, {i: "fp16" for i in range(32)}, pack_dim=1)
+    mixed = agent._mixed_compute(x, packed_up, packed_down, mask)
+    dense_up = packed_up.unpack()
+    dense_down = packed_down.unpack()
+    expected = agent._full_compute(x, dense_up, dense_down, mask)
+    assert mixed.shape == (2, 4, 32)
+    assert torch.allclose(mixed, expected, atol=1e-6)
+
+
+def test_ut9_all_false_mask_zero_with_single_warning():
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    mask = torch.zeros(64, dtype=torch.bool)
+
+    out = agent._mixed_compute(x, up, down, mask, warning_key=(0, "all_false_mask"))
+    out2 = agent._mixed_compute(x, up, down, mask, warning_key=(0, "all_false_mask"))
+    assert torch.count_nonzero(out) == 0 and out.shape == (1, 4, 32)
+    assert torch.count_nonzero(out2) == 0
+    assert sum(1 for k in agent._warned if k == (0, "all_false_mask")) == 1
+
+
+def test_ut21_full_all_false_mask():
+    x = torch.randn(1, 4, 32)
+    up, down = torch.randn(64, 32) * 0.05, torch.randn(32, 64) * 0.05
+    agent = _agent()
+    mask = torch.zeros(64, dtype=torch.bool)
+
+    out = agent._full_compute(x, up, down, mask, warning_key=(2, "all_false_mask"))
+    agent._full_compute(x, up, down, mask, warning_key=(2, "all_false_mask"))
+    assert torch.count_nonzero(out) == 0
+    assert sum(1 for k in agent._warned if k == (2, "all_false_mask")) == 1
+
+
+def test_ut13a_invalid_mask_dim():
+    agent = _agent()
+    x = torch.randn(1, 4, 32)
+    up = torch.randn(64, 32)
+    try:
+        agent._linear_forward(x, up, mask_dim=2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mask_dim=2 must raise ValueError")
+
+
+def _mixed_map(n=64):
+    mapping = {}
+    for i in range(n):
+        mapping[i] = "fp16" if i % 5 == 0 else ("int8" if i % 5 in (1, 2) else "int4")
+    return mapping
+
+
+def test_ut4_unpack_golden_vec_vs_reference():
+    torch.manual_seed(0)
+    for pack_dim, shape in ((0, (64, 48)), (1, (32, 64))):
+        w = torch.randn(*shape)
+        packed = PackedFFNWeight.pack(
+            w, _mixed_map(shape[pack_dim]), pack_dim=pack_dim, group_size=16
+        )
+        assert torch.allclose(packed.unpack(), packed._unpack_reference(), atol=1e-6), pack_dim
+
+
+def test_ut4_int4_non_divisible_group():
+    torch.manual_seed(0)
+    w = torch.randn(16, 30)
+    packed = PackedFFNWeight.pack(w, {i: "int4" for i in range(16)}, group_size=16)
+    assert packed._data[0]["group_size"] == 30
+    assert torch.allclose(packed.unpack(), packed._unpack_reference(), atol=1e-6)
+
+
+def test_ut10_quantize_golden_vec_vs_reference():
+    from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent
+
+    torch.manual_seed(0)
+    up = torch.randn(64, 32)
+    down = torch.randn(32, 64)
+    imp = torch.linspace(0.0, 1.0, 64)
+    agent = FFNOptimizerAgent(
+        {"use_packed_weights": False, "hidden_dim": 32, "intermediate_dim": 64}
+    )
+
+    q_up, q_down, scales = agent.quantize_mixed_precision(up, down, imp)
+    r_up, r_down, r_scales = agent._quantize_mixed_precision_reference(up, down, imp)
+
+    assert torch.allclose(q_up, r_up, atol=1e-6)
+    assert torch.allclose(q_down, r_down, atol=1e-6)
+    assert scales == r_scales
+
+
+def test_ut10_zero_channel_preserved():
+    from shadowinfer.ffn_optimizer.ffn_optimizer_agent import FFNOptimizerAgent
+
+    up = torch.randn(8, 16)
+    down = torch.randn(16, 8)
+    up[3] = 0.0
+    down[:, 3] = 0.0
+    imp = torch.tensor([0.1] * 8)
+    agent = FFNOptimizerAgent(
+        {"use_packed_weights": False, "hidden_dim": 16, "intermediate_dim": 8}
+    )
+    q_up, q_down, scales = agent.quantize_mixed_precision(up, down, imp)
+    assert torch.count_nonzero(q_up[3]) == 0
+    assert torch.count_nonzero(q_down[:, 3]) == 0
+    assert scales[3] == ("int4", (0.0, 0.0))

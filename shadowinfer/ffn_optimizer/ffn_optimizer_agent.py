@@ -9,6 +9,7 @@ from __future__ import annotations
 __version__ = "3.0"
 
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -22,6 +23,21 @@ from shadowinfer.utils.logging_utils import StructuredLogger
 from shadowinfer.utils.metrics import Metrics
 
 
+@dataclass
+class _LayerState:
+    """Per-layer FFN state (AR004 FR4.4): weights, quantization and stats."""
+
+    weight_up: Optional[torch.Tensor] = None
+    weight_down: Optional[torch.Tensor] = None
+    channel_importance: Optional[torch.Tensor] = None
+    channel_mask: Optional[torch.Tensor] = None
+    active_channels: int = 0
+    weight_up_quantized: Optional[Any] = None
+    weight_down_quantized: Optional[Any] = None
+    precision_scales: Dict[int, Any] = field(default_factory=dict)
+    quantization_stats: Dict[str, Any] = field(default_factory=dict)
+
+
 class FFNOptimizerAgent(BaseAgent):
     """FFN Optimizer Agent — FFN 层计算优化专家。
 
@@ -31,10 +47,10 @@ class FFNOptimizerAgent(BaseAgent):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config, name="ffn_optimizer")
-        self.weight_up_quantized = None  # 量化后的 up 权重
-        self.weight_down_quantized = None  # 量化后的 down 权重
-        self.channel_importance = None  # 通道重要性
-        self.precision_scales = {}  # 量化 scale
+        self._layer_states: Dict[int, _LayerState] = {}
+        self._warned: set = set()
+        num_layers = config.get("num_layers")
+        self._num_layers: int = int(num_layers) if num_layers is not None else 0
         self.logger = StructuredLogger("ffn_optimizer", config.get("log_dir", "logs/"))
 
         # Packing configuration
@@ -46,7 +62,6 @@ class FFNOptimizerAgent(BaseAgent):
         self.channel_pruning_ratio: float = config.get("channel_pruning_ratio", 0.0)
         self.channel_pruning_dynamic: bool = config.get("channel_pruning_dynamic", False)
         self.channel_pruning_method: str = config.get("channel_pruning_method", "static_importance")
-        self._channel_mask: Optional[torch.Tensor] = None
         self._active_channels: int = 0
 
         # Cumulative compute statistics
@@ -61,11 +76,74 @@ class FFNOptimizerAgent(BaseAgent):
         self._total_memory_bytes_original: float = 0.0
         self._total_memory_bytes_packed: float = 0.0
 
-        # Cached weights (PyTorch standard: [out_features, in_features])
-        self._weight_up: Optional[torch.Tensor] = None
-        self._weight_down: Optional[torch.Tensor] = None
+        # Cached weights are stored per layer in ``_layer_states`` (AR004).
         self._model_name: str = config.get("model_name", "unknown")
         self._run_id: str = config.get("run_id", "default")
+
+    # ------------------------------------------------------------------
+    # 逐层状态（AR004 FR4.4）
+    # ------------------------------------------------------------------
+
+    def _layer_state(self, layer_id: int) -> _LayerState:
+        """Return (creating if needed) the state for ``layer_id``."""
+        if not isinstance(layer_id, int) or isinstance(layer_id, bool):
+            raise ValueError(f"layer_id must be int, got {type(layer_id).__name__}.")
+        if layer_id < 0:
+            raise ValueError(f"layer_id must be >= 0, got {layer_id}.")
+        limit = max(1, self._num_layers)
+        if layer_id >= limit or len(self._layer_states) > limit:
+            key = (layer_id, "layer_overflow")
+            if key not in self._warned:
+                self._warned.add(key)
+                self.logger.log_alert(
+                    "warning",
+                    f"Layer id {layer_id} exceeds configured num_layers={limit}.",
+                    recommendation="Check model_config['num_layers'].",
+                )
+        state = self._layer_states.get(layer_id)
+        if state is None:
+            state = _LayerState()
+            self._layer_states[layer_id] = state
+        return state
+
+    def _warn_once(self, key: Tuple[int, str], message: str) -> None:
+        """Emit a warning at most once per (layer_id, kind) key."""
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        self.logger.log_alert("warning", message)
+
+    @property
+    def channel_importance(self) -> Optional[torch.Tensor]:
+        return self._layer_state(0).channel_importance
+
+    @channel_importance.setter
+    def channel_importance(self, value: Optional[torch.Tensor]) -> None:
+        self._layer_state(0).channel_importance = value
+
+    @property
+    def weight_up_quantized(self) -> Optional[Any]:
+        return self._layer_state(0).weight_up_quantized
+
+    @weight_up_quantized.setter
+    def weight_up_quantized(self, value: Optional[Any]) -> None:
+        self._layer_state(0).weight_up_quantized = value
+
+    @property
+    def weight_down_quantized(self) -> Optional[Any]:
+        return self._layer_state(0).weight_down_quantized
+
+    @weight_down_quantized.setter
+    def weight_down_quantized(self, value: Optional[Any]) -> None:
+        self._layer_state(0).weight_down_quantized = value
+
+    @property
+    def precision_scales(self) -> Dict[int, Any]:
+        return self._layer_state(0).precision_scales
+
+    @precision_scales.setter
+    def precision_scales(self, value: Dict[int, Any]) -> None:
+        self._layer_state(0).precision_scales = value
 
     # ------------------------------------------------------------------
     # 生命周期接口
@@ -82,13 +160,23 @@ class FFNOptimizerAgent(BaseAgent):
         """
         self._model_name = model_config.get("model_name", self._model_name)
         self._run_id = model_config.get("run_id", self._run_id)
+        if "num_layers" in model_config:
+            self._num_layers = int(model_config["num_layers"])
+
+        # AR004 FR4.4: reset per-layer state and memory accounting on init.
+        self._layer_states.clear()
+        self._warned.clear()
+        self._active_channels = 0
+        self._total_memory_bytes_saved = 0.0
+        self._total_memory_bytes_original = 0.0
+        self._total_memory_bytes_packed = 0.0
 
         if "weights" in model_config:
             weights = model_config["weights"]
             weight_up = weights.get("up")
             weight_down = weights.get("down")
             if weight_up is not None and weight_down is not None:
-                self._precompute_weights(weight_up, weight_down)
+                self._precompute_weights(weight_up, weight_down, layer_id=0)
 
         self.transition_to(AgentState.READY)
         self.logger.log_event(
@@ -135,13 +223,14 @@ class FFNOptimizerAgent(BaseAgent):
         if weight_up is None or weight_down is None:
             raise ValueError("Missing 'up' or 'down' weights in inputs.")
 
-        # 缓存权重（仅在首次遇到时）
-        if self._weight_up is None:
-            self._precompute_weights(weight_up, weight_down)
+        # 缓存权重（逐层状态；仅在该层尚未缓存时写入）
+        state = self._layer_state(layer_id)
+        if state.weight_up is None:
+            self._precompute_weights(weight_up, weight_down, layer_id=layer_id)
 
-        # 使用缓存的权重
-        weight_up = self._weight_up
-        weight_down = self._weight_down
+        # 使用该层缓存的权重
+        weight_up = state.weight_up
+        weight_down = state.weight_down
 
         # Step 1: 解析 Q-drift 信号
         sensitivity_score = qdrift_signal.get("sensitivity_score", 0.0)
@@ -156,9 +245,9 @@ class FFNOptimizerAgent(BaseAgent):
             self.channel_pruning_enabled
             and self.channel_pruning_ratio > 0.0
             and sensitivity_score < 0.7
-            and self.channel_importance is None
+            and state.channel_importance is None
         ):
-            self.channel_importance = self.analyze_channel_importance(
+            state.channel_importance = self.analyze_channel_importance(
                 ffn_input_current, weight_up, weight_down, method="weight_magnitude"
             )
 
@@ -172,14 +261,21 @@ class FFNOptimizerAgent(BaseAgent):
         ):
             try:
                 channel_mask = self.compute_channel_mask(
-                    ffn_input_current, weight_up, method=self.channel_pruning_method
+                    ffn_input_current,
+                    weight_up,
+                    method=self.channel_pruning_method,
+                    importance=state.channel_importance,
                 )
                 active_channels = int(channel_mask.sum().item())
                 intermediate_dim = weight_up.shape[0]
                 active_ratio = active_channels / max(1, intermediate_dim)
-                self._channel_mask = channel_mask
+                state.channel_mask = channel_mask
+                state.active_channels = active_channels
                 self._active_channels = active_channels
             except Exception as exc:
+                state.channel_mask = None
+                state.active_channels = 0
+                self._active_channels = 0
                 self.logger.log_alert(
                     "warning",
                     f"Channel pruning failed at step {step_id}: {exc}",
@@ -203,72 +299,75 @@ class FFNOptimizerAgent(BaseAgent):
         ):
             compute_path = "full"
 
-        # Step 3: 通道重要性分析与量化（仅非 full 路径需要）
+        # Step 3: 通道重要性分析与量化（仅非 full 路径需要；逐层状态）
         quantization_info = {}
         if compute_path in ("mixed_full", "sparse", "incremental"):
-            if self.channel_importance is None:
-                self.channel_importance = self.analyze_channel_importance(
+            if state.channel_importance is None:
+                state.channel_importance = self.analyze_channel_importance(
                     ffn_input_current, weight_up, weight_down, method="weight_magnitude"
                 )
 
-            if self.weight_up_quantized is None:
+            if state.weight_up_quantized is None:
                 (
-                    self.weight_up_quantized,
-                    self.weight_down_quantized,
-                    self.precision_scales,
-                ) = self.quantize_mixed_precision(weight_up, weight_down, self.channel_importance)
+                    state.weight_up_quantized,
+                    state.weight_down_quantized,
+                    state.precision_scales,
+                ) = self.quantize_mixed_precision(weight_up, weight_down, state.channel_importance)
+                # AR004 FR4.2: aggregate statistics once per layer.
+                scales = state.precision_scales
+                num_fp16 = sum(1 for p in scales.values() if p[0] == "fp16")
+                num_int8 = sum(1 for p in scales.values() if p[0] == "int8")
+                num_int4 = sum(1 for p in scales.values() if p[0] == "int4")
+                total_channels = max(len(scales), 1)
+                stats: Dict[str, Any] = {
+                    "weight_precision_map": {f"channel_{k}": v[0] for k, v in scales.items()},
+                    "num_fp16_channels": num_fp16,
+                    "num_int8_channels": num_int8,
+                    "num_int4_channels": num_int4,
+                    "compression_ratio": 1.0
+                    - (num_fp16 * 2 + num_int8 * 1 + num_int4 * 0.5) / (total_channels * 2),
+                }
 
-            num_fp16 = sum(1 for p in self.precision_scales.values() if p[0] == "fp16")
-            num_int8 = sum(1 for p in self.precision_scales.values() if p[0] == "int8")
-            num_int4 = sum(1 for p in self.precision_scales.values() if p[0] == "int4")
-            total_channels = max(len(self.precision_scales), 1)
+                # Track real memory savings from byte-level packing (once per layer).
+                if isinstance(state.weight_up_quantized, PackedFFNWeight) and isinstance(
+                    state.weight_down_quantized, PackedFFNWeight
+                ):
+                    packed_memory = (
+                        state.weight_up_quantized.memory_bytes()
+                        + state.weight_down_quantized.memory_bytes()
+                    )
+                    original_memory = (
+                        state.weight_up_quantized.original_bytes()
+                        + state.weight_down_quantized.original_bytes()
+                    )
+                    memory_saved = original_memory - packed_memory
+                    self._total_memory_bytes_original += original_memory
+                    self._total_memory_bytes_packed += packed_memory
+                    self._total_memory_bytes_saved += memory_saved
+                    stats.update(
+                        {
+                            "packed_memory_bytes": packed_memory,
+                            "original_memory_bytes": original_memory,
+                            "memory_savings_bytes": memory_saved,
+                            "compression_ratio": (
+                                memory_saved / original_memory if original_memory else 0.0
+                            ),
+                        }
+                    )
+                state.quantization_stats = stats
 
-            quantization_info = {
-                "weight_precision_map": {
-                    f"channel_{k}": v[0] for k, v in self.precision_scales.items()
-                },
-                "num_fp16_channels": num_fp16,
-                "num_int8_channels": num_int8,
-                "num_int4_channels": num_int4,
-                "compression_ratio": 1.0
-                - (num_fp16 * 2 + num_int8 * 1 + num_int4 * 0.5) / (total_channels * 2),
-            }
-
-            # Track real memory savings from byte-level packing.
-            if isinstance(self.weight_up_quantized, PackedFFNWeight) and isinstance(
-                self.weight_down_quantized, PackedFFNWeight
-            ):
-                packed_memory = (
-                    self.weight_up_quantized.memory_bytes()
-                    + self.weight_down_quantized.memory_bytes()
-                )
-                original_memory = (
-                    self.weight_up_quantized.original_bytes()
-                    + self.weight_down_quantized.original_bytes()
-                )
-                memory_saved = original_memory - packed_memory
-                self._total_memory_bytes_original += original_memory
-                self._total_memory_bytes_packed += packed_memory
-                self._total_memory_bytes_saved += memory_saved
-                quantization_info.update(
-                    {
-                        "packed_memory_bytes": packed_memory,
-                        "original_memory_bytes": original_memory,
-                        "memory_savings_bytes": memory_saved,
-                        "compression_ratio": (
-                            memory_saved / original_memory if original_memory else 0.0
-                        ),
-                    }
-                )
+            quantization_info = dict(state.quantization_stats)
 
         # Step 4: 执行 FFN 计算
         sparse_update_info = {}
         changed_ratio = 1.0
 
-        # Use packed/quantized weights for optimized paths when available.
-        up_weight = self.weight_up_quantized if self.weight_up_quantized is not None else weight_up
+        # Use this layer's packed/quantized weights when available.
+        up_weight = (
+            state.weight_up_quantized if state.weight_up_quantized is not None else weight_up
+        )
         down_weight = (
-            self.weight_down_quantized if self.weight_down_quantized is not None else weight_down
+            state.weight_down_quantized if state.weight_down_quantized is not None else weight_down
         )
 
         if compute_path == "reuse":
@@ -296,11 +395,23 @@ class FFNOptimizerAgent(BaseAgent):
             changed_ratio = sparse_stats.get("changed_tokens_ratio", 1.0)
 
         elif compute_path == "mixed_full":
-            output = self._mixed_compute(ffn_input_current, up_weight, down_weight, channel_mask)
+            output = self._mixed_compute(
+                ffn_input_current,
+                up_weight,
+                down_weight,
+                channel_mask,
+                warning_key=(layer_id, "all_false_mask"),
+            )
             changed_ratio = 1.0
 
         else:  # full
-            output = self._full_compute(ffn_input_current, weight_up, weight_down, channel_mask)
+            output = self._full_compute(
+                ffn_input_current,
+                weight_up,
+                weight_down,
+                channel_mask,
+                warning_key=(layer_id, "all_false_mask"),
+            )
             changed_ratio = 1.0
 
         # Step 5: 计算统计
@@ -370,7 +481,7 @@ class FFNOptimizerAgent(BaseAgent):
         channel_pruning_info = {
             "enabled": self.channel_pruning_enabled,
             "active_ratio": active_ratio,
-            "active_channels": self._active_channels,
+            "active_channels": state.active_channels,
             "method": self.channel_pruning_method,
         }
 
@@ -443,19 +554,24 @@ class FFNOptimizerAgent(BaseAgent):
     # 内部辅助
     # ------------------------------------------------------------------
 
-    def _precompute_weights(self, weight_up: torch.Tensor, weight_down: torch.Tensor) -> None:
+    def _precompute_weights(
+        self, weight_up: torch.Tensor, weight_down: torch.Tensor, layer_id: int = 0
+    ) -> None:
         """缓存权重。
 
         假设传入的权重为 PyTorch 标准格式 [out_features, in_features]：
         - weight_up: [intermediate_dim, hidden_dim]
         - weight_down: [hidden_dim, intermediate_dim]
         """
-        self._weight_up = weight_up
-        self._weight_down = weight_down
+        state = self._layer_state(layer_id)
+        if state.weight_up is None:
+            state.weight_up = weight_up
+            state.weight_down = weight_down
         self.logger.log_event(
             "weights_cached",
             "FFN weights cached for optimization.",
             data={
+                "layer_id": layer_id,
                 "weight_up_shape": list(weight_up.shape),
                 "weight_down_shape": list(weight_down.shape),
             },
@@ -547,8 +663,77 @@ class FFNOptimizerAgent(BaseAgent):
         Returns:
             (quantized_up, quantized_down, precision_scales_dict)
         """
-        intermediate_dim = weight_up.shape[0]  # PyTorch 标准: [out, in]
+        device = weight_up.device
+        quantized_up = weight_up.clone()
+        quantized_down = weight_down.clone()
+        scales: Dict[int, Any] = {}
 
+        importance = channel_importance.to(device)
+        fp16_mask = importance >= high_precision_threshold
+        int8_mask = (importance >= 0.3) & ~fp16_mask
+        int4_mask = ~(fp16_mask | int8_mask)
+
+        fp16_idx = torch.nonzero(fp16_mask, as_tuple=False).flatten()
+        if fp16_idx.numel() > 0:
+            quantized_up[fp16_idx] = weight_up[fp16_idx].half().float()
+            quantized_down[:, fp16_idx] = weight_down[:, fp16_idx].half().float()
+            for ch in fp16_idx.tolist():
+                scales[ch] = ("fp16", None)
+
+        for mask, precision, qmax in ((int8_mask, "int8", 127.0), (int4_mask, "int4", 7.0)):
+            idx = torch.nonzero(mask, as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            scale_up = weight_up[idx].abs().amax(dim=1) / qmax
+            scale_down = weight_down[:, idx].abs().amax(dim=0) / qmax
+            safe_up = scale_up > 0
+            safe_down = scale_down > 0
+
+            w_up = weight_up[idx]
+            q_up = torch.round(w_up / scale_up.clamp_min(1e-12).unsqueeze(1))
+            q_up = q_up.clamp(-qmax - 1, qmax).to(torch.int8).float()
+            deq_up = q_up * scale_up.unsqueeze(1)
+            quantized_up[idx] = torch.where(safe_up.unsqueeze(1), deq_up, w_up)
+
+            w_down = weight_down[:, idx]
+            q_down = torch.round(w_down / scale_down.clamp_min(1e-12).unsqueeze(0))
+            q_down = q_down.clamp(-qmax - 1, qmax).to(torch.int8).float()
+            deq_down = q_down * scale_down.unsqueeze(0)
+            quantized_down[:, idx] = torch.where(safe_down.unsqueeze(0), deq_down, w_down)
+
+            for pos, ch in enumerate(idx.tolist()):
+                scales[ch] = (
+                    precision,
+                    (float(scale_up[pos].item()), float(scale_down[pos].item())),
+                )
+
+        if self.use_packed_weights:
+            precision_map = {ch: info[0] for ch, info in scales.items()}
+            packed_up = PackedFFNWeight.pack(
+                weight_up,
+                precision_map,
+                pack_dim=0,
+                group_size=self._pack_group_size,
+            )
+            packed_down = PackedFFNWeight.pack(
+                weight_down,
+                precision_map,
+                pack_dim=1,
+                group_size=self._pack_group_size,
+            )
+            return packed_up, packed_down, scales
+
+        return quantized_up, quantized_down, scales
+
+    def _quantize_mixed_precision_reference(
+        self,
+        weight_up: torch.Tensor,
+        weight_down: torch.Tensor,
+        channel_importance: torch.Tensor,
+        high_precision_threshold: float = 0.7,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """Golden per-channel mixed-precision quantization (pre-AR004)."""
+        intermediate_dim = weight_up.shape[0]
         quantized_up = torch.zeros_like(weight_up)
         quantized_down = torch.zeros_like(weight_down)
         scales = {}
@@ -557,13 +742,11 @@ class FFNOptimizerAgent(BaseAgent):
             importance = channel_importance[channel_idx].item()
 
             if importance >= high_precision_threshold:
-                # 高重要性 -> FP16
                 quantized_up[channel_idx, :] = weight_up[channel_idx, :].half().float()
                 quantized_down[:, channel_idx] = weight_down[:, channel_idx].half().float()
                 scales[channel_idx] = ("fp16", None)
 
             elif importance >= 0.3:
-                # 中重要性 -> INT8
                 w_up = weight_up[channel_idx, :]
                 scale_up = w_up.abs().max() / 127.0
                 if scale_up > 0:
@@ -583,7 +766,6 @@ class FFNOptimizerAgent(BaseAgent):
                 scales[channel_idx] = ("int8", (float(scale_up.item()), float(scale_down.item())))
 
             else:
-                # 低重要性 -> INT4
                 w_up = weight_up[channel_idx, :]
                 scale_up = w_up.abs().max() / 7.0
                 if scale_up > 0:
@@ -601,22 +783,6 @@ class FFNOptimizerAgent(BaseAgent):
                     quantized_down[:, channel_idx] = w_down
 
                 scales[channel_idx] = ("int4", (float(scale_up.item()), float(scale_down.item())))
-
-        if self.use_packed_weights:
-            precision_map = {ch: info[0] for ch, info in scales.items()}
-            packed_up = PackedFFNWeight.pack(
-                weight_up,
-                precision_map,
-                pack_dim=0,
-                group_size=self._pack_group_size,
-            )
-            packed_down = PackedFFNWeight.pack(
-                weight_down,
-                precision_map,
-                pack_dim=1,
-                group_size=self._pack_group_size,
-            )
-            return packed_up, packed_down, scales
 
         return quantized_up, quantized_down, scales
 
@@ -826,15 +992,16 @@ class FFNOptimizerAgent(BaseAgent):
         ffn_input: torch.Tensor,
         weight_up: torch.Tensor,
         method: Optional[str] = None,
+        importance: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute a boolean mask of active intermediate channels.
 
         Args:
             ffn_input: FFN input [batch, seq_len, hidden_dim].
             weight_up: Up-projection weight [intermediate_dim, hidden_dim].
-            method: ``static_importance`` uses the cached channel_importance
-                scores; ``dynamic_activation`` uses the current input's up-proj
-                activation energy.
+            method: ``static_importance`` uses ``importance`` (falling back to
+                layer 0's cached scores); ``dynamic_activation`` uses the
+                current input's up-proj activation energy.
 
         Returns:
             Bool tensor [intermediate_dim], ``True`` for kept channels.
@@ -855,13 +1022,16 @@ class FFNOptimizerAgent(BaseAgent):
             return channel_energy > threshold
 
         # Static importance: keep top-(1 - ratio) most important channels.
-        if self.channel_importance is None:
+        if importance is None:
+            importance = self.channel_importance
+        if importance is None:
             raise RuntimeError(
                 "Static channel pruning requires channel_importance; "
                 "run analyze_channel_importance first or use dynamic_activation."
             )
-        k = max(1, int(intermediate_dim * (1.0 - self.channel_pruning_ratio)))
-        keep_indices = torch.topk(self.channel_importance.to(device), k, largest=True).indices
+        ratio = max(0.0, min(1.0, self.channel_pruning_ratio))
+        k = max(1, int(intermediate_dim * (1.0 - ratio)))
+        keep_indices = torch.topk(importance.to(device), k, largest=True).indices
         mask = torch.zeros(intermediate_dim, dtype=torch.bool, device=device)
         mask[keep_indices] = True
         return mask
@@ -872,6 +1042,7 @@ class FFNOptimizerAgent(BaseAgent):
         weight_up: torch.Tensor,
         weight_down: torch.Tensor,
         channel_mask: Optional[torch.Tensor] = None,
+        warning_key: Optional[Tuple[int, str]] = None,
     ) -> torch.Tensor:
         """标准 FFN 计算：gelu(linear(x, weight_up)) @ weight_down
 
@@ -886,6 +1057,16 @@ class FFNOptimizerAgent(BaseAgent):
         Returns:
             FFN 输出张量 [..., hidden_dim]。
         """
+        if channel_mask is not None and not bool(channel_mask.any()):
+            if warning_key is not None:
+                self._warn_once(
+                    warning_key, "Channel mask is all False; returning zero FFN output."
+                )
+            return torch.zeros(
+                (*ffn_input.shape[:-1], weight_down.shape[0]),
+                dtype=ffn_input.dtype,
+                device=ffn_input.device,
+            )
         if channel_mask is not None:
             weight_up = weight_up[channel_mask, :]
             weight_down = weight_down[:, channel_mask]
@@ -899,6 +1080,7 @@ class FFNOptimizerAgent(BaseAgent):
         weight_up: torch.Tensor,
         weight_down: torch.Tensor,
         channel_mask: Optional[torch.Tensor] = None,
+        warning_key: Optional[Tuple[int, str]] = None,
     ) -> torch.Tensor:
         """使用量化权重但完整计算。
 
@@ -911,12 +1093,23 @@ class FFNOptimizerAgent(BaseAgent):
         Returns:
             FFN 输出张量 [..., hidden_dim]。
         """
+        if channel_mask is not None and not bool(channel_mask.any()):
+            if warning_key is not None:
+                self._warn_once(
+                    warning_key, "Channel mask is all False; returning zero FFN output."
+                )
+            out_dim = weight_down.shape[0]
+            return torch.zeros(
+                (*ffn_input.shape[:-1], out_dim),
+                dtype=ffn_input.dtype,
+                device=ffn_input.device,
+            )
         up_output = self._linear_forward(
-            ffn_input, weight_up, use_sparse_gemm=True, channel_mask=channel_mask
+            ffn_input, weight_up, use_sparse_gemm=True, channel_mask=channel_mask, mask_dim=0
         )
         intermediate = F.gelu(up_output)
         return self._linear_forward(
-            intermediate, weight_down, use_sparse_gemm=True, channel_mask=None
+            intermediate, weight_down, use_sparse_gemm=True, channel_mask=channel_mask, mask_dim=1
         )
 
     def _linear_forward(
@@ -925,6 +1118,7 @@ class FFNOptimizerAgent(BaseAgent):
         weight: torch.Tensor,
         use_sparse_gemm: bool = False,
         channel_mask: Optional[torch.Tensor] = None,
+        mask_dim: int = 0,
     ) -> torch.Tensor:
         """Linear forward with optional sparse GEMM kernel and packed-weight fallback.
 
@@ -934,8 +1128,9 @@ class FFNOptimizerAgent(BaseAgent):
         execution paths; otherwise a standard dense ``F.linear`` fallback is used.
 
         Args:
-            channel_mask: Optional bool mask [out_features] applied after
-                dequantization. Used for dynamic channel pruning.
+            channel_mask: Optional bool mask applied after dequantization.
+            mask_dim: 0 applies the mask to output rows (up projection);
+                1 applies it to input columns (down projection).
         """
         is_packed = isinstance(weight, PackedFFNWeight)
         device = input_tensor.device
@@ -944,8 +1139,13 @@ class FFNOptimizerAgent(BaseAgent):
         if dense_weight.device != device:
             dense_weight = dense_weight.to(device)
 
+        if mask_dim not in (0, 1):
+            raise ValueError(f"mask_dim must be 0 or 1, got {mask_dim}.")
         if channel_mask is not None:
-            dense_weight = dense_weight[channel_mask]
+            if mask_dim == 0:
+                dense_weight = dense_weight[channel_mask]
+            else:
+                dense_weight = dense_weight[:, channel_mask]
 
         cuda_ready = (
             use_sparse_gemm

@@ -12,14 +12,14 @@
 | ID | 任务描述 | 依赖 | 状态 | 备注 |
 |----|---------|------|------|------|
 | T001 | 微基准取证落档：on_step 中位 1.88ms、fingerprint 145.4-194.6µs、统计 cProfile 20%、掩码与 FFN-P1 缺陷复现 → baseline-profile.md | - | passing（已核验） | 2026-10-18（baseline-profile.md + ar004_bench.py） |
-| T002a | FR4.1 指纹 O(1)（packed_weight + 集成验证），golden 测试 | T001 | pending | |
-| T002b | FR4.2 统计缓存（层级唯一归属 + 内存累计），golden 测试 | T004 | pending | |
-| T003 | FR4.3 向量化 unpack + `_unpack_reference` golden；性能微基准 | T002b, T004 | pending | |
-| T004 | FR4.4 逐层状态隔离（`_LayerState` 骨架 + 层级读写点）+ on_init 清空 + 超层告警 | T002a | pending | |
-| T005 | FR4.5 `_mixed_compute` 列掩码修复 + 全 False 告警 | T004 | pending | |
-| T006 | FR4.6 向量化 quantize_mixed_precision + 参考 golden；性能微基准 | T003, T005 | pending | |
-| T007 | 微基准对照 + 全量回归 + 五件套（a 同批 A/B 3 次报告区间；b 结构硬门禁：指纹 ≤10µs / vec ≤50% 参考；c 全量 pytest + 覆盖率） | T006 | pending | 规则 1.1 口径 |
-| T008 | README v3.6.0 四检查点 + pyproject/`__version__`/ROADMAP | T007 | pending | 消除 README 81.68/82.04 口径冲突，以当次 pytest --cov 实跑更新两处 |
+| T002a | FR4.1 指纹 O(1)（packed_weight + 集成验证），golden 测试 | T001 | passing | 2026-10-18（commit c027ee0；UT-1/UT-2） |
+| T002b | FR4.2 统计缓存（层级唯一归属 + 内存累计），golden 测试 | T004 | passing | 2026-10-18（quantization_stats 按层一次；UT-3/3b/18b） |
+| T003 | FR4.3 向量化 unpack + `_unpack_reference` golden；性能微基准 | T002b, T004 | passing | 2026-10-18（20x，UT-4/5/7） |
+| T004 | FR4.4 逐层状态隔离（`_LayerState` 骨架 + 层级读写点）+ on_init 清空 + 超层告警 | T002a | passing | 2026-10-18（UT-6/6b/6c/16） |
+| T005 | FR4.5 `_mixed_compute` 列掩码修复 + 全 False 告警 | T004 | passing | 2026-10-18（缺陷复现转通过；UT-8/9/21） |
+| T006 | FR4.6 向量化 quantize_mixed_precision + 参考 golden；性能微基准 | T003, T005 | passing | 2026-10-18（20x，UT-10/11） |
+| T007 | 微基准对照 + 全量回归 + 五件套 | T006 | passing | 2026-10-18：on_step 1.95→0.71ms（0.36x）、指纹 151.4→0.3µs、unpack 0.047x、quantize 0.050x；719 passed / 82.25% |
+| T008 | README v3.6.0 四检查点 + pyproject/`__version__`/ROADMAP | T007 | passing | 2026-10-18：特性表/版本历史/基准/复现协议；版本号三处 3.6.0；当前口径 719/82.25%，历史 v3.4.0 行保留 |
 | T009 | Review + ST（st-cases.md）+ 归档 + Gitee 推送（a Review；b ST；c 归档；d 推送三核验） | T008 | pending | 规则二 |
 
 ## 状态说明
@@ -120,3 +120,12 @@
 - 第 12 轮：PASS（0 Critical / 0 Important；3 WARN + 9 Minor 由 T007/T008 与实现期处理）
 - 门控结论：**req+design 阶段通过，放行 T002a 开发**
 - 审查代理：sdd-gate-reviewer
+
+## 实现与验证记录（2026-10-18）
+
+- T002a：`PackedFFNWeight._plan_fingerprint` pack 时构建；dequant `is` 快路径 + `==` 值语义。
+- T004/T002b：`_LayerState` + 10 处读写点归层；`on_init` 先清空/重置再预载 layer 0；`_warned` 键去重。
+- T003/T006：unpack 分组批量（int4 批量解包）+ 参考实现保留；量化按重要性掩码向量化 + `_quantize_mixed_precision_reference`。
+- T005：`_linear_forward(mask_dim)`、down 列掩码、全 False 零输出 + 告警一次（mixed/full）。
+- T007 实测（同会话同批，CPU）：on_step 1.95→0.71ms（0.36x）；指纹 151.4→0.3µs；unpack 82.29→3.91ms（0.047x）；quantize 189.09→9.43ms（0.050x）；`719 passed, 1 skipped`，覆盖率 82.25%。
+- T008：README v3.6.0 四检查点 + 服务器复现协议；pyproject/`__version__`/README 徽章 3.6.0 同步；ROADMAP AR004 勾选。
