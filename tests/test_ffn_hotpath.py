@@ -566,4 +566,84 @@ def test_ut17_version_strings_consistent():
 
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == shadowinfer.__version__ == "3.7.0"
+    assert pyproject["project"]["version"] == shadowinfer.__version__ == "3.8.0"
+
+
+def _assert_pack_data_equal(vec, ref, label=""):
+    assert vec._data.keys() == ref._data.keys(), label
+    for ch, ref_entry in ref._data.items():
+        entry = vec._data[ch]
+        assert entry.keys() == ref_entry.keys(), (label, ch)
+        for key, expected in ref_entry.items():
+            value = entry[key]
+            if isinstance(expected, torch.Tensor):
+                assert torch.equal(value, expected), (label, ch, key)
+                assert value.dtype == expected.dtype, (label, ch, key)
+                assert value.shape == expected.shape, (label, ch, key)
+            else:
+                assert value == expected, (label, ch, key)
+    assert vec.memory_bytes() == ref.memory_bytes(), label
+    assert vec._precision_plan_fingerprint() == ref._precision_plan_fingerprint(), label
+
+
+def test_ut61_pack_golden_mixed_precision():
+    torch.manual_seed(0)
+    for pack_dim, shape, group_size in (
+        (0, (64, 48), 16),
+        (1, (32, 64), 16),
+        (0, (33, 30), 16),
+        (0, (48, 32), 64),
+    ):
+        weight = torch.randn(*shape)
+        pmap = _mixed_map(shape[pack_dim])
+        vec = PackedFFNWeight.pack(weight, pmap, pack_dim=pack_dim, group_size=group_size)
+        ref = PackedFFNWeight(shape, pack_dim=pack_dim)
+        ref._do_pack_reference(weight, pmap, group_size=group_size)
+        _assert_pack_data_equal(vec, ref, f"dim{pack_dim}-{shape}")
+
+
+def test_ut62_pack_golden_odd_int4_length():
+    torch.manual_seed(0)
+    weight = torch.randn(16, 15)
+    pmap = {i: "int4" for i in range(16)}
+    vec = PackedFFNWeight.pack(weight, pmap, group_size=16)
+    ref = PackedFFNWeight(weight.shape)
+    ref._do_pack_reference(weight, pmap, group_size=16)
+    _assert_pack_data_equal(vec, ref, "odd-int4")
+    assert vec._data[0]["group_size"] == 15
+
+
+def test_ut63_pack_empty_weight():
+    weight = torch.zeros(0, 32)
+    vec = PackedFFNWeight.pack(weight, {}, group_size=16)
+    assert vec._data == {}
+    assert vec.memory_bytes() == 0
+    assert vec._precision_plan_fingerprint() == ()
+
+
+def test_ut64_pack_then_unpack_matches_reference():
+    torch.manual_seed(0)
+    weight = torch.randn(40, 24)
+    pmap = _mixed_map(40)
+    vec = PackedFFNWeight.pack(weight, pmap, group_size=16)
+    assert torch.allclose(vec.unpack(), vec._unpack_reference(), atol=1e-6)
+
+
+def test_ut65_pack_vectorized_speedup():
+    torch.manual_seed(0)
+    weight = torch.randn(1024, 256)
+    pmap = _mixed_map(1024)
+
+    def timed(fn, n=3):
+        samples = []
+        for _ in range(n):
+            start = time.perf_counter()
+            fn()
+            samples.append(time.perf_counter() - start)
+        return sorted(samples)[len(samples) // 2]
+
+    vec = timed(lambda: PackedFFNWeight.pack(weight, pmap, group_size=64))
+    ref = timed(
+        lambda: PackedFFNWeight(weight.shape)._do_pack_reference(weight, pmap, group_size=64)
+    )
+    assert vec <= ref * 0.5

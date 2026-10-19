@@ -8,7 +8,7 @@ and the mixed-precision grouping ideas from
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -83,7 +83,107 @@ class PackedFFNWeight:
         obj._do_pack(weight, precision_map, group_size=group_size)
         return obj
 
+    @staticmethod
+    def _pack_int4_channels(quantized: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Pack INT4 values row-wise into uint8 bytes (AR006 vectorized path)."""
+        if quantized.shape[0] == 0:
+            return torch.empty(0, 0, dtype=torch.uint8, device=quantized.device), 0
+        rows = quantized.reshape(quantized.shape[0], -1)
+        offset = (rows + 8).to(torch.uint8)
+        if offset.shape[1] % 2 != 0:
+            pad = torch.zeros(offset.shape[0], 1, dtype=torch.uint8, device=offset.device)
+            offset = torch.cat([offset, pad], dim=1)
+        high = offset[:, 0::2] << 4
+        low = offset[:, 1::2] & 0x0F
+        packed = high | low
+        return packed, packed.shape[1]
+
     def _do_pack(
+        self,
+        weight: torch.Tensor,
+        precision_map: Dict[int, str],
+        group_size: int = 64,
+    ) -> None:
+        """Grouped vectorized packing (AR006).
+
+        Bit-identical to ``_do_pack_reference``: channels are gathered by
+        precision, quantized in batch, then scattered back into the legacy
+        per-channel layout.
+        """
+        self._data = {}
+        self._dequant_cache = None
+        self._dequant_cache_fingerprint = None
+        self._plan_fingerprint = ()
+        self._memory_bytes = 0
+
+        channels = weight.shape[self.pack_dim]
+        if channels == 0:
+            return
+
+        groups: Dict[str, list] = {"fp32": [], "fp16": [], "int8": [], "int4": []}
+        plan = []
+        for channel_idx in range(channels):
+            precision = precision_map.get(channel_idx, "fp16").lower()
+            if precision not in self.PRECISION_BITS:
+                precision = "fp16"
+            groups[precision].append(channel_idx)
+            plan.append((channel_idx, precision))
+
+        total_bytes = 0
+        for precision, idx_list in groups.items():
+            if not idx_list:
+                continue
+            idx = torch.tensor(idx_list, dtype=torch.long, device=weight.device)
+            if self.pack_dim == 0:
+                batch = weight[idx]
+            else:
+                batch = weight[:, idx].transpose(0, 1)
+
+            if precision == "fp32":
+                block = batch.float()
+                for pos, ch in enumerate(idx_list):
+                    stored = block[pos].contiguous()
+                    total_bytes += stored.numel() * stored.element_size()
+                    self._data[ch] = {"precision": "fp32", "tensor": stored}
+
+            elif precision == "fp16":
+                block = batch.half()
+                for pos, ch in enumerate(idx_list):
+                    stored = block[pos].contiguous()
+                    total_bytes += stored.numel() * stored.element_size()
+                    self._data[ch] = {"precision": "fp16", "tensor": stored}
+
+            elif precision == "int8":
+                quantized, scale = Quantizer.quantize_int8(batch)
+                for pos, ch in enumerate(idx_list):
+                    q = quantized[pos].contiguous()
+                    s = scale[pos].contiguous()
+                    total_bytes += q.numel() * q.element_size()
+                    total_bytes += s.numel() * s.element_size()
+                    self._data[ch] = {"precision": "int8", "q": q, "scale": s}
+
+            elif precision == "int4":
+                channel_len = batch.shape[1]
+                effective_group_size = group_size if channel_len % group_size == 0 else channel_len
+                quantized, scale = Quantizer.quantize_int4(batch, group_size=effective_group_size)
+                packed_rows, _ = self._pack_int4_channels(quantized)
+                for pos, ch in enumerate(idx_list):
+                    packed = packed_rows[pos].contiguous()
+                    s = scale[pos].unsqueeze(0).contiguous()
+                    total_bytes += packed.numel() * packed.element_size()
+                    total_bytes += s.numel() * s.element_size()
+                    self._data[ch] = {
+                        "precision": "int4",
+                        "packed": packed,
+                        "scale": s,
+                        "group_size": effective_group_size,
+                        "num_groups": channel_len // effective_group_size,
+                    }
+
+        self._memory_bytes = total_bytes
+        self._plan_fingerprint = tuple(plan)
+
+    def _do_pack_reference(
         self,
         weight: torch.Tensor,
         precision_map: Dict[int, str],
