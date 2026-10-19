@@ -19,7 +19,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 ### Strengths
 
 - Clean multi-agent architecture (Orchestrator + Profiler / ShadowKV / Q-drift / FFN Optimizer).
-- 630 passing tests (1 skipped) with 81.68% coverage.
+- 792 passing tests (1 skipped) with 82.99% coverage.
 - Comprehensive documentation (architecture, technical spec, engineering, ADRs, bilingual README, tutorials).
 - Built-in observability, benchmarking, and production-safety components.
 - CUDA kernel scaffold (INT8/INT4 quantization, sparse GEMM, fused quantized attention).
@@ -76,6 +76,21 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       backend resolution (success and failure) and batched KV INT4 byte packing;
       byte-identical to the reference packer. CPU same-process A/B: loader 0.022x,
       INT4 pack 0.016x.
+- [x] **FFN pack vectorization** (v3.8.0, AR006): grouped `_do_pack` with
+      byte-identical layouts/scales/fingerprints; CPU same-batch 0.072x
+      (`specs/archive/AR006-ffn-pack-vectorization/`).
+- [x] **Reproducible experiment harness** (v3.9.0, AR007): real-backend
+      baseline/optimized runner with seed control, per-repeat KV reset, config
+      digest, environment/git evidence, and isolated artifacts; mock rejected.
+- [x] **FlashInfer-style Plan/Run fusion** (v3.10.0, AR008): one `PrecisionPlan`
+      shared by compression and packing; CPU 2.81-3.74x with bitwise parity.
+- [x] **Rate-distortion KV allocation** (v3.11.0, AR009): importance x KV
+      amplitude ordering plus optional zero-byte hard eviction; real 8-layer
+      5-seed weighted KV error -3.94%/-6.58% at 1.2/1.5MB.
+- [x] **Dense precision-code hot path** (v3.12.0, AR010): int8 codes as the only
+      hot-path state, prefix-sum `admit_codes`, vectorized `from_codes`, and a
+      contiguous workspace fix; CPU metadata stage 18.00x at 8192x32 with
+      bitwise parity (`specs/archive/AR010-dense-precision-pipeline/`).
 - [ ] **AOG overhead gating** (planned): device-aware adaptive overhead gating
       with K-step decision cadence and pre-flight arbitration (ORC-P1/ORC-P3).
 - [ ] **Macroblock rate control** (planned): SKIP/DELTA/REFRESH reuse modes with
@@ -256,7 +271,7 @@ These directions can differentiate ShadowInfer on GitHub and in the research com
 | pip Installable | ✅ | ✅ | ✅ |
 | Real Model Support | Partial (`SimpleDiffusionLLM` + HuggingFace adapter) | 1 public Diffusion LLM | 3+ |
 | CUDA Kernel Completion | ~35% | 70% | 90%+ |
-| Test Coverage | ~81.68% | >82% | >85% |
+| Test Coverage | ~82.99% | >82% | >85% |
 | Docs Languages | Chinese + English intro | Bilingual core | Bilingual full |
 | Contributors | 1 | 5+ | 20+ |
 | Academic Output | 0 | 1 arXiv | 1 paper + artifact |

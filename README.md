@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.11.0 | 772 passed / 1 skipped | 82.93% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.12.0 | 792 passed / 1 skipped | 82.99% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -65,6 +65,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **实验可复现编排（v3.9.0）** | `scripts/run_experiment.py` 一键执行真实后端 baseline/optimized 对照：固定 seed、每轮清空后端 KV cache、记录配置摘要与环境（Python/torch/设备/git SHA）、按 `--repeats` 输出 median/min/max、每次重复的 profiler 产物隔离到 `run_i/`；显式拒绝 mock 后端。内置 s1（CPU）档位，`configs/experiments/` 提供 s2（7B GPU）与 s3（8K 长上下文）模板。 |
 | **FlashInfer 式 Plan/Run 融合（v3.10.0）** | 新增 `PrecisionPlan`：一次构建精度分组/flat 索引/复用索引/SHA-256 指纹，压缩与字节打包共享；生产路径不再构造未使用的逐条目 scale dict；pack 复用压缩阶段 fp16/int8 量化结果，消除重复分组与重复量化。保留 legacy 与逐元素 reference 作 golden，异常自动回退。CPU 多规模同批中位合计 2.81-3.74x（逐位一致）。 |
 | **率失真 KV 预算分配（v3.11.0）** | `rd_allocator` 以 `attention_importance × KV 幅值敏感度` 排序（量化误差近似），替代纯重要性降档；sink 与复用条目受保护。可选硬驱逐（`hard_eviction_enabled`）在预算低于 int4 底线时按同序驱逐低价值 token-head（零字节，解包为零），保证内存上限不再被突破。真实 8 层模型 5 seed：同字节加权 KV 重建误差 1.2MB -3.94%、1.5MB -6.58%；0.9MB 持平（-0.26%）。 |
+| **稠密精度码热路径（v3.12.0）** | 以 `int8[seq, heads]` codes 作为精度决策的唯一热路径状态：`allocate_precision_codes` 直接产出 codes，`admit_codes` 用稳定 argsort + 前缀和闭式求解降档/驱逐，`PrecisionPlan.from_codes` 张量化生成分组与 flat 索引，dict 仅在 API 边界转换一次。修复非连续 K/V 导致 `zeros_like().view()` 的静默回退（4 层管线 16 次压缩 0 次回退）。CPU 3 次中位 8192×32 元数据阶段 2443.2→135.7 ms（18.00x），512-4096 为 16.67-18.81x，输出与 v3.11 逐位一致。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -709,7 +710,31 @@ python -m shadowinfer optimize \
     --device cpu \
     --num-steps 6 \
     --config configs/optimize_full.yaml
+
+# 稠密精度码元数据基准（dict vs codes，含逐位一致性断言）
+python specs/archive/AR010-dense-precision-pipeline/ar010_bench.py
 ```
+
+### 实测数据（v3.12.0，2026-10-19，Windows / CPU）
+
+真实张量单层，3 次中位（`specs/archive/AR010-dense-precision-pipeline/ar010_bench.py`，
+seed=0，预算为同形状 fp32 全量的 18%）。两路径的 precision_map、predicted 字节、
+驱逐计数与计划指纹均通过脚本内断言：
+
+| 规模（seq×heads×dim） | v3.11 dict 路径（中位[min-max]） | v3.12 codes 路径（中位[min-max]） | 比值 |
+|---|---|---|---|
+| 512×32×128 | 175.0 ms [170.1-195.7] | 10.5 ms [10.5-10.7] | 16.67x |
+| 2048×32×128 | 623.4 ms [612.1-625.2] | 36.4 ms [35.1-36.8] | 17.11x |
+| 4096×32×128 | 1228.5 ms [1208.5-1230.8] | 65.3 ms [65.1-66.4] | 18.81x |
+| 8192×32×128 | 2443.2 ms [2416.8-2467.1] | 135.7 ms [132.5-145.2] | **18.00x** |
+
+每档为 3 次重复的中位与 min-max。独立复跑受 CPU 调度影响，比值区间约 15.7-19.6x
+（8192×32 约 18.0-19.1x）；所有运行均满足 >=10x 且 8192 档 <200ms。计时覆盖
+`allocate + admit + PrecisionPlan` 的生产包装（dict 路径为 `allocate_precision` +
+`_admit_precision_budget` + `build`；codes 路径为 `allocate_precision_codes` +
+`_admit_precision_codes` + `from_codes`，含 KV 敏感度计算）。4 层真实后端 4 步管线复核：
+16 次压缩全部走 plan 路径，reference 回退 0 次。本机为 CPU 实测；GPU/7B 端到端延迟按
+`server-experiment.md` 在服务器回填，本机不宣称端到端收益。
 
 ### 实测数据（v3.11.0，2026-10-19，Windows / CPU）
 
@@ -984,10 +1009,12 @@ ShadowInfer/
 │   ├── run.py                      # CLI 入口脚本
 │   └── run_experiment.py           # 可复现实验编排（v3.9.0）
 ├── configs/                        # 配置示例
-│   ├── experiments/                # s1/s2/s3 实验档位
+│   ├── experiments/                # s1-s5 实验档位
 │   │   ├── s1_cpu_smoke.yaml
 │   │   ├── s2_7b_gpu.yaml
 │   │   ├── s3_longctx_gpu.yaml
+│   │   ├── s4_edge_eviction_gpu.yaml
+│   │   ├── s5_dense_precision_gpu.yaml
 │   │   └── model_7b_longctx.yaml
 │   ├── model_fast_dllm_7b.yaml
 │   ├── optimize_full.yaml
@@ -1015,7 +1042,7 @@ ShadowInfer/
 │   │   ├── shadowkv_agent.py
 │   │   ├── kv_cache_manager.py
 │   │   ├── packed_kv_cache.py
-│   │   ├── precision_plan.py       # Plan/Run 精度计划（v3.10.0）
+│   │   ├── precision_plan.py       # Plan/Run 精度计划 + 稠密 codes（v3.12.0）
 │   │   ├── rd_allocator.py         # 率失真预算分配/硬驱逐（v3.11.0）
 │   │   ├── decision_plane.py
 │   │   ├── importance_model.py
@@ -1104,6 +1131,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.12.0（2026-10）
+
+- **稠密精度码 KV 热路径**：新增 `map_to_codes`/`codes_to_map`/`PrecisionPlan.from_codes`；`build` 委托 `from_codes`，dict 与 codes 两条路径构造完全一致；`int8[seq, heads]` 成为 on_step 的唯一精度状态。
+- **稠密预算准入**：`admit_codes` 以稳定 argsort + 前缀和闭式求解降档与驱逐，语义与 `admit_budget` 逐项一致（含 sink/复用保护、RD 开关、驱逐计数），且不修改输入。
+- **生产接入**：`allocate_precision_codes`、`_admit_precision_codes`、`compress_kv(precision_codes=...)`；决策缓存保存准入后 codes；`dense_precision_enabled`（默认 true）可切回 v3.11 dict 路径做 A/B。
+- **缺陷修复**：`_compress_kv_with_plan` 改用连续 `torch.zeros` workspace，非连续 K/V 不再触发 stride 错误并静默回退；4 层真实管线 16/16 走 plan 路径。
+- **实测（CPU，3 次中位[min-max]）**：元数据阶段 8192×32 2443.2→135.7 ms（18.00x，复跑 18.0-19.1x）；4096×32 18.81x；2048×32 17.11x；512×32 16.67x；输出逐位一致。
+- **复现资产**：`specs/archive/AR010-dense-precision-pipeline/`（srs/design/tasks/bench/pipeline-check/server-experiment），`configs/experiments/s5_dense_precision_gpu.yaml`；792 passed / 1 skipped，覆盖率 82.99%。
 
 ### v3.11.0（2026-10）
 

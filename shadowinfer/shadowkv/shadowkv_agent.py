@@ -26,8 +26,21 @@ from shadowinfer.utils.quantization import Quantizer
 
 from .kv_cache_manager import KVCacheManager
 from .packed_kv_cache import PackedKVCache
-from .precision_plan import PRECISION_ORDER, PrecisionPlan
-from .rd_allocator import EVICTED, admit_budget, entry_bytes, kv_sensitivity
+from .precision_plan import (
+    PRECISION_CODES,
+    PRECISION_ORDER,
+    PrecisionPlan,
+    codes_to_map,
+    map_to_codes,
+)
+from .rd_allocator import (
+    EVICTED,
+    admit_budget,
+    admit_codes,
+    entry_bytes,
+    kv_sensitivity,
+    predict_codes_bytes,
+)
 
 
 class ShadowKVAgent(BaseAgent):
@@ -64,6 +77,7 @@ class ShadowKVAgent(BaseAgent):
         self.prefetch_enabled = config.get("prefetch_enabled", False)
         self.rd_allocation_enabled = bool(config.get("rd_allocation_enabled", True))
         self.hard_eviction_enabled = bool(config.get("hard_eviction_enabled", False))
+        self.dense_precision_enabled = bool(config.get("dense_precision_enabled", True))
 
         # Memory budget / eviction.
         memory_budget_mb = config.get("memory_budget_mb")
@@ -159,6 +173,7 @@ class ShadowKVAgent(BaseAgent):
         self.compression_target = self.config.get("compression_target", 0.5)
         self.rd_allocation_enabled = bool(self.config.get("rd_allocation_enabled", True))
         self.hard_eviction_enabled = bool(self.config.get("hard_eviction_enabled", False))
+        self.dense_precision_enabled = bool(self.config.get("dense_precision_enabled", True))
         self.importance_thresholds = self.config.get(
             "importance_thresholds",
             {"fp32": 0.8, "fp16": 0.5, "int8": 0.2, "int4": 0.0},
@@ -278,12 +293,22 @@ class ShadowKVAgent(BaseAgent):
         cached = self._decision_cache.get(cache_key) if fingerprint is not None else None
         step_delta = None
         new_ema: Optional[torch.Tensor] = None
+        precision_codes: Optional[torch.Tensor] = None
         if cached is not None and cached.get("fingerprint") == fingerprint:
             importance_map = cached["importance_map"]
-            # review M4：副本隔离，避免准入/调用方修改污染缓存对象
-            precision_map = {t: dict(m) for t, m in cached["precision_map"].items()}
             reuse_decision = cached["reuse_decision"]
             step_delta = cached.get("importance_drift")
+            if self.dense_precision_enabled:
+                cached_codes = cached.get("precision_codes")
+                if cached_codes is not None:
+                    precision_codes = cached_codes.clone()
+                else:
+                    # review D4：旧缓存（无 codes）仅在缺失时从 dict 反解析一次
+                    precision_map = {t: dict(m) for t, m in cached["precision_map"].items()}
+                    precision_codes = map_to_codes(precision_map, seq_len, num_heads)
+            else:
+                # review M4：副本隔离，避免准入/调用方修改污染缓存对象
+                precision_map = {t: dict(m) for t, m in cached["precision_map"].items()}
         else:
             # Step 2: 计算重要性分数（AR002 M1 向量化；AR003 T003/T004 IRAP）
             # review I3：EMA/ΔA 通过局部变量传递，不落全局单槽（异常中断不残留）
@@ -298,21 +323,34 @@ class ShadowKVAgent(BaseAgent):
                 sink_tokens=self.sink_tokens,
             )
 
-            # Step 3: 分配精度
-            precision_map = self.allocate_precision(importance_map, mode)
+            # Step 3: 分配精度（AR010：稠密 codes 路径避免逐条 dict 构建）
+            if self.dense_precision_enabled:
+                precision_codes = self.allocate_precision_codes(importance_map, mode)
+                if drift_score > 0.5:
+                    num_fp16_heads = max(1, int(num_heads * 0.2))
+                    for token_idx in range(seq_len):
+                        if token_idx < self.sink_tokens:
+                            continue
+                        top_heads = torch.topk(
+                            importance_map[token_idx], num_fp16_heads
+                        ).indices.tolist()
+                        for head_idx in top_heads:
+                            precision_codes[token_idx, head_idx] = PRECISION_CODES["fp16"]
+            else:
+                precision_map = self.allocate_precision(importance_map, mode)
 
-            # 如果 drift_score > 0.5，保留每 token top 20% head 为 FP16
-            # （review I1：sink 前缀硬保护优先，永不降档）
-            if drift_score > 0.5:
-                num_fp16_heads = max(1, int(num_heads * 0.2))
-                for token_idx in range(seq_len):
-                    if token_idx < self.sink_tokens:
-                        continue
-                    top_heads = torch.topk(
-                        importance_map[token_idx], num_fp16_heads
-                    ).indices.tolist()
-                    for head_idx in top_heads:
-                        precision_map[token_idx][head_idx] = "fp16"
+                # 如果 drift_score > 0.5，保留每 token top 20% head 为 FP16
+                # （review I1：sink 前缀硬保护优先，永不降档）
+                if drift_score > 0.5:
+                    num_fp16_heads = max(1, int(num_heads * 0.2))
+                    for token_idx in range(seq_len):
+                        if token_idx < self.sink_tokens:
+                            continue
+                        top_heads = torch.topk(
+                            importance_map[token_idx], num_fp16_heads
+                        ).indices.tolist()
+                        for head_idx in top_heads:
+                            precision_map[token_idx][head_idx] = "fp16"
 
             # Step 4: 复用决策
             reuse_decision = self._build_reuse_decision(
@@ -325,7 +363,7 @@ class ShadowKVAgent(BaseAgent):
                 importance_map,
             )
 
-            if fingerprint is not None:
+            if fingerprint is not None and not self.dense_precision_enabled:
                 # review M4：缓存副本（准入在缓存之外原地进行）
                 self._decision_cache[cache_key] = {
                     "fingerprint": fingerprint,
@@ -333,6 +371,7 @@ class ShadowKVAgent(BaseAgent):
                     "precision_map": {t: dict(m) for t, m in precision_map.items()},
                     "reuse_decision": reuse_decision,
                     "importance_drift": step_delta,
+                    "precision_codes": None,
                 }
 
         # AR003 T005：预算准入（pre-pack 降档阶梯，先于压缩）
@@ -341,9 +380,27 @@ class ShadowKVAgent(BaseAgent):
         if kv_previous is not None and isinstance(reuse_decision, dict):
             reuse_mask = reuse_decision.get("reuse_mask") or {}
             protected_reuse = {key for key, flag in reuse_mask.items() if flag}
-        precision_map = self._admit_precision_budget(
-            importance_map, precision_map, kv_current, protected=protected_reuse
-        )
+        if self.dense_precision_enabled and precision_codes is not None:
+            # 命中缓存时 codes 已是准入后状态；这里再执行一次准入以兼容
+            # 预算在两次调用之间变化的情形（预算内为 O(N) 早退，幂等）。
+            precision_codes = self._admit_precision_codes(
+                precision_codes, importance_map, kv_current, protected=protected_reuse
+            )
+            # 仅在 API 边界转换为 dict 一次（压缩/统计/对外状态共用）
+            precision_map = codes_to_map(precision_codes)
+            if fingerprint is not None:
+                self._decision_cache[cache_key] = {
+                    "fingerprint": fingerprint,
+                    "importance_map": importance_map,
+                    "precision_map": {t: dict(m) for t, m in precision_map.items()},
+                    "reuse_decision": reuse_decision,
+                    "importance_drift": step_delta,
+                    "precision_codes": precision_codes.clone(),
+                }
+        else:
+            precision_map = self._admit_precision_budget(
+                importance_map, precision_map, kv_current, protected=protected_reuse
+            )
 
         # 记录状态（AR003 T004；review I2：按 (step, layer) 幂等，pressure/契约
         # 变化导致的重放不得二次推进 EMA）
@@ -366,6 +423,7 @@ class ShadowKVAgent(BaseAgent):
             reuse_mask=reuse_decision.get("reuse_mask"),
             kv_previous=kv_previous,
             build_scale_map=False,
+            precision_codes=precision_codes,
         )
 
         # 若启用 packed cache 且有复用决策，将复用 token-head 从上一个 packed cache 复制过来
@@ -593,6 +651,71 @@ class ShadowKVAgent(BaseAgent):
             rd_allocation=self.rd_allocation_enabled,
             allow_eviction=self.hard_eviction_enabled,
             protected=protected,
+        )
+
+        if evicted:
+            self.logger.log_event(
+                "hard_eviction",
+                f"evicted {evicted} token-heads to satisfy layer budget",
+                data={"layer_budget": layer_budget, "predicted": predicted},
+            )
+        if predicted > layer_budget:
+            self.logger.log_alert(
+                "warning",
+                f"layer budget floor reached: predicted={predicted} "
+                f"layer_budget={layer_budget} (all candidates at int4)",
+            )
+        return result
+
+    def _admit_precision_codes(
+        self,
+        codes: torch.Tensor,
+        importance_map: torch.Tensor,
+        kv_current: Dict[str, torch.Tensor],
+        protected: Optional[Set[Tuple[int, int]]] = None,
+    ) -> torch.Tensor:
+        """Dense ``int8`` variant of :meth:`_admit_precision_budget` (AR010)."""
+        budget = self.cache_manager.memory_budget_bytes
+        if not budget or budget <= 0:
+            return codes
+
+        layer_budget = max(1, int(budget) // max(1, self.num_layers))
+        k_tensor = kv_current["k"]
+        v_tensor = kv_current["v"]
+        batch, _, seq_len, head_dim = k_tensor.shape
+
+        predicted = predict_codes_bytes(codes, batch, head_dim)
+        if predicted <= layer_budget:
+            return codes
+
+        try:
+            sensitivity = kv_sensitivity(k_tensor, v_tensor)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.log_alert(
+                "warning", f"kv sensitivity unavailable, falling back to importance: {exc}"
+            )
+            sensitivity = torch.ones(
+                importance_map.shape[0], importance_map.shape[1], dtype=torch.float32
+            )
+
+        protected_mask: Optional[torch.Tensor] = None
+        if protected:
+            protected_mask = torch.zeros(codes.shape[0], codes.shape[1], dtype=torch.bool)
+            for token_idx, head_idx in protected:
+                if 0 <= token_idx < codes.shape[0] and 0 <= head_idx < codes.shape[1]:
+                    protected_mask[token_idx, head_idx] = True
+
+        result, predicted, evicted = admit_codes(
+            codes,
+            importance_map,
+            sensitivity,
+            layer_budget,
+            batch=batch,
+            head_dim=head_dim,
+            sink_tokens=self.sink_tokens,
+            rd_allocation=self.rd_allocation_enabled,
+            allow_eviction=self.hard_eviction_enabled,
+            protected_mask=protected_mask,
         )
 
         if evicted:
@@ -891,6 +1014,39 @@ class ShadowKVAgent(BaseAgent):
             precision_map[token_idx] = token_map
 
         return precision_map
+
+    def allocate_precision_codes(self, importance_map: torch.Tensor, mode: str) -> torch.Tensor:
+        """Dense ``int8 [seq, heads]`` precision allocation (AR010).
+
+        Vectorized equivalent of :meth:`allocate_precision`: the returned codes
+        convert back to the identical precision map via
+        :func:`codes_to_map`.
+        """
+        mode_adjustment = {
+            "aggressive": -0.1,
+            "balanced": 0.0,
+            "conservative": 0.1,
+        }.get(mode, 0.0)
+
+        threshold_fp32 = max(0.0, 0.8 + mode_adjustment)
+        threshold_fp16 = max(0.0, 0.5 + mode_adjustment)
+        threshold_int8 = max(0.0, 0.2 + mode_adjustment)
+
+        scores = importance_map.detach().cpu().double()
+        codes = torch.where(
+            scores >= threshold_fp32,
+            torch.full_like(scores, float(PRECISION_CODES["fp32"])),
+            torch.where(
+                scores >= threshold_fp16,
+                torch.full_like(scores, float(PRECISION_CODES["fp16"])),
+                torch.where(
+                    scores >= threshold_int8,
+                    torch.full_like(scores, float(PRECISION_CODES["int8"])),
+                    torch.full_like(scores, float(PRECISION_CODES["int4"])),
+                ),
+            ),
+        )
+        return codes.to(torch.int8)
 
     def _allocate_precision_reference(
         self, importance_map: Any, mode: str
@@ -1284,6 +1440,7 @@ class ShadowKVAgent(BaseAgent):
         reuse_mask: Optional[Dict[Tuple[int, int], bool]] = None,
         kv_previous: Optional[Dict[str, torch.Tensor]] = None,
         build_scale_map: bool = True,
+        precision_codes: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         压缩 KV cache。
@@ -1328,13 +1485,20 @@ class ShadowKVAgent(BaseAgent):
         # 复用命中仅在存在上一步张量时生效（与 legacy 语义一致）。
         plan: Optional[PrecisionPlan] = None
         try:
-            plan = PrecisionPlan.build(
-                precision_map,
-                seq_len,
-                num_heads,
-                reuse_mask=effective_reuse_mask if k_prev is not None else None,
-                device=k_tensor.device,
-            )
+            if precision_codes is not None:
+                plan = PrecisionPlan.from_codes(
+                    precision_codes,
+                    reuse_mask=effective_reuse_mask if k_prev is not None else None,
+                    device=k_tensor.device,
+                )
+            else:
+                plan = PrecisionPlan.build(
+                    precision_map,
+                    seq_len,
+                    num_heads,
+                    reuse_mask=effective_reuse_mask if k_prev is not None else None,
+                    device=k_tensor.device,
+                )
             core = self._compress_kv_vectorized(
                 k_tensor,
                 v_tensor,
@@ -1549,8 +1713,8 @@ class ShadowKVAgent(BaseAgent):
                 f"tensor (seq_len={seq_len}, num_heads={num_heads})"
             )
 
-        k_out = torch.zeros_like(k_tensor)
-        v_out = torch.zeros_like(v_tensor)
+        k_out = torch.zeros(k_tensor.shape, dtype=k_tensor.dtype, device=k_tensor.device)
+        v_out = torch.zeros(v_tensor.shape, dtype=v_tensor.dtype, device=v_tensor.device)
         k_flat = k_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
         v_flat = v_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
         k_out_flat = k_out.view(batch_size, num_heads * seq_len, head_dim)

@@ -24,6 +24,49 @@ PRECISION_CODES: Dict[str, int] = {
     "int4": 3,
     EVICTED: 4,
 }
+CODE_PRECISIONS: Dict[int, str] = {code: name for name, code in PRECISION_CODES.items()}
+
+
+def map_to_codes(
+    precision_map: Dict[int, Dict[int, str]],
+    seq_len: int,
+    num_heads: int,
+    strict: bool = True,
+    device: Any = "cpu",
+) -> torch.Tensor:
+    """Convert a per-token/head precision map into an ``int8 [seq, heads]``.
+
+    Missing entries default to ``fp16``. Unsupported names raise ``ValueError``
+    when ``strict`` is true, otherwise they are normalized to ``fp16``.
+    """
+    rows: List[List[int]] = []
+    for token_idx in range(seq_len):
+        token_map = precision_map.get(token_idx, {})
+        row: List[int] = []
+        for head_idx in range(num_heads):
+            raw = token_map.get(head_idx, "fp16")
+            precision = raw.lower() if isinstance(raw, str) else raw
+            if precision not in PRECISION_CODES:
+                if strict:
+                    raise ValueError(f"Unsupported precision: {raw}")
+                precision = "fp16"
+            row.append(PRECISION_CODES[precision])
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.int8, device=device)
+
+
+def codes_to_map(codes: torch.Tensor) -> Dict[int, Dict[int, str]]:
+    """Convert ``int8 [seq, heads]`` codes back into a precision map."""
+    values = codes.detach().to("cpu").to(torch.int64).tolist()
+    precision_map: Dict[int, Dict[int, str]] = {}
+    for token_idx, row in enumerate(values):
+        token_map: Dict[int, str] = {}
+        for head_idx, code in enumerate(row):
+            if code not in CODE_PRECISIONS:
+                raise ValueError(f"Unsupported precision code: {code}")
+            token_map[head_idx] = CODE_PRECISIONS[code]
+        precision_map[token_idx] = token_map
+    return precision_map
 
 
 @dataclass(frozen=True)
@@ -64,39 +107,48 @@ class PrecisionPlan:
         Raises:
             ValueError: invalid shape or unsupported precision when ``strict``.
         """
+        codes = map_to_codes(precision_map, seq_len, num_heads, strict=strict, device=device)
+        return cls.from_codes(codes, reuse_mask=reuse_mask, device=device)
+
+    @classmethod
+    def from_codes(
+        cls,
+        codes: torch.Tensor,
+        reuse_mask: Optional[Dict[Tuple[int, int], bool]] = None,
+        device: Any = None,
+    ) -> "PrecisionPlan":
+        """Build a plan directly from dense ``int8 [seq, heads]`` codes (AR010)."""
+        if codes.dim() != 2:
+            raise ValueError(f"codes must be 2-D [seq, heads], got shape {tuple(codes.shape)}")
+        seq_len, num_heads = int(codes.shape[0]), int(codes.shape[1])
         if seq_len <= 0 or num_heads <= 0:
             raise ValueError(f"seq_len and num_heads must be positive, got {seq_len}, {num_heads}")
+        if device is None:
+            device = codes.device
+
+        codes = codes.detach().to(device=device, dtype=torch.int8).contiguous()
+        working = codes.detach().to("cpu", dtype=torch.int8).contiguous()
+        flat = working.reshape(-1).to(torch.int64)
 
         groups: Dict[str, List[Tuple[int, int]]] = {p: [] for p in PRECISION_ORDER}
+        flat_indices: Dict[str, torch.Tensor] = {}
         evicted_entries: List[Tuple[int, int]] = []
-        rows: List[List[int]] = []
-        for token_idx in range(seq_len):
-            token_map = precision_map.get(token_idx, {})
-            codes_row: List[int] = []
-            for head_idx in range(num_heads):
-                raw = token_map.get(head_idx, "fp16")
-                precision = raw.lower() if isinstance(raw, str) else raw
-                if precision == EVICTED:
-                    codes_row.append(PRECISION_CODES[EVICTED])
-                    evicted_entries.append((token_idx, head_idx))
-                    continue
-                if precision not in groups:
-                    if strict:
-                        raise ValueError(f"Unsupported precision: {raw}")
-                    precision = "fp16"
-                codes_row.append(PRECISION_CODES[precision])
-                groups[precision].append((token_idx, head_idx))
-            rows.append(codes_row)
-
-        codes = torch.tensor(rows, dtype=torch.int8, device=device)
-        flat_indices = {
-            precision: torch.tensor(
-                [head_idx * seq_len + token_idx for token_idx, head_idx in entries],
-                dtype=torch.long,
-                device=device,
-            )
-            for precision, entries in groups.items()
-        }
+        for code, precision in CODE_PRECISIONS.items():
+            selected = (flat == code).nonzero(as_tuple=False).reshape(-1)
+            if selected.numel() == 0:
+                if precision != EVICTED:
+                    flat_indices[precision] = torch.empty(0, dtype=torch.long, device=device)
+                continue
+            token_idx = torch.div(selected, num_heads, rounding_mode="floor")
+            head_idx = torch.remainder(selected, num_heads)
+            entries = list(zip(token_idx.tolist(), head_idx.tolist()))
+            if precision == EVICTED:
+                evicted_entries = entries
+            else:
+                groups[precision] = entries
+                flat_indices[precision] = (head_idx * seq_len + token_idx).to(
+                    device=device, dtype=torch.long
+                )
 
         reuse_entries: List[Tuple[int, int]] = []
         if reuse_mask:

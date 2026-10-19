@@ -1,0 +1,62 @@
+# AR010 long-context profile: dense int8 precision codes on 7B / 8K.
+# Baseline: run the same command with shadowkv.dense_precision_enabled=false.
+# Usage:
+#   python scripts/run_experiment.py \
+#     --config configs/experiments/s5_dense_precision_gpu.yaml \
+#     --model-config configs/experiments/model_7b_longctx.yaml \
+#     --backend hf --model-name <hf-model-id> \
+#     --device cuda --steps 24 --repeats 3 --out results/ar010_s5
+log_level: ERROR
+warmup_steps: 3
+latency_budget_ms: 300.0
+memory_budget_mb: 4096.0
+
+shadowkv:
+  enabled: true
+  use_packed_cache: true
+  dense_precision_enabled: true
+  rd_allocation_enabled: true
+  hard_eviction_enabled: false
+  compression_ratio: 0.2
+  irap_decay: 0.85
+  entropy_weight: 0.4
+  sink_tokens: 8
+  eviction_pressure_threshold: 0.8
+  memory_budget_mb: 4096
+  precision_levels: ["fp32", "fp16", "int8", "int4"]
+  importance_thresholds:
+    fp32: 0.75
+    fp16: 0.45
+    int8: 0.15
+    int4: 0.0
+  reuse:
+    enabled: true
+    base_threshold: 0.12
+    adaptive: true
+
+qdrift:
+  enabled: true
+  noise_schedule: cosine
+  sensitivity_temperature: 1.2
+  drift_method: relative_l2
+  positional_prior_weight: 0.3
+  use_importance_drift: true
+  importance_drift_weight: 0.3
+
+ffn:
+  enabled: true
+  mixed_precision: true
+  channel_importance_threshold: 0.7
+  sparse_update: true
+  delta_threshold: 0.05
+
+profiler:
+  accuracy_warning: 0.005
+  accuracy_critical: 0.01
+  latency_warning_ratio: 1.5
+  memory_warning_ratio: 0.9
+
+constraints:
+  max_accuracy_drop: 0.02
+  max_latency_ms: 300
+  max_memory_mb: 4096
