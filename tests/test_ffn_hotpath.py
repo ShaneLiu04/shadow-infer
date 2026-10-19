@@ -647,3 +647,21 @@ def test_ut65_pack_vectorized_speedup():
         lambda: PackedFFNWeight(weight.shape)._do_pack_reference(weight, pmap, group_size=64)
     )
     assert vec <= ref * 0.5
+
+
+def test_ut61b_pack_golden_fp32_and_unknown_precision():
+    torch.manual_seed(0)
+    weight = torch.randn(12, 20)
+    pmap = {ch: ("fp32" if ch % 2 == 0 else "bogus") for ch in range(12)}
+    vec = PackedFFNWeight.pack(weight, pmap, group_size=16)
+    ref = PackedFFNWeight(weight.shape)
+    ref._do_pack_reference(weight, pmap, group_size=16)
+    _assert_pack_data_equal(vec, ref, "fp32-unknown")
+    assert vec._data[0]["precision"] == "fp32"
+    assert vec._data[1]["precision"] == "fp16"
+    try:
+        PackedFFNWeight.pack(torch.randn(4, 4, 4), {}, group_size=16)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("3D weight must raise ValueError")

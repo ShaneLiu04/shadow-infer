@@ -5,7 +5,7 @@
 | 取证日期 | 2026-10-19 |
 | 执行设备 | CPU（Windows，torch 2.5.1 CPU-only） |
 | 性质 | 冷启动打包开销取证（微基准 + 4 步小模型 cProfile；非大型实验） |
-| 复现脚本 | `specs/changes/AR006-ffn-pack-vectorization/ar006_bench.py`（seed=42） |
+| 复现脚本 | `specs/archive/AR006-ffn-pack-vectorization/ar006_bench.py`（seed=42） |
 
 ## 1. 打包微基准（优化前，逐通道）
 

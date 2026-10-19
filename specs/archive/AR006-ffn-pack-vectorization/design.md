@@ -81,8 +81,8 @@ for precision, idx in groups:
 | 文件 | 变更 |
 |---|---|
 | `shadowinfer/ffn_optimizer/packed_weight.py` | 分组打包 + 参考实现 + 字节 helper |
-| `tests/test_ffn_hotpath.py` | UT-6.1~6.5 |
-| `tests/test_ffn_pack_perf.py`（新） | 性能用例（可选拆分） |
+| `tests/test_ffn_hotpath.py` | UT-6.1~6.5（含性能用例） |
+
 | `README.md` / `ROADMAP.md` / `pyproject.toml` / `__init__.py` | v3.8.0 |
 
 ## 5 边界与异常

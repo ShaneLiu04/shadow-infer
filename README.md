@@ -1029,7 +1029,7 @@ pytest
 
 - **Kernel 解析记忆化**：成功/失败结果均缓存 + 双检锁；不可用告警只发一次。消除热路径上每次 kernel 调用重试 `cpp_extension.load`（本机 3816 次 / 12.4s）。
 - **KV INT4 批量打包**：`PackedKVCache._pack_int4_rows` 按行批量打包，奇数行内补零；k/v 字节、`byte_offsets`、scales 与 `_do_pack_reference` 逐位一致。
-- **实测（CPU，同进程 3 次中位）**：loader 0.022x；INT4 pack 0.016x；738 passed，覆盖率 82.53%。
+- **实测（CPU，同进程 3 次中位）**：loader 0.022x；INT4 pack 0.016x；738 passed，覆盖率 82.41%。
 - **复现资产**：`specs/archive/AR005-overhead-memoization/`（srs/design/tasks/baseline-profile/bench）。
 
 ### v3.6.0（2026-10）

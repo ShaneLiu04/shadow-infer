@@ -79,6 +79,8 @@ class PackedFFNWeight:
         Returns:
             A ``PackedFFNWeight`` instance.
         """
+        if weight.dim() != 2:
+            raise ValueError(f"PackedFFNWeight.pack expects a 2D weight, got {weight.dim()}D.")
         obj = cls(weight.shape, pack_dim=pack_dim, device=weight.device)
         obj._do_pack(weight, precision_map, group_size=group_size)
         return obj
