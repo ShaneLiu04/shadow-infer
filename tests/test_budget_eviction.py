@@ -104,6 +104,9 @@ def _make_agent(mock_config, monkeypatch, budget_mb=None, matrices=None, **overr
             "use_packed_cache": True,
             "attn_is_probabilities": False,
             "sink_tokens": SINK,
+            # This suite pins the v3.10.0 importance-only semantics; AR009
+            # behavior is covered by tests/test_rd_allocator.py.
+            "rd_allocation_enabled": False,
         }
     )
     if budget_mb is not None:

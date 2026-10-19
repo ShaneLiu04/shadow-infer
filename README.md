@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.10.0 | 759 passed / 1 skipped | 82.87% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.11.0 | 772 passed / 1 skipped | 82.93% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -64,6 +64,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **推理管线常数开销消除（v3.7.0）** | Kernel 后端解析结果记忆化（成功/失败均缓存，失败不再逐次重试 `cpp_extension.load`；同进程 200 次对照 0.022x）；KV INT4 字节打包改为行批量（`_pack_int4_rows`，奇数行内补零；字节布局与参考实现逐位一致，同批 0.016x）。复现脚本见 `specs/archive/AR005-overhead-memoization/`。 |
 | **实验可复现编排（v3.9.0）** | `scripts/run_experiment.py` 一键执行真实后端 baseline/optimized 对照：固定 seed、每轮清空后端 KV cache、记录配置摘要与环境（Python/torch/设备/git SHA）、按 `--repeats` 输出 median/min/max、每次重复的 profiler 产物隔离到 `run_i/`；显式拒绝 mock 后端。内置 s1（CPU）档位，`configs/experiments/` 提供 s2（7B GPU）与 s3（8K 长上下文）模板。 |
 | **FlashInfer 式 Plan/Run 融合（v3.10.0）** | 新增 `PrecisionPlan`：一次构建精度分组/flat 索引/复用索引/SHA-256 指纹，压缩与字节打包共享；生产路径不再构造未使用的逐条目 scale dict；pack 复用压缩阶段 fp16/int8 量化结果，消除重复分组与重复量化。保留 legacy 与逐元素 reference 作 golden，异常自动回退。CPU 多规模同批中位合计 2.81-3.74x（逐位一致）。 |
+| **率失真 KV 预算分配（v3.11.0）** | `rd_allocator` 以 `attention_importance × KV 幅值敏感度` 排序（量化误差近似），替代纯重要性降档；sink 与复用条目受保护。可选硬驱逐（`hard_eviction_enabled`）在预算低于 int4 底线时按同序驱逐低价值 token-head（零字节，解包为零），保证内存上限不再被突破。真实 8 层模型 5 seed：同字节加权 KV 重建误差 1.2MB -3.94%、1.5MB -6.58%；0.9MB 持平（-0.26%）。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -108,7 +109,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`759 passed, 1 skipped`，测试覆盖率 `82.87%`（pytest-cov，fail-under 75）。
+当前主分支：`772 passed, 1 skipped`，测试覆盖率 `82.93%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -710,6 +711,29 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.11.0，2026-10-19，Windows / CPU）
+
+真实 `SimpleDiffusionLLM`（8 层/8 头/dim64/seq128，真实前向注意力与 K/V，随机初始化权重；
+5 seed 中位，`specs/archive/AR009-rd-kv-allocation/ar009_bench.py`）：
+
+| 总预算 | baseline 加权重建误差 | RD 加权重建误差 | 变化 | 实际字节 | 分配耗时（base/RD） |
+|---|---|---|---|---|---|
+| 0.9 MB | 0.011157 | 0.011128 | -0.26% | 899904 / 899904 | 88.1 / 85.9 ms |
+| 1.2 MB | 0.009997 | 0.009603 | **-3.94%** | 1199424 / 1199424 | 83.4 / 80.4 ms |
+| 1.5 MB | 0.008910 | 0.008324 | **-6.58%** | 1499904 / 1499904 | 75.5 / 83.4 ms |
+
+低于 int4 底线的预算（RD + 硬驱逐）：
+
+| 总预算 | baseline 实际字节 | 超预算 | RD+驱逐实际字节 | 是否合规 | 加权误差 | 分配耗时 |
+|---|---|---|---|---|---|---|
+| 0.3 MB | 892928 | 2.98x | 299264 | 是 | 0.7345 | 101.3 ms |
+| 0.5 MB | 892928 | 1.79x | 499712 | 是 | 0.4736 | 87.0 ms |
+| 0.7 MB | 892928 | 1.28x | 699392 | 是 | 0.2284 | 83.7 ms |
+
+说明：0.9MB 档位接近 int4 底线，RD 与纯重要性差异在噪声内，如实标注；1.2/1.5MB 档位
+RD 收益稳定。固定 inverted-pyramid 深度先验在本模型上未取得稳定收益，因此未作为默认策略。
+GPU/7B 复现协议见 `specs/archive/AR009-rd-kv-allocation/server-experiment.md`。
+
 ### 实测数据（v3.10.0，2026-10-19，Windows / CPU）
 
 同进程 5 次中位（`specs/archive/AR008-fused-kv-plan/ar008_bench.py`，seed=42），
@@ -992,6 +1016,7 @@ ShadowInfer/
 │   │   ├── kv_cache_manager.py
 │   │   ├── packed_kv_cache.py
 │   │   ├── precision_plan.py       # Plan/Run 精度计划（v3.10.0）
+│   │   ├── rd_allocator.py         # 率失真预算分配/硬驱逐（v3.11.0）
 │   │   ├── decision_plane.py
 │   │   ├── importance_model.py
 │   │   └── eviction_policy.py
@@ -1079,6 +1104,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.11.0（2026-10）
+
+- **率失真 KV 预算分配**：新增 `rd_allocator`，以 `importance × KV absmax²` 排序降档；sink/复用条目保护；`rd_allocation_enabled` 默认开启，关闭时与 v3.10.0 逐位一致。
+- **可选硬驱逐**：`hard_eviction_enabled` 在预算低于 int4 底线时驱逐低价值 token-head（`evicted`，0 字节）；`PrecisionPlan`/compress/pack/unpack/evict 全链路支持，解包为零且不复活；内存上限 100% 合规。
+- **实测（真实模型，5 seed）**：同字节加权 KV 重建误差 1.2MB -3.94%、1.5MB -6.58%；0.9MB -0.26%（噪声内）；低预算 baseline 超限 1.28-2.98x，RD+驱逐全部合规。
+- **PyramidInfer 分析**：采用 heavy-hitter 保留思想；固定深度先验实测收益 0-4% 且不稳定，未作为默认，避免无依据层偏置。
+- **复现资产**：`specs/archive/AR009-rd-kv-allocation/`（srs/design/tasks/st-cases/bench/server-experiment）；772 passed / 1 skipped，覆盖率 82.93%。
 
 ### v3.10.0（2026-10）
 

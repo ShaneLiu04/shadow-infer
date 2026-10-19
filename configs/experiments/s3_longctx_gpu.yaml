@@ -11,6 +11,8 @@ memory_budget_mb: 4096.0
 shadowkv:
   enabled: true
   use_packed_cache: true
+  rd_allocation_enabled: true
+  hard_eviction_enabled: true
   compression_ratio: 0.35
   irap_decay: 0.85
   entropy_weight: 0.4

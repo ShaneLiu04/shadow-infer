@@ -27,6 +27,7 @@ from shadowinfer.utils.quantization import Quantizer
 from .kv_cache_manager import KVCacheManager
 from .packed_kv_cache import PackedKVCache
 from .precision_plan import PRECISION_ORDER, PrecisionPlan
+from .rd_allocator import EVICTED, admit_budget, entry_bytes, kv_sensitivity
 
 
 class ShadowKVAgent(BaseAgent):
@@ -61,6 +62,8 @@ class ShadowKVAgent(BaseAgent):
         self.use_packed_cache = config.get("use_packed_cache", True)
         self.use_decision_plane = config.get("use_decision_plane", False)
         self.prefetch_enabled = config.get("prefetch_enabled", False)
+        self.rd_allocation_enabled = bool(config.get("rd_allocation_enabled", True))
+        self.hard_eviction_enabled = bool(config.get("hard_eviction_enabled", False))
 
         # Memory budget / eviction.
         memory_budget_mb = config.get("memory_budget_mb")
@@ -154,6 +157,8 @@ class ShadowKVAgent(BaseAgent):
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
+        self.rd_allocation_enabled = bool(self.config.get("rd_allocation_enabled", True))
+        self.hard_eviction_enabled = bool(self.config.get("hard_eviction_enabled", False))
         self.importance_thresholds = self.config.get(
             "importance_thresholds",
             {"fp32": 0.8, "fp16": 0.5, "int8": 0.2, "int4": 0.0},
@@ -331,7 +336,14 @@ class ShadowKVAgent(BaseAgent):
                 }
 
         # AR003 T005：预算准入（pre-pack 降档阶梯，先于压缩）
-        precision_map = self._admit_precision_budget(importance_map, precision_map, kv_current)
+        # AR009：复用条目作为保护集，避免被降档/驱逐
+        protected_reuse: Optional[Set[Tuple[int, int]]] = None
+        if kv_previous is not None and isinstance(reuse_decision, dict):
+            reuse_mask = reuse_decision.get("reuse_mask") or {}
+            protected_reuse = {key for key, flag in reuse_mask.items() if flag}
+        precision_map = self._admit_precision_budget(
+            importance_map, precision_map, kv_current, protected=protected_reuse
+        )
 
         # 记录状态（AR003 T004；review I2：按 (step, layer) 幂等，pressure/契约
         # 变化导致的重放不得二次推进 EMA）
@@ -518,19 +530,9 @@ class ShadowKVAgent(BaseAgent):
     def _entry_bytes(self, precision: str, batch: int, head_dim: int) -> float:
         """单条 token-head 的 k+v 存储字节（含 int8/int4 scale，与 packed 一致）。
 
-        INT4 分组与 ``PackedKVCache.pack`` 默认 group_size=16 对齐
-        （head_dim 不可整除时退化为 head_dim）。
+        AR009：成本模型统一由 ``rd_allocator.entry_bytes`` 提供，``evicted`` 为 0。
         """
-        if precision == "int4":
-            group = 16 if head_dim % 16 == 0 else head_dim
-            per_tensor = batch * head_dim / 2.0 + batch * (head_dim // group) * 4
-        elif precision == "int8":
-            per_tensor = batch * head_dim + batch * 4
-        elif precision == "fp32":
-            per_tensor = batch * head_dim * 4
-        else:  # fp16
-            per_tensor = batch * head_dim * 2
-        return per_tensor * 2.0
+        return entry_bytes(precision, batch, head_dim)
 
     def _estimate_precision_bytes(
         self, precision_map: Dict[int, Dict[int, str]], batch: int, seq_len: int, head_dim: int
@@ -547,12 +549,15 @@ class ShadowKVAgent(BaseAgent):
         importance_map: torch.Tensor,
         precision_map: Dict[int, Dict[int, str]],
         kv_current: Dict[str, torch.Tensor],
+        protected: Optional[Set[Tuple[int, int]]] = None,
     ) -> Dict[int, Dict[int, str]]:
-        """预算准入（AR003 T005，FR3.4）：pre-pack 降档阶梯。
+        """预算准入（AR003 T005 / AR009）：率失真排序 + 可选硬驱逐。
 
-        非 sink 条目按重要性升序逐级降档（fp32→fp16→int8→int4），直至
-        predicted_bytes ≤ layer_budget（= memory_budget_bytes // num_layers）
-        或全部触底；触底仍超时告警并保留底线档。压缩打包仅执行一次。
+        - 优先级为 ``importance × KV 幅值敏感度``（RD），可通过
+          ``rd_allocation_enabled=False`` 回退到纯重要性排序；
+        - sink 前缀与 ``protected``（复用条目）不降档、不驱逐；
+        - 降档至 int4 仍超预算且启用 ``hard_eviction_enabled`` 时，按同序
+          驱逐低价值 token-head（零字节）。
         """
         budget = self.cache_manager.memory_budget_bytes
         if not budget or budget <= 0:
@@ -560,48 +565,49 @@ class ShadowKVAgent(BaseAgent):
 
         layer_budget = max(1, int(budget) // max(1, self.num_layers))
         k_tensor = kv_current["k"]
+        v_tensor = kv_current["v"]
         batch, _, seq_len, head_dim = k_tensor.shape
+
         predicted = self._estimate_precision_bytes(precision_map, batch, seq_len, head_dim)
         if predicted <= layer_budget:
             return precision_map
 
-        scores = importance_map.detach().cpu()
-        seq = min(scores.shape[0], seq_len)
-        heads = min(scores.shape[1], self.num_heads)
-        candidates = sorted(
-            (
-                (float(scores[token_idx, head_idx]), token_idx, head_idx)
-                for token_idx in range(seq)
-                for head_idx in range(heads)
-                if token_idx >= self.sink_tokens
-            ),
-            key=lambda item: item[0],
+        try:
+            sensitivity = kv_sensitivity(k_tensor, v_tensor)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.log_alert(
+                "warning", f"kv sensitivity unavailable, falling back to importance: {exc}"
+            )
+            sensitivity = torch.ones(
+                importance_map.shape[0], importance_map.shape[1], dtype=torch.float32
+            )
+
+        result, predicted, evicted = admit_budget(
+            importance_map,
+            sensitivity,
+            precision_map,
+            layer_budget,
+            batch=batch,
+            head_dim=head_dim,
+            sink_tokens=self.sink_tokens,
+            rd_allocation=self.rd_allocation_enabled,
+            allow_eviction=self.hard_eviction_enabled,
+            protected=protected,
         )
 
-        idx = 0
-        while predicted > layer_budget and idx < len(candidates):
-            _, token_idx, head_idx = candidates[idx]
-            token_map = precision_map.setdefault(token_idx, {})
-            current = token_map.get(head_idx, "fp16")
-            next_precision = self.DOWNGRADE_LADDER.get(current)
-            if next_precision is None:
-                idx += 1
-                continue
-            freed = self._entry_bytes(current, batch, head_dim) - self._entry_bytes(
-                next_precision, batch, head_dim
+        if evicted:
+            self.logger.log_event(
+                "hard_eviction",
+                f"evicted {evicted} token-heads to satisfy layer budget",
+                data={"layer_budget": layer_budget, "predicted": predicted},
             )
-            predicted -= int(freed)
-            token_map[head_idx] = next_precision
-            if next_precision == "int4":
-                idx += 1
-
         if predicted > layer_budget:
             self.logger.log_alert(
                 "warning",
                 f"layer budget floor reached: predicted={predicted} "
-                f"layer_budget={layer_budget} (all non-sink at int4)",
+                f"layer_budget={layer_budget} (all candidates at int4)",
             )
-        return precision_map
+        return result
 
     def _consume_memory_pressure(
         self, memory_pressure: float, step_id: Optional[int] = None
@@ -1649,6 +1655,8 @@ class ShadowKVAgent(BaseAgent):
             token_precision = precision_map.get(token_idx, {})
             for head_idx in range(num_heads):
                 precision = token_precision.get(head_idx, "fp16")
+                if isinstance(precision, str) and precision.lower() == EVICTED:
+                    continue
 
                 should_reuse = False
                 if reuse_mask is not None:
@@ -1853,7 +1861,7 @@ class ShadowKVAgent(BaseAgent):
 
         total_precision_bits = 0
         total_count = 0
-        precision_bits = {"fp32": 32, "fp16": 16, "int8": 8, "int4": 4}
+        precision_bits = {"fp32": 32, "fp16": 16, "int8": 8, "int4": 4, EVICTED: 0}
         for prec, count in self._precision_distribution.items():
             total_precision_bits += precision_bits.get(prec, 16) * count
             total_count += count

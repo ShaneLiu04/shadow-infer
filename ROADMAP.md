@@ -124,6 +124,10 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       `PrecisionPlan` shared by compression and byte packing; flat gather/scatter,
       no unused per-entry scale maps, single fp16/int8 quantization, bit-identical
       legacy golden; CPU same-process 2.81-3.74x on compress+pack.
+- [x] **Rate-Distortion KV Allocation** (v3.11.0, AR009): PyramidInfer-inspired
+      heavy-hitter retention with `importance × KV absmax²` ordering; optional
+      zero-byte hard eviction for budgets below the int4 floor; real-model
+      5-seed weighted KV error -3.94% (1.2MB) / -6.58% (1.5MB) at equal bytes.
 - [ ] **Paged KV layout** (future): FlashInfer-style page table indirection for
       O(1) append/eviction; evaluated separately from the plan layer.
 

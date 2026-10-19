@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 
 import shadowinfer.kernels as _kernels
+from shadowinfer.shadowkv.rd_allocator import EVICTED
 from shadowinfer.utils.quantization import Quantizer
 
 
@@ -119,6 +120,8 @@ class PackedKVCache:
             token_map = precision_map.get(token_idx, {})
             for head_idx in range(self.num_heads):
                 precision = token_map.get(head_idx, "fp16").lower()
+                if precision == EVICTED:
+                    continue
                 if precision not in groups:
                     precision = "fp16"
                 groups[precision].append((token_idx, head_idx))
@@ -395,6 +398,8 @@ class PackedKVCache:
             token_map = precision_map.get(token_idx, {})
             for head_idx in range(self.num_heads):
                 precision = token_map.get(head_idx, "fp16").lower()
+                if precision == EVICTED:
+                    continue
                 if precision not in groups:
                     precision = "fp16"
                 groups[precision].append((token_idx, head_idx))
@@ -627,11 +632,15 @@ class PackedKVCache:
         self._do_pack(k_full, v_full, new_precision_map)
 
     def _precision_for(self, token_idx: int, head_idx: int) -> str:
-        """Return the precision string for a token-head from packed_data."""
+        """Return the precision for a token-head from packed_data.
+
+        Missing entries are treated as evicted (AR009): repacking after
+        ``evict`` must not resurrect dropped token-heads as fp16.
+        """
         for precision, data in self.packed_data.items():
             if (token_idx, head_idx) in data.get("indices", []):
                 return precision
-        return "fp16"
+        return EVICTED
 
     def apply_reuse_mask(
         self,

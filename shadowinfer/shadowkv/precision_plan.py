@@ -16,11 +16,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 PRECISION_ORDER: Tuple[str, ...] = ("fp32", "fp16", "int8", "int4")
+EVICTED = "evicted"
 PRECISION_CODES: Dict[str, int] = {
     "fp32": 0,
     "fp16": 1,
     "int8": 2,
     "int4": 3,
+    EVICTED: 4,
 }
 
 
@@ -36,6 +38,7 @@ class PrecisionPlan:
     reuse_entries: List[Tuple[int, int]]
     reuse_flat: torch.Tensor
     fingerprint: str
+    evicted_entries: List[Tuple[int, int]]
 
     @classmethod
     def build(
@@ -65,6 +68,7 @@ class PrecisionPlan:
             raise ValueError(f"seq_len and num_heads must be positive, got {seq_len}, {num_heads}")
 
         groups: Dict[str, List[Tuple[int, int]]] = {p: [] for p in PRECISION_ORDER}
+        evicted_entries: List[Tuple[int, int]] = []
         rows: List[List[int]] = []
         for token_idx in range(seq_len):
             token_map = precision_map.get(token_idx, {})
@@ -72,6 +76,10 @@ class PrecisionPlan:
             for head_idx in range(num_heads):
                 raw = token_map.get(head_idx, "fp16")
                 precision = raw.lower() if isinstance(raw, str) else raw
+                if precision == EVICTED:
+                    codes_row.append(PRECISION_CODES[EVICTED])
+                    evicted_entries.append((token_idx, head_idx))
+                    continue
                 if precision not in groups:
                     if strict:
                         raise ValueError(f"Unsupported precision: {raw}")
@@ -113,6 +121,7 @@ class PrecisionPlan:
             reuse_entries=reuse_entries,
             reuse_flat=reuse_flat,
             fingerprint=fingerprint,
+            evicted_entries=evicted_entries,
         )
 
     @staticmethod
