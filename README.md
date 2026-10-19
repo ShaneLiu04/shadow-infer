@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.8.0 | 743 passed / 1 skipped | 82.53% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.9.0 | 751 passed / 1 skipped | 82.48% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -62,6 +62,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **真实性能记账** | latency.e2e_ms / per_step_ms 真实测量（内部计时与外部墙钟对照偏差 0.02%），KV memory 按真实节省字节记账。 |
 | **FFN 打包向量化（v3.8.0）** | `PackedFFNWeight._do_pack` 按精度分组批量 gather/量化/字节打包；逐通道存储布局、scale、内存计账与指纹与参考实现逐位一致（含奇数长度、pack_dim 0/1）；同批 0.072x（8.41ms vs 116.56ms @1024×256）。复现脚本见 `specs/archive/AR006-ffn-pack-vectorization/`。 |
 | **推理管线常数开销消除（v3.7.0）** | Kernel 后端解析结果记忆化（成功/失败均缓存，失败不再逐次重试 `cpp_extension.load`；同进程 200 次对照 0.022x）；KV INT4 字节打包改为行批量（`_pack_int4_rows`，奇数行内补零；字节布局与参考实现逐位一致，同批 0.016x）。复现脚本见 `specs/archive/AR005-overhead-memoization/`。 |
+| **实验可复现编排（v3.9.0）** | `scripts/run_experiment.py` 一键执行真实后端 baseline/optimized 对照：固定 seed、每轮清空后端 KV cache、记录配置摘要与环境（Python/torch/设备/git SHA）、按 `--repeats` 输出 median/min/max、每次重复的 profiler 产物隔离到 `run_i/`；显式拒绝 mock 后端。内置 s1（CPU）档位，`configs/experiments/` 提供 s2（7B GPU）与 s3（8K 长上下文）模板。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -106,7 +107,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`743 passed, 1 skipped`，测试覆盖率 `82.53%`（pytest-cov，fail-under 75）。
+当前主分支：`751 passed, 1 skipped`，测试覆盖率 `82.48%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -128,6 +129,25 @@ print(f"Memory savings:    {result['memory_savings_ratio']:.1%}")
 print(f"Accuracy drop:     {result['accuracy_drop']:.4f}")
 print(f"Report:            {result['comparison_path']}")
 ```
+
+### 可复现实验（v3.9.0）
+
+```bash
+# CPU 冒烟档位：6 步 x 3 次重复，真实 PyTorch 后端
+python scripts/run_experiment.py --profile s1 --steps 6 --repeats 3 --device cpu --out results/s1
+
+# 仅校验配置与摘要，不执行模型
+python scripts/run_experiment.py --profile s1 --dry-run
+
+# 服务器：7B GPU / 8K 长上下文（需 transformers 与本地或可下载权重）
+python scripts/run_experiment.py --config configs/experiments/s2_7b_gpu.yaml \
+    --model-config configs/model_fast_dllm_7b.yaml \
+    --backend hf --model-name <hf-model-id> --device cuda --steps 32 --repeats 3
+```
+
+产物：`result.json`（环境、配置摘要、每次运行原始数据、median/min/max）与 `summary.md`；
+`run_i/` 内含该轮的 `profile_baseline.json` / `profile_optimized.json` / `profile_comparison.html`。
+`mock` 与 `auto` 后端会被拒绝，避免非真实数据进入结论。
 
 ### 单 Agent 使用示例
 
@@ -490,6 +510,9 @@ python -m shadowinfer benchmark \
     --backend pytorch \
     --device cpu \
     --num-steps 20
+
+# 可复现 baseline/optimized 对照（v3.9.0，固定 seed + 环境取证 + 多次重复）
+python scripts/run_experiment.py --profile s1 --steps 6 --repeats 3 --device cpu --out results/s1
 ```
 
 ---
@@ -686,6 +709,21 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.9.0，2026-10-19，Windows / CPU）
+
+可复现编排冒烟档位 s1（真实 `PyTorchModelBackend`，6 步 × 3 次重复，seed=42，
+`results/ar007_s1/result.json`）：
+
+| 指标 | 中位 | 区间（min-max） |
+|------|------|-----------------|
+| Baseline e2e | 41.89 ms | 39.70-46.91 ms |
+| Optimized e2e | 1029.81 ms | 1016.80-1060.44 ms |
+| Speedup | 0.041x | 0.039-0.044x |
+| KV 内存 | 1.75 MB → 1.65 MB（压缩比 1.061x） | — |
+
+该档位用于验证编排、随机性控制与产物隔离，不作为优化收益声称：CPU 上优化管线的调度/压缩开销
+真实存在。收益判定请使用 s2/s3 在服务器上按同配置、同 seed、3 次重复执行。
+
 ### 实测数据（v3.8.0，2026-10-19，Windows / CPU fallback）
 
 同进程同批对照（`specs/archive/AR006-ffn-pack-vectorization/ar006_bench.py`，seed=42，3 次中位）：
@@ -712,7 +750,7 @@ python -m shadowinfer optimize \
 
 根因取证（6 步管线 cProfile，7B 形状）：`_load_cuda_extensions` 被调用 3816 次、累计 12.38 s（占总 27.63 s 的 44.8%），因加载失败结果未被缓存而逐次重试。
 
-**质量**：738 passed / 1 skipped；覆盖率 82.53%；black / isort / flake8 / mypy 全绿。
+**质量**：738 passed / 1 skipped；覆盖率 82.41%；black / isort / flake8 / mypy 全绿。
 说明：以上为 CPU 微基准；GPU 服务器可按脚本复核（安装 CUDA 扩展后字节布局须与 CPU 一致）。
 
 ### 实测数据（v3.6.0，2026-10-18，Windows / CPU fallback）
@@ -902,8 +940,14 @@ ShadowInfer/
 ├── requirements.txt                # 依赖列表
 ├── requirements-lock.txt           # 锁定依赖
 ├── scripts/
-│   └── run.py                      # CLI 入口脚本
+│   ├── run.py                      # CLI 入口脚本
+│   └── run_experiment.py           # 可复现实验编排（v3.9.0）
 ├── configs/                        # 配置示例
+│   ├── experiments/                # s1/s2/s3 实验档位
+│   │   ├── s1_cpu_smoke.yaml
+│   │   ├── s2_7b_gpu.yaml
+│   │   ├── s3_longctx_gpu.yaml
+│   │   └── model_7b_longctx.yaml
 │   ├── model_fast_dllm_7b.yaml
 │   ├── optimize_full.yaml
 │   ├── policy_default.yaml
@@ -1017,6 +1061,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.9.0（2026-10）
+
+- **实验可复现编排**：新增 `scripts/run_experiment.py`，真实后端 baseline/optimized 一键对照；固定 seed、每轮清空后端 KV cache、配置 SHA-256、环境与 git SHA 取证、`--repeats` 输出 median/min/max。
+- **产物隔离**：Profiler 的 baseline/optimized/comparison 全部写入 `run_i/`，修复跨轮 KV cache 状态泄漏（baseline 口径漂移）。
+- **规模档位**：s1 CPU 冒烟内置；`configs/experiments/` 提供 s2（7B GPU）与 s3（8K 长上下文 + 4GB）模板；模型模板支持嵌套结构自动展平；显式拒绝 mock/auto 后端。
+- **实测（CPU，6 步 × 3 次）**：baseline 41.89 ms（39.70-46.91），optimized 1029.81 ms（1016.80-1060.44），KV 1.75→1.65 MB；该档位不作收益声称。751 passed / 1 skipped，覆盖率 82.48%。
+- **复现资产**：`specs/archive/AR007-experiment-reproducibility/`（srs/design/tasks/st-cases）。
 
 ### v3.8.0（2026-10）
 

@@ -1,0 +1,22 @@
+# AR007 profile s3 long-context model template (8K sequence).
+model:
+  name: "shadowinfer-longctx-7b"
+  type: "diffusion_llm"
+
+architecture:
+  num_layers: 32
+  hidden_dim: 4096
+  num_heads: 32
+  head_dim: 128
+  intermediate_dim: 11008
+  vocab_size: 32000
+  max_seq_len: 8192
+  seq_len: 8192
+
+diffusion:
+  num_steps: 24
+  noise_schedule: "cosine"
+
+profiling:
+  warmup_steps: 3
+  profile_steps: 24

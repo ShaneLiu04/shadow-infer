@@ -1,0 +1,40 @@
+# AR007 profile s1: CPU smoke scale (fast, deterministic, no external weights).
+# Real PyTorch backend (SimpleDiffusionLLM); no mock.
+log_level: ERROR
+warmup_steps: 1
+latency_budget_ms: 500.0
+memory_budget_mb: 2048.0
+
+shadowkv:
+  enabled: true
+  irap_decay: 0.9
+  entropy_weight: 0.3
+  sink_tokens: 4
+  precision_levels: ["fp32", "fp16", "int8", "int4"]
+  importance_thresholds:
+    fp32: 0.8
+    fp16: 0.5
+    int8: 0.2
+    int4: 0.0
+  reuse:
+    enabled: true
+    base_threshold: 0.15
+    adaptive: true
+
+qdrift:
+  enabled: true
+  noise_schedule: cosine
+  sensitivity_temperature: 1.0
+  drift_method: relative_l2
+  positional_prior_weight: 0.3
+
+ffn:
+  enabled: true
+  mixed_precision: true
+  channel_importance_threshold: 0.7
+  sparse_update: true
+  delta_threshold: 0.05
+
+profiler:
+  latency_warning_ratio: 1.5
+  memory_warning_ratio: 0.9

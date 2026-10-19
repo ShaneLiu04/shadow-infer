@@ -154,6 +154,10 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] **Real Model Smoke Tests**: Run end-to-end tests with `SimpleDiffusionLLM` in CI.
 - [ ] **Real Model Smoke Tests**: Run end-to-end tests with a publicly available Diffusion LLM in CI.
 - [x] **Performance Regression Tests**: Track latency/memory/accuracy across PRs via `RegressionTracker` and `shadowinfer benchmark`.
+- [x] **Reproducible Experiment Harness** (v3.9.0, AR007): one-command real-backend
+      baseline/optimized runs with fixed seed, per-repeat KV reset, config/environment
+      digests, median/min/max summaries, isolated `run_i/` artifacts, and s1/s2/s3
+      scale profiles; mock backends are rejected.
 - **Property-Based Testing**: Use Hypothesis for quantization and metrics fuzzing.
 
 ### 3.9 Distributed Inference
