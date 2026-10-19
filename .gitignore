@@ -59,6 +59,8 @@ Thumbs.db
 models/
 !shadowinfer/models/
 !shadowinfer/models/**
+shadowinfer/models/__pycache__/
+*.pyc
 checkpoints/
 *.safetensors
 *.bin
