@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.9.0 | 751 passed / 1 skipped | 82.48% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.10.0 | 759 passed / 1 skipped | 82.87% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -63,6 +63,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **FFN 打包向量化（v3.8.0）** | `PackedFFNWeight._do_pack` 按精度分组批量 gather/量化/字节打包；逐通道存储布局、scale、内存计账与指纹与参考实现逐位一致（含奇数长度、pack_dim 0/1）；同批 0.072x（8.41ms vs 116.56ms @1024×256）。复现脚本见 `specs/archive/AR006-ffn-pack-vectorization/`。 |
 | **推理管线常数开销消除（v3.7.0）** | Kernel 后端解析结果记忆化（成功/失败均缓存，失败不再逐次重试 `cpp_extension.load`；同进程 200 次对照 0.022x）；KV INT4 字节打包改为行批量（`_pack_int4_rows`，奇数行内补零；字节布局与参考实现逐位一致，同批 0.016x）。复现脚本见 `specs/archive/AR005-overhead-memoization/`。 |
 | **实验可复现编排（v3.9.0）** | `scripts/run_experiment.py` 一键执行真实后端 baseline/optimized 对照：固定 seed、每轮清空后端 KV cache、记录配置摘要与环境（Python/torch/设备/git SHA）、按 `--repeats` 输出 median/min/max、每次重复的 profiler 产物隔离到 `run_i/`；显式拒绝 mock 后端。内置 s1（CPU）档位，`configs/experiments/` 提供 s2（7B GPU）与 s3（8K 长上下文）模板。 |
+| **FlashInfer 式 Plan/Run 融合（v3.10.0）** | 新增 `PrecisionPlan`：一次构建精度分组/flat 索引/复用索引/SHA-256 指纹，压缩与字节打包共享；生产路径不再构造未使用的逐条目 scale dict；pack 复用压缩阶段 fp16/int8 量化结果，消除重复分组与重复量化。保留 legacy 与逐元素 reference 作 golden，异常自动回退。CPU 多规模同批中位合计 2.81-3.74x（逐位一致）。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -107,7 +108,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`751 passed, 1 skipped`，测试覆盖率 `82.48%`（pytest-cov，fail-under 75）。
+当前主分支：`759 passed, 1 skipped`，测试覆盖率 `82.87%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -709,6 +710,22 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.10.0，2026-10-19，Windows / CPU）
+
+同进程 5 次中位（`specs/archive/AR008-fused-kv-plan/ar008_bench.py`，seed=42），
+fused（plan 共享）与 legacy 的 k/v 与 packed 数据逐位一致：
+
+| 形状（seq×heads×dim） | compress legacy→plan | pack legacy→plan | 合计 legacy→fused | 比值 |
+|---|---|---|---|---|
+| 256×8×64 | 8.43→2.51 ms | 3.72→0.75 ms | 14.66→4.22 ms | 3.48x |
+| 512×8×64 | 20.60→2.68 ms | 3.91→1.11 ms | 26.23→9.33 ms | 2.81x |
+| 1024×8×64 | 43.15→3.77 ms | 7.73→1.41 ms | 47.26→12.65 ms | 3.74x |
+| 512×16×128 | 39.47→5.63 ms | 9.86→1.71 ms | 53.98→15.54 ms | 3.47x |
+
+收益主要来自消除逐条目 scale dict 构造、重复精度分组与重复 gather；int4 打包仍按
+`PackedKVCache` 自己的 group size 重新量化以保证字节布局不变。GPU/7B 复现协议见
+`specs/archive/AR008-fused-kv-plan/server-experiment.md`（本机不宣称端到端收益）。
+
 ### 实测数据（v3.9.0，2026-10-19，Windows / CPU）
 
 可复现编排冒烟档位 s1（真实 `PyTorchModelBackend`，6 步 × 3 次重复，seed=42，
@@ -974,6 +991,7 @@ ShadowInfer/
 │   │   ├── shadowkv_agent.py
 │   │   ├── kv_cache_manager.py
 │   │   ├── packed_kv_cache.py
+│   │   ├── precision_plan.py       # Plan/Run 精度计划（v3.10.0）
 │   │   ├── decision_plane.py
 │   │   ├── importance_model.py
 │   │   └── eviction_policy.py
@@ -1061,6 +1079,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.10.0（2026-10）
+
+- **FlashInfer 式 Plan/Run 融合**：`PrecisionPlan` 一次构建精度码/分组/flat 索引/复用索引/SHA-256 指纹，`compress_kv` 与 `PackedKVCache.pack` 共享；生产路径跳过未使用的 scale dict，pack 复用 fp16/int8 量化结果。
+- **正确性**：legacy 与逐元素 reference 保留为 golden；k/v、`scale_*`、`packed_data`、`byte_offsets`、`memory_bytes` 逐位一致（含 batch=2、奇数 head_dim int4、复用掩码）。
+- **实测（CPU，5 次中位）**：compress+pack 512×8×64 26.23→9.33 ms（2.81x）；1024×8×64 47.26→12.65 ms（3.74x）；512×16×128 53.98→15.54 ms（3.47x）。
+- **复现资产**：`specs/archive/AR008-fused-kv-plan/`（srs/design/tasks/st-cases/bench/server-experiment）；759 passed / 1 skipped，覆盖率 82.87%。
+- **服务器实验**：`scripts/run_experiment.py` + `configs/experiments/s2_7b_gpu.yaml` / `s3_longctx_gpu.yaml`，按 `server-experiment.md` 回填。
 
 ### v3.9.0（2026-10）
 

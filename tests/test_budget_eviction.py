@@ -150,9 +150,9 @@ def _count_pack_calls(monkeypatch):
     calls = []
     original = PackedKVCache.pack
 
-    def counting_pack(k_tensor, v_tensor, precision_map, group_size=16):
+    def counting_pack(k_tensor, v_tensor, precision_map, group_size=16, **kwargs):
         calls.append((tuple(k_tensor.shape), tuple(sorted(precision_map))))
-        return original(k_tensor, v_tensor, precision_map, group_size=group_size)
+        return original(k_tensor, v_tensor, precision_map, group_size=group_size, **kwargs)
 
     monkeypatch.setattr(PackedKVCache, "pack", staticmethod(counting_pack))
     return calls

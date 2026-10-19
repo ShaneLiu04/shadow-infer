@@ -10,7 +10,7 @@ memory savings. Supports mixed precision per token/head:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -46,6 +46,8 @@ class PackedKVCache:
         v_tensor: torch.Tensor,
         precision_map: Dict[int, Dict[int, str]],
         group_size: int = 16,
+        plan: Any = None,
+        precomputed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Pack K/V tensors into byte-level storage.
 
@@ -55,13 +57,23 @@ class PackedKVCache:
             precision_map: token_idx -> head_idx -> precision
             group_size: INT4 quantization group size. Defaults to 16 to keep
                 roundtrip error well below the 1e-1 requirement.
+            plan: optional ``PrecisionPlan`` (AR008) to reuse grouping indices.
+            precomputed: optional per-precision quantized/gathered tensors from
+                the compression stage (AR008) to avoid duplicate quantization.
 
         Returns:
             Dict with keys: packed_kv, memory_bytes, memory_mb
         """
         batch_size, num_heads, seq_len, head_dim = k_tensor.shape
         cache = cls(batch_size, num_heads, seq_len, head_dim, device=k_tensor.device)
-        cache._do_pack(k_tensor, v_tensor, precision_map, group_size=group_size)
+        cache._do_pack(
+            k_tensor,
+            v_tensor,
+            precision_map,
+            group_size=group_size,
+            plan=plan,
+            precomputed=precomputed,
+        )
         return {
             "packed_kv": cache,
             "memory_bytes": cache.memory_bytes(),
@@ -74,6 +86,8 @@ class PackedKVCache:
         v_tensor: torch.Tensor,
         precision_map: Dict[int, Dict[int, str]],
         group_size: int = 64,
+        plan: Any = None,
+        precomputed: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Vectorized packing core (AR002 M1).
@@ -83,7 +97,15 @@ class PackedKVCache:
         instead of per-entry slicing. The int4 scale layout ``(n*batch, g, 1)``
         is preserved bit-for-bit (including its known batch>1 indexing defect
         in ``unpack``, kept for compatibility).
+
+        AR008: when ``plan`` is supplied, grouping/flat indices are reused and
+        ``precomputed`` (if present) supplies the tensors already produced by
+        the compression stage.
         """
+        if plan is not None:
+            self._do_pack_with_plan(k_tensor, v_tensor, plan, group_size, precomputed=precomputed)
+            return
+
         self.packed_data = {}
         total_bytes = 0
 
@@ -158,6 +180,141 @@ class PackedKVCache:
                 # AR005: batched INT4 byte packing (bit-identical to the
                 # per-entry loop in ``_do_pack_reference``). Rows are padded
                 # independently when the flattened row length is odd.
+                k_rows, k_row_bytes = self._pack_int4_rows(qk_all)
+                v_rows, v_row_bytes = self._pack_int4_rows(qv_all)
+                k_stacked_packed = k_rows.reshape(-1)
+                v_stacked_packed = v_rows.reshape(-1)
+
+                byte_offsets: List[Tuple[int, int, int, int]] = []
+                for n in range(len(indices)):
+                    byte_offsets.append(
+                        (
+                            n * k_row_bytes,
+                            (n + 1) * k_row_bytes,
+                            n * v_row_bytes,
+                            (n + 1) * v_row_bytes,
+                        )
+                    )
+                scale_k = scale_k_all.reshape(-1, num_groups, 1)
+                scale_v = scale_v_all.reshape(-1, num_groups, 1)
+
+                total_bytes += k_stacked_packed.numel() * k_stacked_packed.element_size()
+                total_bytes += v_stacked_packed.numel() * v_stacked_packed.element_size()
+                total_bytes += scale_k.numel() * scale_k.element_size()
+                total_bytes += scale_v.numel() * scale_v.element_size()
+
+                self.packed_data[precision] = {
+                    "k": k_stacked_packed,
+                    "v": v_stacked_packed,
+                    "scale_k": scale_k,
+                    "scale_v": scale_v,
+                    "indices": indices,
+                    "byte_offsets": byte_offsets,
+                    "group_size": effective_group_size,
+                    "num_groups": num_groups,
+                }
+
+        self._memory_bytes = total_bytes
+
+    def _do_pack_with_plan(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        plan: Any,
+        group_size: int,
+        precomputed: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Plan-driven packing (AR008).
+
+        Reuses ``plan.groups`` / ``plan.flat_indices`` instead of rebuilding
+        the precision grouping. When ``precomputed`` is supplied, fp32/fp16 and
+        int8 groups skip re-quantization (identical inputs/quantizer); int4
+        still quantizes with the pack-specific group size because the
+        compression working copy may use a different group size.
+        """
+        batch_size, num_heads, seq_len, head_dim = k_tensor.shape
+        if plan.seq_len != seq_len or plan.num_heads != num_heads:
+            raise ValueError(
+                "PrecisionPlan shape mismatch: plan "
+                f"(seq_len={plan.seq_len}, num_heads={plan.num_heads}) vs "
+                f"tensor (seq_len={seq_len}, num_heads={num_heads})"
+            )
+        if v_tensor.shape != k_tensor.shape:
+            raise ValueError("k_tensor and v_tensor must have identical shapes")
+        if plan.codes.device.type != k_tensor.device.type:
+            raise ValueError(
+                f"PrecisionPlan device ({plan.codes.device}) does not match "
+                f"KV device ({k_tensor.device})"
+            )
+
+        self.packed_data = {}
+        total_bytes = 0
+        k_flat = k_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
+        v_flat = v_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
+
+        for precision, entries in plan.groups.items():
+            if not entries:
+                continue
+            indices = list(entries)
+            flat = plan.flat_indices[precision]
+            pre = precomputed.get(precision) if precomputed else None
+
+            if precision in ("fp32", "fp16"):
+                dtype = torch.float32 if precision == "fp32" else torch.float16
+                if pre is not None:
+                    k_stacked = pre["qk"]
+                    v_stacked = pre["qv"]
+                else:
+                    k_stacked = k_flat.index_select(1, flat).permute(1, 0, 2).to(dtype)
+                    v_stacked = v_flat.index_select(1, flat).permute(1, 0, 2).to(dtype)
+                total_bytes += k_stacked.numel() * k_stacked.element_size()
+                total_bytes += v_stacked.numel() * v_stacked.element_size()
+                self.packed_data[precision] = {
+                    "k": k_stacked,
+                    "v": v_stacked,
+                    "scale_k": None,
+                    "scale_v": None,
+                    "indices": indices,
+                }
+
+            elif precision == "int8":
+                if pre is not None:
+                    qk = pre["qk"]
+                    qv = pre["qv"]
+                    scale_k = pre["scale_k"]
+                    scale_v = pre["scale_v"]
+                else:
+                    k_stacked = k_flat.index_select(1, flat).permute(1, 0, 2)
+                    v_stacked = v_flat.index_select(1, flat).permute(1, 0, 2)
+                    qk, scale_k = Quantizer.quantize_int8(k_stacked)
+                    qv, scale_v = Quantizer.quantize_int8(v_stacked)
+                total_bytes += qk.numel() * qk.element_size()
+                total_bytes += qv.numel() * qv.element_size()
+                total_bytes += scale_k.numel() * scale_k.element_size()
+                total_bytes += scale_v.numel() * scale_v.element_size()
+                self.packed_data[precision] = {
+                    "k": qk,
+                    "v": qv,
+                    "scale_k": scale_k,
+                    "scale_v": scale_v,
+                    "indices": indices,
+                }
+
+            else:
+                effective_group_size = group_size if head_dim % group_size == 0 else head_dim
+                num_groups = head_dim // effective_group_size
+                if pre is not None:
+                    k_stacked = pre["k_group"]
+                    v_stacked = pre["v_group"]
+                else:
+                    k_stacked = k_flat.index_select(1, flat).permute(1, 0, 2)
+                    v_stacked = v_flat.index_select(1, flat).permute(1, 0, 2)
+                qk_all, scale_k_all = Quantizer.quantize_int4(
+                    k_stacked, group_size=effective_group_size
+                )
+                qv_all, scale_v_all = Quantizer.quantize_int4(
+                    v_stacked, group_size=effective_group_size
+                )
                 k_rows, k_row_bytes = self._pack_int4_rows(qk_all)
                 v_rows, v_row_bytes = self._pack_int4_rows(qv_all)
                 k_stacked_packed = k_rows.reshape(-1)

@@ -26,6 +26,7 @@ from shadowinfer.utils.quantization import Quantizer
 
 from .kv_cache_manager import KVCacheManager
 from .packed_kv_cache import PackedKVCache
+from .precision_plan import PRECISION_ORDER, PrecisionPlan
 
 
 class ShadowKVAgent(BaseAgent):
@@ -352,6 +353,7 @@ class ShadowKVAgent(BaseAgent):
             reuse_decision=reuse_decision,
             reuse_mask=reuse_decision.get("reuse_mask"),
             kv_previous=kv_previous,
+            build_scale_map=False,
         )
 
         # 若启用 packed cache 且有复用决策，将复用 token-head 从上一个 packed cache 复制过来
@@ -1275,6 +1277,7 @@ class ShadowKVAgent(BaseAgent):
         reuse_decision: Optional[Dict[str, Any]] = None,
         reuse_mask: Optional[Dict[Tuple[int, int], bool]] = None,
         kv_previous: Optional[Dict[str, torch.Tensor]] = None,
+        build_scale_map: bool = True,
     ) -> Dict[str, Any]:
         """
         压缩 KV cache。
@@ -1315,16 +1318,33 @@ class ShadowKVAgent(BaseAgent):
         k_prev = kv_previous["k"] if kv_previous is not None else None
         v_prev = kv_previous["v"] if kv_previous is not None else None
 
-        # 热路径核心（AR002 M1）：向量化主路径，异常时回退 reference
+        # AR008：plan/run 分离——一次构建，compress 与 pack 共享。
+        # 复用命中仅在存在上一步张量时生效（与 legacy 语义一致）。
+        plan: Optional[PrecisionPlan] = None
         try:
+            plan = PrecisionPlan.build(
+                precision_map,
+                seq_len,
+                num_heads,
+                reuse_mask=effective_reuse_mask if k_prev is not None else None,
+                device=k_tensor.device,
+            )
             core = self._compress_kv_vectorized(
-                k_tensor, v_tensor, k_prev, v_prev, precision_map, effective_reuse_mask
+                k_tensor,
+                v_tensor,
+                k_prev,
+                v_prev,
+                precision_map,
+                effective_reuse_mask,
+                plan=plan,
+                build_scale_map=build_scale_map,
             )
         except Exception as exc:
             self.logger.log_alert(
                 "error",
                 f"vectorized compress_kv failed, falling back to reference: {exc}",
             )
+            plan = None
             core = self._compress_kv_reference(
                 k_tensor, v_tensor, k_prev, v_prev, precision_map, effective_reuse_mask
             )
@@ -1347,7 +1367,13 @@ class ShadowKVAgent(BaseAgent):
         }
 
         if self.use_packed_cache:
-            packed_result = PackedKVCache.pack(k_tensor, v_tensor, precision_map)
+            packed_result = PackedKVCache.pack(
+                k_tensor,
+                v_tensor,
+                precision_map,
+                plan=plan,
+                precomputed=core.get("group_payload"),
+            )
             compressed_bytes = packed_result["memory_bytes"]
             compression_ratio = (
                 1.0 - compressed_bytes / original_bytes if original_bytes > 0 else 0.0
@@ -1384,6 +1410,8 @@ class ShadowKVAgent(BaseAgent):
         v_prev: Optional[torch.Tensor],
         precision_map: Dict[int, Dict[int, str]],
         reuse_mask: Optional[Dict[Tuple[int, int], bool]],
+        plan: Optional[PrecisionPlan] = None,
+        build_scale_map: bool = True,
     ) -> Dict[str, Any]:
         """
         向量化压缩核心（AR002 M1）。
@@ -1399,6 +1427,11 @@ class ShadowKVAgent(BaseAgent):
         本路径统一 reshape(N, batch, head_dim) 写回，在 reference 可用的
         包络内 bitwise 一致，其余情形按语义意图产出。
         """
+        if plan is not None:
+            return self._compress_kv_with_plan(
+                k_tensor, v_tensor, k_prev, v_prev, plan, build_scale_map
+            )
+
         batch_size, num_heads, seq_len, head_dim = k_tensor.shape
         k_out = torch.zeros_like(k_tensor)
         v_out = torch.zeros_like(v_tensor)
@@ -1479,6 +1512,119 @@ class ShadowKVAgent(BaseAgent):
             "v": v_out,
             "scale_k_map": scale_k_map,
             "scale_v_map": scale_v_map,
+        }
+
+    def _compress_kv_with_plan(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_prev: Optional[torch.Tensor],
+        v_prev: Optional[torch.Tensor],
+        plan: PrecisionPlan,
+        build_scale_map: bool,
+    ) -> Dict[str, Any]:
+        """Plan-driven compression (AR008).
+
+        Equivalent to the legacy grouped path: reuse entries are copied from
+        the previous step, all other entries are quantized per precision using
+        flat gather/scatter indices. The plan is shared with ``PackedKVCache``
+        through ``group_payload`` so packing does not rebuild groups or repeat
+        the int8/fp quantization.
+        """
+        batch_size, num_heads, seq_len, head_dim = k_tensor.shape
+        if (
+            plan.seq_len != seq_len
+            or plan.num_heads != num_heads
+            or v_tensor.shape != k_tensor.shape
+        ):
+            raise ValueError(
+                "PrecisionPlan shape mismatch: plan "
+                f"(seq_len={plan.seq_len}, num_heads={plan.num_heads}) vs "
+                f"tensor (seq_len={seq_len}, num_heads={num_heads})"
+            )
+
+        k_out = torch.zeros_like(k_tensor)
+        v_out = torch.zeros_like(v_tensor)
+        k_flat = k_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
+        v_flat = v_tensor.reshape(batch_size, num_heads * seq_len, head_dim)
+        k_out_flat = k_out.view(batch_size, num_heads * seq_len, head_dim)
+        v_out_flat = v_out.view(batch_size, num_heads * seq_len, head_dim)
+
+        reuse_active = k_prev is not None and plan.reuse_flat.numel() > 0
+        if reuse_active and v_prev is None:
+            raise ValueError("v_prev is required when reuse entries are active")
+        if reuse_active and (k_prev.shape != k_tensor.shape or v_prev.shape != v_tensor.shape):
+            raise ValueError("previous KV tensors must match the current KV shape")
+        if plan.codes.device.type != k_tensor.device.type:
+            raise ValueError(
+                f"PrecisionPlan device ({plan.codes.device}) does not match "
+                f"KV device ({k_tensor.device})"
+            )
+        reuse_set = plan.reuse_set() if reuse_active else set()
+
+        int4_group = 64 if head_dim % 64 == 0 else head_dim
+        scale_k_map: Optional[Dict[Tuple[int, int], Optional[torch.Tensor]]] = (
+            {} if build_scale_map else None
+        )
+        scale_v_map: Optional[Dict[Tuple[int, int], Optional[torch.Tensor]]] = (
+            {} if build_scale_map else None
+        )
+        payload: Dict[str, Dict[str, Any]] = {}
+
+        for precision in PRECISION_ORDER:
+            entries = plan.groups.get(precision, [])
+            if not entries:
+                continue
+            flat = plan.flat_indices[precision]
+            k_group = k_flat.index_select(1, flat).permute(1, 0, 2)
+            v_group = v_flat.index_select(1, flat).permute(1, 0, 2)
+
+            if precision in ("fp32", "fp16"):
+                qk = k_group if precision == "fp32" else k_group.half()
+                qv = v_group if precision == "fp32" else v_group.half()
+                sk = sv = None
+            elif precision == "int8":
+                qk, sk = Quantizer.quantize_int8(k_group)
+                qv, sv = Quantizer.quantize_int8(v_group)
+            else:
+                qk, sk = Quantizer.quantize_int4(k_group, group_size=int4_group)
+                qv, sv = Quantizer.quantize_int4(v_group, group_size=int4_group)
+                qk = qk.reshape(qk.shape[0], batch_size, head_dim)
+                qv = qv.reshape(qv.shape[0], batch_size, head_dim)
+
+            k_out_flat.index_copy_(1, flat, qk.permute(1, 0, 2).to(k_out.dtype).contiguous())
+            v_out_flat.index_copy_(1, flat, qv.permute(1, 0, 2).to(v_out.dtype).contiguous())
+
+            payload[precision] = {
+                "k_group": k_group,
+                "v_group": v_group,
+                "qk": qk,
+                "qv": qv,
+                "scale_k": sk,
+                "scale_v": sv,
+            }
+
+            if build_scale_map:
+                for index, entry in enumerate(entries):
+                    if entry in reuse_set:
+                        continue
+                    scale_k_map[entry] = None if sk is None else sk[index : index + 1]
+                    scale_v_map[entry] = None if sv is None else sv[index : index + 1]
+
+        if reuse_active:
+            # Legacy writes reuse entries after grouping (its groups exclude
+            # them); overwrite the quantized placeholders with previous values.
+            k_prev_flat = k_prev.reshape(batch_size, num_heads * seq_len, head_dim)
+            v_prev_flat = v_prev.reshape(batch_size, num_heads * seq_len, head_dim)
+            k_out_flat.index_copy_(1, plan.reuse_flat, k_prev_flat.index_select(1, plan.reuse_flat))
+            v_out_flat.index_copy_(1, plan.reuse_flat, v_prev_flat.index_select(1, plan.reuse_flat))
+
+        return {
+            "k": k_out,
+            "v": v_out,
+            "scale_k_map": scale_k_map,
+            "scale_v_map": scale_v_map,
+            "group_payload": payload,
         }
 
     def _compress_kv_reference(

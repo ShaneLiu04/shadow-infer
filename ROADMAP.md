@@ -120,6 +120,12 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 - [x] IRAP received-attention importance: column-wise received attention, EMA
       propagation, rank normalization, sink hard protection, delta-A drift signal.
 - [ ] Wire `KVDecisionPlane` singleton as the single dispatch path (KV-P7 remainder, AR005).
+- [x] **Precision Plan/Run Fusion** (v3.10.0, AR008): FlashInfer-inspired
+      `PrecisionPlan` shared by compression and byte packing; flat gather/scatter,
+      no unused per-entry scale maps, single fp16/int8 quantization, bit-identical
+      legacy golden; CPU same-process 2.81-3.74x on compress+pack.
+- [ ] **Paged KV layout** (future): FlashInfer-style page table indirection for
+      O(1) append/eviction; evaluated separately from the plan layer.
 
 ### 3.5 FFN Optimization
 
