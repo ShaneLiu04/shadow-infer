@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.6.0 | 732 passed / 1 skipped | 82.37% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.7.0 | 738 passed / 1 skipped | 82.41% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -60,6 +60,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **Q-drift 步感知调度** | 敏感度由位置先验与实测扰动响应凸组合（默认权重 0.3 / 0.7），结合激活漂移动态选择 ShadowKV / FFN 工作模式；扰动响应与真实扰动幅度的 Spearman 秩相关 >= 0.9。 |
 | **决策记忆化** | 同 (step, layer) 同输入的决策缓存（输入指纹校验、step 边界失效、异常旁路）与 FFN 反量化结果缓存，重复调用决策耗时下降 >= 90%。 |
 | **真实性能记账** | latency.e2e_ms / per_step_ms 真实测量（内部计时与外部墙钟对照偏差 0.02%），KV memory 按真实节省字节记账。 |
+| **推理管线常数开销消除（v3.7.0）** | Kernel 后端解析结果记忆化（成功/失败均缓存，失败不再逐次重试 `cpp_extension.load`；同进程 200 次对照 0.022x）；KV INT4 字节打包改为行批量（`_pack_int4_rows`，奇数行内补零；字节布局与参考实现逐位一致，同批 0.016x）。复现脚本见 `specs/archive/AR005-overhead-memoization/`。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -104,7 +105,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`732 passed, 1 skipped`，测试覆盖率 `82.37%`（pytest-cov，fail-under 75）。
+当前主分支：`738 passed, 1 skipped`，测试覆盖率 `82.41%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -684,6 +685,21 @@ python -m shadowinfer optimize \
     --config configs/optimize_full.yaml
 ```
 
+### 实测数据（v3.7.0，2026-10-19，Windows / CPU fallback）
+
+同进程同批对照（`specs/archive/AR005-overhead-memoization/ar005_bench.py`，seed=42，3 次中位）：
+
+| 指标 | 规模 | 优化路径 | 旧/参考路径 | 比值 |
+|------|------|----------|-------------|------|
+| kernel 后端解析 | 200 次调用 | 64.2 µs/次 | 2866.1 µs/次（逐次重试） | 0.022x |
+| KV INT4 打包 | 128 seq × 8 heads × 128 dim | 3.65 ms | 232.83 ms | 0.016x |
+| 字节布局 | 多组 seq/head/dim | `torch.equal` + `byte_offsets` 一致 | — | golden |
+
+根因取证（6 步管线 cProfile，7B 形状）：`_load_cuda_extensions` 被调用 3816 次、累计 12.38 s（占总 27.63 s 的 44.8%），因加载失败结果未被缓存而逐次重试。
+
+**质量**：738 passed / 1 skipped；覆盖率 82.41%；black / isort / flake8 / mypy 全绿。
+说明：以上为 CPU 微基准；GPU 服务器可按脚本复核（安装 CUDA 扩展后字节布局须与 CPU 一致）。
+
 ### 实测数据（v3.6.0，2026-10-18，Windows / CPU fallback）
 
 同进程同批对照（`specs/archive/AR004-ffn-hotpath/ar004_bench.py`，seed=42，3 次中位）：
@@ -986,6 +1002,13 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.7.0（2026-10）
+
+- **Kernel 解析记忆化**：成功/失败结果均缓存 + 双检锁；不可用告警只发一次。消除热路径上每次 kernel 调用重试 `cpp_extension.load`（本机 3816 次 / 12.4s）。
+- **KV INT4 批量打包**：`PackedKVCache._pack_int4_rows` 按行批量打包，奇数行内补零；k/v 字节、`byte_offsets`、scales 与 `_do_pack_reference` 逐位一致。
+- **实测（CPU，同进程 3 次中位）**：loader 0.022x；INT4 pack 0.016x；738 passed，覆盖率 82.41%。
+- **复现资产**：`specs/archive/AR005-overhead-memoization/`（srs/design/tasks/baseline-profile/bench）。
 
 ### v3.6.0（2026-10）
 

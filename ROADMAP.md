@@ -72,9 +72,13 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       pre-pack budget admission + pressure-driven global eviction (KV-P4/P8/P10),
       delta-A drift export to Q-drift. Benefit claims pending GPU experiment plan
       (`specs/changes/AR003-irap-signal-integrity/experiment-plan.md`).
-- [ ] **AOG overhead gating** (planned AR005): device-aware adaptive overhead gating
+- [x] **Pipeline constant-overhead elimination** (v3.7.0, AR005): memoized kernel
+      backend resolution (success and failure) and batched KV INT4 byte packing;
+      byte-identical to the reference packer. CPU same-process A/B: loader 0.022x,
+      INT4 pack 0.016x.
+- [ ] **AOG overhead gating** (planned): device-aware adaptive overhead gating
       with K-step decision cadence and pre-flight arbitration (ORC-P1/ORC-P3).
-- [ ] **Macroblock rate control** (planned AR006): SKIP/DELTA/REFRESH reuse modes with
+- [ ] **Macroblock rate control** (planned): SKIP/DELTA/REFRESH reuse modes with
       rate-distortion control and per-precision free-list slab allocator.
 - [x] Continuous benchmarking and performance regression tracking.
 - [x] English documentation and broader internationalization — all content consolidated into the Chinese README.md.

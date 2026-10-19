@@ -26,6 +26,7 @@ Architecture:
 """
 
 import os
+import threading
 import warnings
 from typing import Optional, Tuple
 
@@ -91,16 +92,34 @@ def get_kernel_status() -> dict:
 # ---------------------------------------------------------------------------
 
 _cuda_ops = None
+_load_attempted = False
+_load_lock = threading.Lock()
+_warned_no_cuda = False
 
 
 def _load_cuda_extensions():
-    """Compile and load CUDA extensions on first call."""
-    global _cuda_ops
-    if _cuda_ops is not None:
+    """Compile and load CUDA extensions on first call (result memoized).
+
+    AR005: failed or unavailable loads are memoized too, so hot paths that call
+    kernel wrappers per channel do not retry ``cpp_extension.load`` each time.
+    """
+    global _cuda_ops, _load_attempted
+    if _load_attempted:
+        return _cuda_ops
+    with _load_lock:
+        if _load_attempted:
+            return _cuda_ops
+        _load_attempted = True
+        _cuda_ops = _load_cuda_extensions_once()
         return _cuda_ops
 
+
+def _load_cuda_extensions_once():
+    global _cuda_ops, _warned_no_cuda
     if not _CUDA_AVAILABLE:
-        warnings.warn("CUDA not available, using CPU fallback kernels.")
+        if not _warned_no_cuda:
+            _warned_no_cuda = True
+            warnings.warn("CUDA not available, using CPU fallback kernels.")
         return None
 
     cpp_dir = os.path.join(os.path.dirname(__file__), "cpp")

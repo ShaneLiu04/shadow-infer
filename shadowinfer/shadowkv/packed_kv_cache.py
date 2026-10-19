@@ -155,30 +155,24 @@ class PackedKVCache:
                     v_stacked, group_size=effective_group_size
                 )
 
-                k_slices_packed: List[torch.Tensor] = []
-                v_slices_packed: List[torch.Tensor] = []
-                byte_offsets: List[Tuple[int, int, int, int]] = []
-                k_byte_cursor = 0
-                v_byte_cursor = 0
+                # AR005: batched INT4 byte packing (bit-identical to the
+                # per-entry loop in ``_do_pack_reference``). Rows are padded
+                # independently when the flattened row length is odd.
+                k_rows, k_row_bytes = self._pack_int4_rows(qk_all)
+                v_rows, v_row_bytes = self._pack_int4_rows(qv_all)
+                k_stacked_packed = k_rows.reshape(-1)
+                v_stacked_packed = v_rows.reshape(-1)
 
+                byte_offsets: List[Tuple[int, int, int, int]] = []
                 for n in range(len(indices)):
-                    qk_packed = _kernels._pack_int4(qk_all[n].reshape(-1))
-                    qv_packed = _kernels._pack_int4(qv_all[n].reshape(-1))
                     byte_offsets.append(
                         (
-                            k_byte_cursor,
-                            k_byte_cursor + qk_packed.numel(),
-                            v_byte_cursor,
-                            v_byte_cursor + qv_packed.numel(),
+                            n * k_row_bytes,
+                            (n + 1) * k_row_bytes,
+                            n * v_row_bytes,
+                            (n + 1) * v_row_bytes,
                         )
                     )
-                    k_byte_cursor += qk_packed.numel()
-                    v_byte_cursor += qv_packed.numel()
-                    k_slices_packed.append(qk_packed)
-                    v_slices_packed.append(qv_packed)
-
-                k_stacked_packed = torch.cat(k_slices_packed, dim=0)
-                v_stacked_packed = torch.cat(v_slices_packed, dim=0)
                 scale_k = scale_k_all.reshape(-1, num_groups, 1)
                 scale_v = scale_v_all.reshape(-1, num_groups, 1)
 
@@ -199,6 +193,27 @@ class PackedKVCache:
                 }
 
         self._memory_bytes = total_bytes
+
+    @staticmethod
+    def _pack_int4_rows(quantized: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Pack INT4 values row-wise into uint8 bytes (AR005 vectorized path).
+
+        Args:
+            quantized: INT8-encoded INT4 tensor ``[n, batch, groups, group]``.
+
+        Returns:
+            ``(packed_rows [n, ceil(L/2)], row_bytes)`` where ``L`` is the
+            flattened per-row element count.
+        """
+        rows = quantized.reshape(quantized.shape[0], -1)
+        offset = (rows + 8).to(torch.uint8)
+        if offset.shape[1] % 2 != 0:
+            pad = torch.zeros(offset.shape[0], 1, dtype=torch.uint8, device=offset.device)
+            offset = torch.cat([offset, pad], dim=1)
+        high = offset[:, 0::2] << 4
+        low = offset[:, 1::2] & 0x0F
+        packed = high | low
+        return packed, packed.shape[1]
 
     def _do_pack_reference(
         self,
