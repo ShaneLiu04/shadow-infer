@@ -16,7 +16,7 @@
 | T003 | FR5.2 `_pack_int4_rows` 批量打包 + 参考实现保留 | T001 | passing | 2026-10-19 |
 | T004 | FR5.3 测试（UT-1~UT-6）+ 全量回归 + 五件套 | T002, T003 | passing | 2026-10-19：tests/test_pipeline_overhead.py 6 passed；全量 738 passed / 82.41%；五件套全绿 |
 | T005 | FR5.4 README v3.7.0 四检查点 + 版本同步 + ROADMAP | T004 | passing | 2026-10-19：特性表/版本历史/基准/复现路径；版本三处 3.7.0 |
-| T006 | Review + ST + 归档 + Gitee 推送 | T005 | pending | 规则二 |
+| T006 | Review + ST + 归档 + Gitee 推送 | T005 | passing | 2026-10-19：Review 一轮（I1-I3 修复）；ST-01~ST-11 全 PASS；归档至 specs/archive/AR005-overhead-memoization |
 
 ## 进度记录
 
@@ -24,4 +24,10 @@
 
 - 7B 配置 6 步管线 cProfile：`_load_cuda_extensions` 3816 次 / 12.4s（占总 27.6s 的 45%），单次约 2.8ms（本机 CUDA 扩展加载失败导致逐次重试）。
 - `PackedKVCache` int4 pack（128 seq × 8 heads × head_dim 128）：逐条实现 72.7ms vs 参考 189.17ms（0.384x）。
-- 脚本：`specs/changes/AR005-overhead-memoization/ar005_bench.py`（seed=42，CPU）。
+- 脚本：`specs/archive/AR005-overhead-memoization/ar005_bench.py`（seed=42，CPU）。
+
+## 归档与验收（2026-10-19）
+
+- Review：FAIL（I1 UT-4 缺奇数行长；I2 UT-5 规模/阈值不符；I3 fixture 未恢复 `_KERNEL_STATUS`）。修复后 6 passed，全量 738 passed / 82.42%。
+- ST：`st-cases.md` ST-01~ST-11 全 PASS。
+- 归档：`specs/changes/AR005-overhead-memoization/` -> `specs/archive/AR005-overhead-memoization/`。

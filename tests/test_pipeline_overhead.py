@@ -20,6 +20,7 @@ def _restore_kernel_state():
         kernels._load_attempted,
         kernels._warned_no_cuda,
         kernels._CUDA_AVAILABLE,
+        dict(kernels._KERNEL_STATUS),
     )
     yield
     (
@@ -27,7 +28,10 @@ def _restore_kernel_state():
         kernels._load_attempted,
         kernels._warned_no_cuda,
         kernels._CUDA_AVAILABLE,
+        saved_status,
     ) = saved
+    kernels._KERNEL_STATUS.clear()
+    kernels._KERNEL_STATUS.update(saved_status)
 
 
 def _reset_loader(available=False):
@@ -46,8 +50,9 @@ def test_ut1_loader_attempted_once(monkeypatch):
         return None
 
     monkeypatch.setattr(kernels, "_load_cuda_extensions_once", fake_once)
+    tiny = torch.arange(-8, 8, dtype=torch.int8)
     for _ in range(200):
-        assert kernels._load_cuda_extensions() is None
+        kernels._pack_int4(tiny)
     assert calls["n"] == 1
 
 
@@ -117,6 +122,7 @@ def _assert_pack_golden(batch, heads, seq, dim, group_size):
 def test_ut4_pack_golden_bytes_identical():
     for args in (
         (1, 3, 5, 16, 16),
+        (1, 2, 5, 7, 16),
         (1, 2, 7, 24, 16),
         (2, 2, 9, 32, 16),
         (1, 4, 16, 128, 16),
@@ -125,7 +131,7 @@ def test_ut4_pack_golden_bytes_identical():
 
 
 def test_ut5_pack_vectorized_speedup():
-    batch, heads, seq, dim = 1, 4, 64, 64
+    batch, heads, seq, dim = 1, 8, 128, 128
     torch.manual_seed(0)
     k = torch.randn(batch, heads, seq, dim)
     v = torch.randn(batch, heads, seq, dim)
@@ -143,7 +149,7 @@ def test_ut5_pack_vectorized_speedup():
     ref = timed(
         lambda: PackedKVCache(batch, heads, seq, dim)._do_pack_reference(k, v, pmap, group_size=16)
     )
-    assert vec <= ref * 0.5
+    assert vec <= ref * 0.30
 
 
 def test_ut6_pipeline_smoke_after_optimization(tmp_path):

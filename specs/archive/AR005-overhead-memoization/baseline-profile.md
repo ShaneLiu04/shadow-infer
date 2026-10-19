@@ -5,7 +5,7 @@
 | 取证日期 | 2026-10-19 |
 | 执行设备 | CPU（Windows，torch 2.5.1 CPU-only；CUDA 扩展加载失败触发 CPU fallback） |
 | 性质 | 常数开销取证（微基准 + 6 步管线 cProfile；非大型模型实验） |
-| 复现脚本 | `specs/changes/AR005-overhead-memoization/ar005_bench.py`（seed=42） |
+| 复现脚本 | `specs/archive/AR005-overhead-memoization/ar005_bench.py`（seed=42） |
 
 ## 1. 管线 cProfile（优化前）
 
@@ -28,7 +28,7 @@
 | 实现 | 耗时 |
 |------|------|
 | AR002 向量化量化 + 逐条 `_pack_int4` | 72.71 ms |
-| `_do_pack_reference`（逐条全流程） | 189.17 ms |
+| `_do_pack_reference`（逐条全流程，首次取证） | 189.17 ms（后续复跑 232.83 ms，机器抖动） |
 | 比值 | 0.384x |
 
 ## 3. 优化后同进程对照

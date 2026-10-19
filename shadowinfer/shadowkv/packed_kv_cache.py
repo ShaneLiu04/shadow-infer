@@ -205,6 +205,8 @@ class PackedKVCache:
             ``(packed_rows [n, ceil(L/2)], row_bytes)`` where ``L`` is the
             flattened per-row element count.
         """
+        if quantized.shape[0] == 0:
+            return torch.empty(0, 0, dtype=torch.uint8, device=quantized.device), 0
         rows = quantized.reshape(quantized.shape[0], -1)
         offset = (rows + 8).to(torch.uint8)
         if offset.shape[1] % 2 != 0:
