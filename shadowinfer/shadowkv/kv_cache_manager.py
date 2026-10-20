@@ -130,8 +130,8 @@ class KVCacheManager:
         """跨层全局驱逐（AR003 T005）：按重要性升序驱逐非 sink token-head。
 
         目标用量为 ``budget_bytes * 0.9``（10% 迟滞）。驱逐通过
-        ``PackedKVCache.evict`` 完成（降档至 int4 并清零），属于罕见路径，
-        允许 O(全量) 重打包。sink 前缀（token_idx < sink_tokens）永不驱逐。
+        ``PackedKVCache.evict`` 桶内就地删除条目并真实释放字节（AR012），
+        不做全量 unpack/重打包。sink 前缀（token_idx < sink_tokens）永不驱逐。
 
         Returns:
             实际驱逐的 token-head 条数；无 packed 层或无候选时为 0。
@@ -142,6 +142,8 @@ class KVCacheManager:
             return 0
 
         target = int(budget_bytes * 0.9)
+        if self.get_memory_usage() > target:
+            self._release_dense_shadows()
         if self.get_memory_usage() <= target:
             return 0
         evicted_total = 0
@@ -162,7 +164,7 @@ class KVCacheManager:
                     )
         candidates.sort(key=lambda item: item[0])
 
-        # review I4：按需批量驱逐（估计每批释放量），每层每次 evict 只重打包一次；
+        # 按需批量驱逐（估计每批释放量）；evict 为桶内就地删除，不重打包；
         # 循环迭代次数受候选集大小约束，且用量达标即停。
         idx = 0
         while self.get_memory_usage() > target and idx < len(candidates):
@@ -197,12 +199,36 @@ class KVCacheManager:
             )
         return evicted_total
 
+    def _release_dense_shadows(self) -> bool:
+        """Drop retained dense KV shadows when a packed cache exists.
+
+        AR012: the packed cache is the canonical resident representation; the
+        dense copy is an optional compatibility shadow and is released under
+        memory pressure before evicting packed token-heads.
+        """
+        released = False
+        for layer_id, entry in self.cache.items():
+            if self._packed_cache.get(layer_id) is None:
+                continue
+            if any(
+                tensor is not None
+                for tensor in (entry.k_tensor, entry.v_tensor, entry.scale_k, entry.scale_v)
+            ):
+                entry.k_tensor = None
+                entry.v_tensor = None
+                entry.scale_k = None
+                entry.scale_v = None
+                released = True
+        return released
+
     def _enforce_budget(self, layer_id: int) -> None:
         """Evict token-heads if the cache exceeds the configured budget."""
         if self.memory_budget_bytes is None or self.memory_budget_bytes <= 0:
             return
 
         current_usage = self.get_memory_usage()
+        if current_usage > self.memory_budget_bytes and self._release_dense_shadows():
+            current_usage = self.get_memory_usage()
         if current_usage <= self.memory_budget_bytes:
             return
 
@@ -237,7 +263,8 @@ class KVCacheManager:
         )
 
         if to_evict:
-            packed.evict(to_evict)
+            evict_entries = {(token_idx, head_idx) for _, token_idx, head_idx in to_evict}
+            packed.evict(evict_entries)
             # Mark evicted entries in metadata.
             for _, token_idx, head_idx in to_evict:
                 key = (token_idx, head_idx)
@@ -289,7 +316,14 @@ class KVCacheManager:
         total_bytes = 0
         for layer_id, entry in self.cache.items():
             packed = self._packed_cache.get(layer_id)
-            if packed is not None and hasattr(packed, "memory_bytes"):
+            if packed is not None and hasattr(packed, "resident_bytes"):
+                total_bytes += packed.resident_bytes()
+                # Retained dense shadow (store_dense_kv=True) is resident too.
+                total_bytes += self._tensor_bytes(entry.k_tensor)
+                total_bytes += self._tensor_bytes(entry.v_tensor)
+                total_bytes += self._tensor_bytes(entry.scale_k)
+                total_bytes += self._tensor_bytes(entry.scale_v)
+            elif packed is not None and hasattr(packed, "memory_bytes"):
                 total_bytes += packed.memory_bytes()
             else:
                 total_bytes += self._tensor_bytes(entry.k_tensor)
@@ -319,8 +353,10 @@ class KVCacheManager:
         return stats
 
     @staticmethod
-    def _tensor_bytes(tensor: torch.Tensor) -> int:
-        """计算 tensor 占用的字节数。"""
+    def _tensor_bytes(tensor: Optional[torch.Tensor]) -> int:
+        """计算 tensor 占用的字节数（None 记为 0）。"""
+        if tensor is None:
+            return 0
         return tensor.numel() * tensor.element_size()
 
     def __repr__(self) -> str:

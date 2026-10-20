@@ -19,7 +19,7 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
 ### Strengths
 
 - Clean multi-agent architecture (Orchestrator + Profiler / ShadowKV / Q-drift / FFN Optimizer).
-- 812 passing tests (1 skipped) with 82.99% coverage.
+- 853 passing tests (1 skipped) with 83.23% coverage.
 - Comprehensive documentation (architecture, technical spec, engineering, ADRs, bilingual README, tutorials).
 - Built-in observability, benchmarking, and production-safety components.
 - CUDA kernel scaffold (INT8/INT4 quantization, sparse GEMM, fused quantized attention).
@@ -96,6 +96,11 @@ ShadowInfer aims to become a leading open-source inference optimization framewor
       model/backend/orchestrator wiring; CPU 4.80-6.74x at 7B up-projection
       shapes, 1.37-1.47x medium-model e2e, 0.43% logits error
       (`specs/archive/AR011-int8-ffn-execution/`).
+- [x] **Canonical packed KV store** (v3.14.0, AR012): vectorized
+      `unpack`/reuse/in-place bucket eviction, corrected INT4 batch>1 scales,
+      unified INT4 group size with single quantization, and packed-only resident
+      accounting; CPU 135.7-212.7x unpack and 58.0-62.2x evict with real 25%
+      byte release (`specs/archive/AR012-canonical-kv-store/`).
 - [ ] **AOG overhead gating** (planned): device-aware adaptive overhead gating
       with K-step decision cadence and pre-flight arbitration (ORC-P1/ORC-P3).
 - [ ] **Macroblock rate control** (planned): SKIP/DELTA/REFRESH reuse modes with

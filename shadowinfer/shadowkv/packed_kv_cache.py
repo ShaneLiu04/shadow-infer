@@ -86,7 +86,7 @@ class PackedKVCache:
         k_tensor: torch.Tensor,
         v_tensor: torch.Tensor,
         precision_map: Dict[int, Dict[int, str]],
-        group_size: int = 64,
+        group_size: int = 16,
         plan: Any = None,
         precomputed: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -96,8 +96,8 @@ class PackedKVCache:
         Element-wise identical to ``_do_pack_reference``: per-precision groups
         are gathered with advanced indexing and quantized in one batched call
         instead of per-entry slicing. The int4 scale layout ``(n*batch, g, 1)``
-        is preserved bit-for-bit (including its known batch>1 indexing defect
-        in ``unpack``, kept for compatibility).
+        is preserved bit-for-bit and decoded with the corrected AR012 batch
+        indexing in ``unpack``.
 
         AR008: when ``plan`` is supplied, grouping/flat indices are reused and
         ``precomputed`` (if present) supplies the tensors already produced by
@@ -230,10 +230,10 @@ class PackedKVCache:
         """Plan-driven packing (AR008).
 
         Reuses ``plan.groups`` / ``plan.flat_indices`` instead of rebuilding
-        the precision grouping. When ``precomputed`` is supplied, fp32/fp16 and
-        int8 groups skip re-quantization (identical inputs/quantizer); int4
-        still quantizes with the pack-specific group size because the
-        compression working copy may use a different group size.
+        the precision grouping. When ``precomputed`` is supplied, fp32/fp16,
+        int8 and int4 groups skip re-quantization because compression uses the
+        same unified ``int4_group_size`` (AR012); the packed byte layout is
+        produced from the precomputed INT4 codes/scales.
         """
         batch_size, num_heads, seq_len, head_dim = k_tensor.shape
         if plan.seq_len != seq_len or plan.num_heads != num_heads:
@@ -306,18 +306,28 @@ class PackedKVCache:
             else:
                 effective_group_size = group_size if head_dim % group_size == 0 else head_dim
                 num_groups = head_dim // effective_group_size
-                if pre is not None:
-                    k_stacked = pre["k_group"]
-                    v_stacked = pre["v_group"]
+                if pre is not None and pre.get("qk") is not None and pre.get("scale_k") is not None:
+                    qk_all = pre["qk"].reshape(
+                        len(indices), batch_size, num_groups, effective_group_size
+                    )
+                    qv_all = pre["qv"].reshape(
+                        len(indices), batch_size, num_groups, effective_group_size
+                    )
+                    scale_k_all = pre["scale_k"].reshape(len(indices), batch_size, num_groups, 1)
+                    scale_v_all = pre["scale_v"].reshape(len(indices), batch_size, num_groups, 1)
                 else:
-                    k_stacked = k_flat.index_select(1, flat).permute(1, 0, 2)
-                    v_stacked = v_flat.index_select(1, flat).permute(1, 0, 2)
-                qk_all, scale_k_all = Quantizer.quantize_int4(
-                    k_stacked, group_size=effective_group_size
-                )
-                qv_all, scale_v_all = Quantizer.quantize_int4(
-                    v_stacked, group_size=effective_group_size
-                )
+                    if pre is not None:
+                        k_stacked = pre["k_group"]
+                        v_stacked = pre["v_group"]
+                    else:
+                        k_stacked = k_flat.index_select(1, flat).permute(1, 0, 2)
+                        v_stacked = v_flat.index_select(1, flat).permute(1, 0, 2)
+                    qk_all, scale_k_all = Quantizer.quantize_int4(
+                        k_stacked, group_size=effective_group_size
+                    )
+                    qv_all, scale_v_all = Quantizer.quantize_int4(
+                        v_stacked, group_size=effective_group_size
+                    )
                 k_rows, k_row_bytes = self._pack_int4_rows(qk_all)
                 v_rows, v_row_bytes = self._pack_int4_rows(qv_all)
                 k_stacked_packed = k_rows.reshape(-1)
@@ -523,7 +533,7 @@ class PackedKVCache:
         self._memory_bytes = total_bytes
 
     def unpack(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Unpack K/V tensors back to float32."""
+        """Vectorized unpack of all precision buckets to float32 (AR012)."""
         k_out = torch.zeros(
             self.batch_size,
             self.num_heads,
@@ -539,57 +549,111 @@ class PackedKVCache:
             if not indices:
                 continue
 
-            if precision == "fp32":
-                k_vals = data["k"].float()
-                v_vals = data["v"].float()
-                for slice_idx, (token_idx, head_idx) in enumerate(indices):
-                    k_out[:, head_idx, token_idx, :] = k_vals[slice_idx]
-                    v_out[:, head_idx, token_idx, :] = v_vals[slice_idx]
+            heads = torch.tensor([h for _, h in indices], dtype=torch.long, device=self.device)
+            tokens = torch.tensor([t for t, _ in indices], dtype=torch.long, device=self.device)
 
-            elif precision == "fp16":
+            if precision in ("fp32", "fp16"):
                 k_vals = data["k"].float()
                 v_vals = data["v"].float()
-                for slice_idx, (token_idx, head_idx) in enumerate(indices):
-                    k_out[:, head_idx, token_idx, :] = k_vals[slice_idx]
-                    v_out[:, head_idx, token_idx, :] = v_vals[slice_idx]
+                k_out[:, heads, tokens, :] = k_vals.permute(1, 0, 2)
+                v_out[:, heads, tokens, :] = v_vals.permute(1, 0, 2)
 
             elif precision == "int8":
                 k_vals = Quantizer.dequantize_int8(data["k"], data["scale_k"])
                 v_vals = Quantizer.dequantize_int8(data["v"], data["scale_v"])
-                for slice_idx, (token_idx, head_idx) in enumerate(indices):
-                    k_out[:, head_idx, token_idx, :] = k_vals[slice_idx]
-                    v_out[:, head_idx, token_idx, :] = v_vals[slice_idx]
+                k_out[:, heads, tokens, :] = k_vals.permute(1, 0, 2)
+                v_out[:, heads, tokens, :] = v_vals.permute(1, 0, 2)
 
             elif precision == "int4":
-                byte_offsets = data["byte_offsets"]
-                group_size = data["group_size"]
-                num_groups = data["num_groups"]
-                for slice_idx, (token_idx, head_idx) in enumerate(indices):
-                    k_start, k_end, v_start, v_end = byte_offsets[slice_idx]
-                    k_packed_slice = data["k"][k_start:k_end]
-                    v_packed_slice = data["v"][v_start:v_end]
-
-                    k_unpacked = _kernels._unpack_int4(
-                        k_packed_slice, self.batch_size * self.head_dim
-                    )
-                    v_unpacked = _kernels._unpack_int4(
-                        v_packed_slice, self.batch_size * self.head_dim
-                    )
-
-                    k_unpacked = k_unpacked.reshape(self.batch_size, num_groups, group_size)
-                    v_unpacked = v_unpacked.reshape(self.batch_size, num_groups, group_size)
-
-                    k_slice = Quantizer.dequantize_int4(k_unpacked, data["scale_k"][slice_idx])
-                    v_slice = Quantizer.dequantize_int4(v_unpacked, data["scale_v"][slice_idx])
-
-                    k_out[:, head_idx, token_idx, :] = k_slice.reshape(
-                        self.batch_size, self.head_dim
-                    )
-                    v_out[:, head_idx, token_idx, :] = v_slice.reshape(
-                        self.batch_size, self.head_dim
-                    )
+                k_vals = self._dequantize_int4_bucket(
+                    data["k"], data["scale_k"], data, len(indices)
+                )
+                v_vals = self._dequantize_int4_bucket(
+                    data["v"], data["scale_v"], data, len(indices)
+                )
+                k_out[:, heads, tokens, :] = k_vals.permute(1, 0, 2)
+                v_out[:, heads, tokens, :] = v_vals.permute(1, 0, 2)
 
         return k_out, v_out
+
+    def unpack_reference(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-entry golden unpack (AR012).
+
+        Semantically identical to :meth:`unpack`; INT4 scales are interpreted
+        with the corrected ``[entry, batch, group, 1]`` layout.
+        """
+        k_out = torch.zeros(
+            self.batch_size,
+            self.num_heads,
+            self.seq_len,
+            self.head_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        v_out = torch.zeros_like(k_out)
+
+        for precision, data in self.packed_data.items():
+            indices = data["indices"]
+            if not indices:
+                continue
+            group_size = data.get("group_size")
+            num_groups = data.get("num_groups")
+            scale_k = data["scale_k"]
+            scale_v = data["scale_v"]
+            if precision == "int4":
+                scale_k = scale_k.reshape(len(indices), self.batch_size, num_groups, 1)
+                scale_v = scale_v.reshape(len(indices), self.batch_size, num_groups, 1)
+
+            for slice_idx, (token_idx, head_idx) in enumerate(indices):
+                if precision in ("fp32", "fp16"):
+                    k_slice = data["k"][slice_idx].float()
+                    v_slice = data["v"][slice_idx].float()
+                elif precision == "int8":
+                    k_slice = Quantizer.dequantize_int8(
+                        data["k"][slice_idx : slice_idx + 1],
+                        data["scale_k"][slice_idx : slice_idx + 1],
+                    )[0]
+                    v_slice = Quantizer.dequantize_int8(
+                        data["v"][slice_idx : slice_idx + 1],
+                        data["scale_v"][slice_idx : slice_idx + 1],
+                    )[0]
+                else:
+                    k_start, k_end, v_start, v_end = data["byte_offsets"][slice_idx]
+                    k_unpacked = _kernels._unpack_int4(
+                        data["k"][k_start:k_end], self.batch_size * self.head_dim
+                    ).reshape(self.batch_size, num_groups, group_size)
+                    v_unpacked = _kernels._unpack_int4(
+                        data["v"][v_start:v_end], self.batch_size * self.head_dim
+                    ).reshape(self.batch_size, num_groups, group_size)
+                    k_slice = Quantizer.dequantize_int4(k_unpacked, scale_k[slice_idx])
+                    v_slice = Quantizer.dequantize_int4(v_unpacked, scale_v[slice_idx])
+
+                k_out[:, head_idx, token_idx, :] = k_slice.reshape(self.batch_size, self.head_dim)
+                v_out[:, head_idx, token_idx, :] = v_slice.reshape(self.batch_size, self.head_dim)
+
+        return k_out, v_out
+
+    def _dequantize_int4_bucket(
+        self,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        data: Dict[str, Any],
+        num_entries: int,
+    ) -> torch.Tensor:
+        """Decode one INT4 bucket into ``[N, batch, head_dim]`` float32."""
+        row_bytes = packed.numel() // max(num_entries, 1)
+        rows = packed.reshape(num_entries, row_bytes)
+        high = (rows >> 4) & 0x0F
+        low = rows & 0x0F
+        interleaved = torch.stack([high, low], dim=-1).reshape(num_entries, -1)
+        num_values = self.batch_size * self.head_dim
+        int_codes = (interleaved[:, :num_values].to(torch.int16) - 8).to(torch.int8)
+        group_size = data["group_size"]
+        num_groups = data["num_groups"]
+        codes = int_codes.reshape(num_entries, self.batch_size, num_groups, group_size)
+        scales = scale.reshape(num_entries, self.batch_size, num_groups, 1)
+        values = codes.float() * scales
+        return values.reshape(num_entries, self.batch_size, self.head_dim)
 
     def memory_bytes(self) -> int:
         """Return actual byte-level memory usage."""
@@ -599,42 +663,86 @@ class PackedKVCache:
         """Return memory usage in megabytes."""
         return self._memory_bytes / (1024.0 * 1024.0)
 
-    def evict(self, token_head_set: Set[Tuple[int, int]]) -> None:
-        """Downgrade or zero out a set of token-heads to free memory.
+    def evict(self, token_head_set: Set[Tuple[int, int]]) -> int:
+        """Remove token-heads from their precision buckets in place (AR012).
 
-        The current implementation unpacks the cache, zeros the evicted
-        token-heads, and re-packs them in INT4 (the smallest precision).
-        Non-evicted token-heads keep their original precision.
+        Unlike the legacy unpack/repack path this truly frees bytes, keeps the
+        original INT4 ``group_size`` for untouched entries, and never
+        resurrects already-absent entries.
 
-        Args:
-            token_head_set: Set of ``(token_idx, head_idx)`` to evict.
+        Returns:
+            Number of entries actually removed.
         """
         if not token_head_set or not self.packed_data:
-            return
+            return 0
 
-        k_full, v_full = self.unpack()
-        # Build a new precision map: evicted entries -> int4, others unchanged.
-        new_precision_map: Dict[int, Dict[int, str]] = {}
-        for token_idx in range(self.seq_len):
-            new_precision_map[token_idx] = {}
-            for head_idx in range(self.num_heads):
-                if (token_idx, head_idx) in token_head_set:
-                    new_precision_map[token_idx][head_idx] = "int4"
-                    k_full[:, head_idx, token_idx, :] = 0.0
-                    v_full[:, head_idx, token_idx, :] = 0.0
+        removed = 0
+        for precision in list(self.packed_data.keys()):
+            data = self.packed_data[precision]
+            indices = data["indices"]
+            keep_positions: List[int] = []
+            keep_indices: List[Tuple[int, int]] = []
+            for position, entry in enumerate(indices):
+                if entry in token_head_set:
+                    removed += 1
                 else:
-                    original = self._precision_for(token_idx, head_idx)
-                    new_precision_map[token_idx][head_idx] = original
+                    keep_positions.append(position)
+                    keep_indices.append(entry)
 
-        self.packed_data = {}
-        # review I5：重打包沿用 pack 默认分组（group_size=16），避免驱逐后
-        # 非驱逐 int4 条目被换组重量化、字节口径与准入估算脱节
-        self._do_pack(k_full, v_full, new_precision_map)
+            if len(keep_positions) == len(indices):
+                continue
+            if not keep_indices:
+                del self.packed_data[precision]
+                continue
+
+            keep = torch.tensor(keep_positions, dtype=torch.long, device=data["k"].device)
+            if precision in ("fp32", "fp16", "int8"):
+                data["k"] = data["k"].index_select(0, keep)
+                data["v"] = data["v"].index_select(0, keep)
+                if precision == "int8":
+                    data["scale_k"] = data["scale_k"].index_select(0, keep)
+                    data["scale_v"] = data["scale_v"].index_select(0, keep)
+            else:
+                num_entries = len(indices)
+                row_bytes = data["k"].numel() // num_entries
+                data["k"] = (
+                    data["k"].reshape(num_entries, row_bytes).index_select(0, keep).reshape(-1)
+                )
+                data["v"] = (
+                    data["v"].reshape(num_entries, row_bytes).index_select(0, keep).reshape(-1)
+                )
+                new_num = len(keep_indices)
+                data["scale_k"] = (
+                    data["scale_k"]
+                    .reshape(num_entries, self.batch_size, data["num_groups"], 1)
+                    .index_select(0, keep)
+                    .reshape(-1, data["num_groups"], 1)
+                )
+                data["scale_v"] = (
+                    data["scale_v"]
+                    .reshape(num_entries, self.batch_size, data["num_groups"], 1)
+                    .index_select(0, keep)
+                    .reshape(-1, data["num_groups"], 1)
+                )
+                data["byte_offsets"] = [
+                    (
+                        i * row_bytes,
+                        (i + 1) * row_bytes,
+                        i * row_bytes,
+                        (i + 1) * row_bytes,
+                    )
+                    for i in range(new_num)
+                ]
+
+            data["indices"] = keep_indices
+
+        self._memory_bytes = self._compute_data_bytes()
+        return removed
 
     def _precision_for(self, token_idx: int, head_idx: int) -> str:
         """Return the precision for a token-head from packed_data.
 
-        Missing entries are treated as evicted (AR009): repacking after
+        Missing entries are treated as evicted (AR009): packing after
         ``evict`` must not resurrect dropped token-heads as fp16.
         """
         for precision, data in self.packed_data.items():
@@ -646,53 +754,124 @@ class PackedKVCache:
         self,
         kv_previous_packed: "PackedKVCache",
         reuse_mask: Dict[Tuple[int, int], bool],
-    ) -> None:
-        """Copy reused token-heads from previous packed cache into this cache.
+        return_stats: bool = False,
+    ) -> Optional[Dict[str, int]]:
+        """Copy reused token-heads from a previous packed cache (vectorized).
 
-        Args:
-            kv_previous_packed: PackedKVCache from the previous step.
-            reuse_mask: {(token_idx, head_idx): bool} indicating which
-                token-heads should be copied from the previous cache.
+        Cross-precision entries are not copied (their quantized representation
+        differs); they keep the current values and are counted in
+        ``skipped_precision``.
         """
+        if (
+            self.batch_size != kv_previous_packed.batch_size
+            or self.num_heads != kv_previous_packed.num_heads
+            or self.head_dim != kv_previous_packed.head_dim
+        ):
+            raise ValueError(
+                "packed cache shape mismatch for reuse: "
+                f"current=({self.batch_size},{self.num_heads},{self.head_dim}) "
+                f"previous=({kv_previous_packed.batch_size},"
+                f"{kv_previous_packed.num_heads},{kv_previous_packed.head_dim})"
+            )
+        for precision in self.packed_data:
+            if precision != "int4":
+                continue
+            current = self.packed_data[precision]
+            previous = kv_previous_packed.packed_data.get(precision)
+            if previous is not None and current["group_size"] != previous["group_size"]:
+                raise ValueError(
+                    "INT4 group_size mismatch for reuse: "
+                    f"current={current['group_size']} previous={previous['group_size']}"
+                )
+
+        stats = {"applied": 0, "skipped_precision": 0}
         if not reuse_mask or not kv_previous_packed.packed_data:
-            return
+            return stats if return_stats else None
+
+        previous_precision: Dict[Tuple[int, int], str] = {}
+        previous_position: Dict[Tuple[int, int], int] = {}
+        for precision, prev_data in kv_previous_packed.packed_data.items():
+            for position, entry in enumerate(prev_data["indices"]):
+                previous_precision[entry] = precision
+                previous_position[entry] = position
 
         for precision, data in self.packed_data.items():
             prev_data = kv_previous_packed.packed_data.get(precision)
-            if prev_data is None:
+            target_positions: List[int] = []
+            source_positions: List[int] = []
+            for position, entry in enumerate(data["indices"]):
+                if not reuse_mask.get(entry, False):
+                    continue
+                if previous_precision.get(entry) == precision and entry in previous_position:
+                    target_positions.append(position)
+                    source_positions.append(previous_position[entry])
+                elif entry in previous_precision:
+                    stats["skipped_precision"] += 1
+
+            if not target_positions:
                 continue
 
-            prev_map = {(t, h): i for i, (t, h) in enumerate(prev_data["indices"])}
-            cur_indices = data["indices"]
+            target = torch.tensor(target_positions, dtype=torch.long, device=data["k"].device)
+            source = torch.tensor(source_positions, dtype=torch.long, device=data["k"].device)
+            if precision in ("fp32", "fp16", "int8"):
+                data["k"].index_copy_(0, target, prev_data["k"].index_select(0, source))
+                data["v"].index_copy_(0, target, prev_data["v"].index_select(0, source))
+                if precision == "int8":
+                    data["scale_k"].index_copy_(
+                        0, target, prev_data["scale_k"].index_select(0, source)
+                    )
+                    data["scale_v"].index_copy_(
+                        0, target, prev_data["scale_v"].index_select(0, source)
+                    )
+            else:
+                num_entries = len(data["indices"])
+                prev_entries = len(prev_data["indices"])
+                row_bytes = data["k"].numel() // num_entries
+                k_rows = data["k"].reshape(num_entries, row_bytes)
+                v_rows = data["v"].reshape(num_entries, row_bytes)
+                prev_k_rows = prev_data["k"].reshape(prev_entries, row_bytes)
+                prev_v_rows = prev_data["v"].reshape(prev_entries, row_bytes)
+                k_rows.index_copy_(0, target, prev_k_rows.index_select(0, source))
+                v_rows.index_copy_(0, target, prev_v_rows.index_select(0, source))
+                data["k"] = k_rows.reshape(-1)
+                data["v"] = v_rows.reshape(-1)
+                num_groups = data["num_groups"]
+                scale_k = data["scale_k"].reshape(num_entries, self.batch_size, num_groups, 1)
+                scale_v = data["scale_v"].reshape(num_entries, self.batch_size, num_groups, 1)
+                prev_scale_k = prev_data["scale_k"].reshape(
+                    prev_entries, self.batch_size, num_groups, 1
+                )
+                prev_scale_v = prev_data["scale_v"].reshape(
+                    prev_entries, self.batch_size, num_groups, 1
+                )
+                scale_k.index_copy_(0, target, prev_scale_k.index_select(0, source))
+                scale_v.index_copy_(0, target, prev_scale_v.index_select(0, source))
+                data["scale_k"] = scale_k.reshape(-1, num_groups, 1)
+                data["scale_v"] = scale_v.reshape(-1, num_groups, 1)
 
-            for slice_idx, (token_idx, head_idx) in enumerate(cur_indices):
-                if not reuse_mask.get((token_idx, head_idx), False):
-                    continue
+            stats["applied"] += len(target_positions)
 
-                prev_slice_idx = prev_map.get((token_idx, head_idx))
-                if prev_slice_idx is None:
-                    continue
+        return stats if return_stats else None
 
-                if precision in ("fp32", "fp16", "int8"):
-                    data["k"][slice_idx] = prev_data["k"][prev_slice_idx]
-                    data["v"][slice_idx] = prev_data["v"][prev_slice_idx]
-                    if precision == "int8":
-                        data["scale_k"][slice_idx] = prev_data["scale_k"][prev_slice_idx]
-                        data["scale_v"][slice_idx] = prev_data["scale_v"][prev_slice_idx]
-                elif precision == "int4":
-                    k_start, k_end, v_start, v_end = data["byte_offsets"][slice_idx]
-                    (
-                        prev_k_start,
-                        prev_k_end,
-                        prev_v_start,
-                        prev_v_end,
-                    ) = prev_data[
-                        "byte_offsets"
-                    ][prev_slice_idx]
-                    data["k"][k_start:k_end] = prev_data["k"][prev_k_start:prev_k_end]
-                    data["v"][v_start:v_end] = prev_data["v"][prev_v_start:prev_v_end]
-                    data["scale_k"][slice_idx] = prev_data["scale_k"][prev_slice_idx]
-                    data["scale_v"][slice_idx] = prev_data["scale_v"][prev_slice_idx]
+    def _compute_data_bytes(self) -> int:
+        total = 0
+        for data in self.packed_data.values():
+            for key in ("k", "v", "scale_k", "scale_v"):
+                tensor = data.get(key)
+                if tensor is not None:
+                    total += tensor.numel() * tensor.element_size()
+        return total
+
+    def resident_bytes(self) -> int:
+        """Return resident bytes including per-entry metadata (AR012).
+
+        Metadata is estimated at 48 bytes per token-head: a 16-byte Python
+        tuple/list slot for ``indices`` plus four int64 offsets (32 bytes).
+        """
+        if not self.packed_data:
+            return 0
+        num_entries = sum(len(data["indices"]) for data in self.packed_data.values())
+        return self._compute_data_bytes() + 48 * num_entries
 
     def __repr__(self) -> str:
         return (

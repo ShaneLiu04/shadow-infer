@@ -9,7 +9,7 @@
 版本：v3.1
 """
 
-__version__ = "3.13.0"
+__version__ = "3.14.0"
 
 import argparse
 import json

@@ -73,6 +73,10 @@ class ShadowKVAgent(BaseAgent):
         self.model_name = config.get("model_name", "unknown")
         self.run_id = config.get("run_id", "default")
         self.use_packed_cache = config.get("use_packed_cache", True)
+        self.store_dense_kv = bool(config.get("store_dense_kv", not self.use_packed_cache))
+        self.int4_group_size = int(config.get("int4_group_size", 16))
+        if self.int4_group_size < 1:
+            raise ValueError(f"int4_group_size must be >= 1, got {self.int4_group_size}")
         self.use_decision_plane = config.get("use_decision_plane", False)
         self.prefetch_enabled = config.get("prefetch_enabled", False)
         self.rd_allocation_enabled = bool(config.get("rd_allocation_enabled", True))
@@ -171,6 +175,10 @@ class ShadowKVAgent(BaseAgent):
 
         # 加载优化配置
         self.compression_target = self.config.get("compression_target", 0.5)
+        self.store_dense_kv = bool(self.config.get("store_dense_kv", not self.use_packed_cache))
+        self.int4_group_size = int(self.config.get("int4_group_size", 16))
+        if self.int4_group_size < 1:
+            raise ValueError(f"int4_group_size must be >= 1, got {self.int4_group_size}")
         self.rd_allocation_enabled = bool(self.config.get("rd_allocation_enabled", True))
         self.hard_eviction_enabled = bool(self.config.get("hard_eviction_enabled", False))
         self.dense_precision_enabled = bool(self.config.get("dense_precision_enabled", True))
@@ -590,7 +598,7 @@ class ShadowKVAgent(BaseAgent):
 
         AR009：成本模型统一由 ``rd_allocator.entry_bytes`` 提供，``evicted`` 为 0。
         """
-        return entry_bytes(precision, batch, head_dim)
+        return entry_bytes(precision, batch, head_dim, group_size=self.int4_group_size)
 
     def _estimate_precision_bytes(
         self, precision_map: Dict[int, Dict[int, str]], batch: int, seq_len: int, head_dim: int
@@ -651,6 +659,7 @@ class ShadowKVAgent(BaseAgent):
             rd_allocation=self.rd_allocation_enabled,
             allow_eviction=self.hard_eviction_enabled,
             protected=protected,
+            group_size=self.int4_group_size,
         )
 
         if evicted:
@@ -684,7 +693,7 @@ class ShadowKVAgent(BaseAgent):
         v_tensor = kv_current["v"]
         batch, _, seq_len, head_dim = k_tensor.shape
 
-        predicted = predict_codes_bytes(codes, batch, head_dim)
+        predicted = predict_codes_bytes(codes, batch, head_dim, group_size=self.int4_group_size)
         if predicted <= layer_budget:
             return codes
 
@@ -716,6 +725,7 @@ class ShadowKVAgent(BaseAgent):
             rd_allocation=self.rd_allocation_enabled,
             allow_eviction=self.hard_eviction_enabled,
             protected_mask=protected_mask,
+            group_size=self.int4_group_size,
         )
 
         if evicted:
@@ -1541,6 +1551,7 @@ class ShadowKVAgent(BaseAgent):
                 k_tensor,
                 v_tensor,
                 precision_map,
+                group_size=self.int4_group_size,
                 plan=plan,
                 precomputed=core.get("group_payload"),
             )
@@ -1609,7 +1620,7 @@ class ShadowKVAgent(BaseAgent):
         scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         # AR003：INT4 分组自适应（与 PackedKVCache 规则一致）——head_dim 不可
         # 被 64 整除时以 head_dim 为组（修复小 head_dim 模型 int4 直接抛错）
-        int4_group = 64 if head_dim % 64 == 0 else head_dim
+        int4_group = self.int4_group_size if head_dim % self.int4_group_size == 0 else head_dim
 
         groups: Dict[str, List[Tuple[int, int]]] = {
             "fp32": [],
@@ -1732,7 +1743,7 @@ class ShadowKVAgent(BaseAgent):
             )
         reuse_set = plan.reuse_set() if reuse_active else set()
 
-        int4_group = 64 if head_dim % 64 == 0 else head_dim
+        int4_group = self.int4_group_size if head_dim % self.int4_group_size == 0 else head_dim
         scale_k_map: Optional[Dict[Tuple[int, int], Optional[torch.Tensor]]] = (
             {} if build_scale_map else None
         )
@@ -1813,7 +1824,7 @@ class ShadowKVAgent(BaseAgent):
         scale_k_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         scale_v_map: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         # AR003：INT4 分组自适应（与向量化路径一致）
-        int4_group = 64 if head_dim % 64 == 0 else head_dim
+        int4_group = self.int4_group_size if head_dim % self.int4_group_size == 0 else head_dim
 
         for token_idx in range(seq_len):
             token_precision = precision_map.get(token_idx, {})
@@ -1841,8 +1852,8 @@ class ShadowKVAgent(BaseAgent):
                     v_slice.unsqueeze(0), precision, group_size=int4_group
                 )
 
-                k_out[:, head_idx, token_idx, :] = k_quantized.squeeze(0)
-                v_out[:, head_idx, token_idx, :] = v_quantized.squeeze(0)
+                k_out[:, head_idx, token_idx, :] = k_quantized.reshape(batch_size, head_dim)
+                v_out[:, head_idx, token_idx, :] = v_quantized.reshape(batch_size, head_dim)
 
                 scale_k_map[(token_idx, head_idx)] = scale_k
                 scale_v_map[(token_idx, head_idx)] = scale_v
@@ -1888,9 +1899,14 @@ class ShadowKVAgent(BaseAgent):
         if reuse_decision is not None:
             is_reused = reuse_decision.get("should_reuse", False)
 
+        packed_only = packed_kv is not None and not self.store_dense_kv
+        if packed_only:
+            precision_str = "mixed"
+        k_stored: Optional[torch.Tensor] = None if packed_only else k
+        v_stored: Optional[torch.Tensor] = None if packed_only else v
         entry = KVCacheEntry(
-            k_tensor=k,
-            v_tensor=v,
+            k_tensor=k_stored,
+            v_tensor=v_stored,
             precision=precision_str,
             importance_score=0.0,
             is_reused=is_reused,
@@ -1899,22 +1915,27 @@ class ShadowKVAgent(BaseAgent):
         )
         self.cache_manager.store(layer_id, entry)
         self.kv_cache[layer_id] = {
-            "k": k,
-            "v": v,
+            "k": None if packed_kv is not None else k_stored,
+            "v": None if packed_kv is not None else v_stored,
             "precision": precision_str,
             "packed_kv": packed_kv,
         }
 
-    def _load_kv(self, layer_id: int) -> Dict[str, torch.Tensor]:
-        """从缓存加载 KV。"""
+    def _load_kv(self, layer_id: int) -> Dict[str, Any]:
+        """Load KV from cache; dequantize packed-only entries on demand."""
         entry = self.cache_manager.retrieve(layer_id)
         if entry is None:
             return {}
-        return {
-            "k": entry.k_tensor,
-            "v": entry.v_tensor,
-            "precision": entry.precision,
-        }
+        if entry.k_tensor is not None and entry.v_tensor is not None:
+            return {
+                "k": entry.k_tensor,
+                "v": entry.v_tensor,
+                "precision": entry.precision,
+            }
+        if entry.packed_kv is not None:
+            k, v = entry.packed_kv.unpack()
+            return {"k": k, "v": v, "precision": entry.precision}
+        return {"k": entry.k_tensor, "v": entry.v_tensor, "precision": entry.precision}
 
     def prefetch_next_step(
         self,
@@ -1988,7 +2009,12 @@ class ShadowKVAgent(BaseAgent):
         # Build a staging PackedKVCache for the prefetched entry.
         # Create a shallow copy by re-packing with the same precision map.
         precision_map = self.precision_map.get(layer_id, {})
-        staged_result = PackedKVCache.pack(compressed_kv["k"], compressed_kv["v"], precision_map)
+        staged_result = PackedKVCache.pack(
+            compressed_kv["k"],
+            compressed_kv["v"],
+            precision_map,
+            group_size=self.int4_group_size,
+        )
         staged_packed = staged_result["packed_kv"]
         staged_packed.apply_reuse_mask(packed_kv, reuse_mask)
 

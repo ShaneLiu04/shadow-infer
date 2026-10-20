@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.13.0 | 812 passed / 1 skipped | 82.99% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.14.0 | 853 passed / 1 skipped | 83.23% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -67,6 +67,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **率失真 KV 预算分配（v3.11.0）** | `rd_allocator` 以 `attention_importance × KV 幅值敏感度` 排序（量化误差近似），替代纯重要性降档；sink 与复用条目受保护。可选硬驱逐（`hard_eviction_enabled`）在预算低于 int4 底线时按同序驱逐低价值 token-head（零字节，解包为零），保证内存上限不再被突破。真实 8 层模型 5 seed：同字节加权 KV 重建误差 1.2MB -3.94%、1.5MB -6.58%；0.9MB 持平（-0.26%）。 |
 | **稠密精度码热路径（v3.12.0）** | 以 `int8[seq, heads]` codes 作为精度决策的唯一热路径状态：`allocate_precision_codes` 直接产出 codes，`admit_codes` 用稳定 argsort + 前缀和闭式求解降档/驱逐，`PrecisionPlan.from_codes` 张量化生成分组与 flat 索引，dict 仅在 API 边界转换一次。修复非连续 K/V 导致 `zeros_like().view()` 的静默回退（4 层管线 16 次压缩 0 次回退）。CPU 3 次中位 8192×32 元数据阶段 2443.2→135.7 ms（18.00x），512-4096 为 16.67-18.81x，输出与 v3.11 逐位一致。 |
 | **可执行 INT8 FFN（v3.13.0）** | `INT8Linear` 按输出通道对称量化权重、按 token 动态量化激活，使用真实 `torch._int_mm` INT8 GEMM 后按 `scale_x × scale_w` 反量化；`SimpleDiffusionLLM`/HF 后端可直接替换 FFN 线性层并释放 FP32 权重（可选保留 golden）。7B FFN 上投影（4096×11008，M>=16）CPU 复跑 4.8-6.7x，权重内存 3.99x 降低；中等模型端到端 1.37-1.47x；小模型 logits 相对误差 0.43%、top-1 99.22%。`_int_mm` 不可用时确定性回退且只告警一次。 |
+| **规范化紧凑 KV Store（v3.14.0）** | `PackedKVCache.unpack` / `apply_reuse_mask` / `evict` 全量张量化：unpack 按精度桶批量 gather+反量化（CPU 512-2048 为 101-219x），复用按 flat 索引批量拷贝（7.3-8.2x），驱逐改为桶内就地删除并真实释放字节（49-109x，25% 条目对应 25% 字节下降）。修正 INT4 `B>1` scale 的 batch 索引缺陷（B=2 每 batch 相对 MSE 0.0075/0.0072），统一压缩/打包/成本模型的 `int4_group_size`（默认 16）且只量化一次；默认 `store_dense_kv=false`，packed cache 成为单一驻留表示，`resident_bytes()` 与 `KVCacheManager` 统一口径（dense shadow 存在时同时计入，超预算先释放 shadow 再驱逐）。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -111,7 +112,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`812 passed, 1 skipped`，测试覆盖率 `82.99%`（pytest-cov，fail-under 75）。
+当前主分支：`853 passed, 1 skipped`，测试覆盖率 `83.23%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -717,7 +718,31 @@ python specs/archive/AR010-dense-precision-pipeline/ar010_bench.py
 
 # 可执行 INT8 FFN 基准（7B FFN 形状 / 中等模型 / logits golden）
 python specs/archive/AR011-int8-ffn-execution/ar011_bench.py
+
+# 紧凑 KV Store 读写/复用/驱逐基准（含 INT4 batch 修正与字节下降断言）
+python specs/archive/AR012-canonical-kv-store/ar012_bench.py
 ```
+
+### 实测数据（v3.14.0，2026-10-20，Windows / CPU）
+
+真实张量、混合精度 map（fp32/fp16/int8/int4 轮转）、`B=1/H=8/D=64`，3 次中位
+（`specs/archive/AR012-canonical-kv-store/ar012_bench.py`）：
+
+| 规模 S | unpack 旧→新 | 加速 | reuse 旧→新 | 加速 | evict 旧→新 | 加速 | 驱逐后字节 |
+|---|---|---|---|---|---|---|---|
+| 512 | 485.8→4.8 ms | **101.3x** | 84.2→11.5 ms | **7.3x** | 564.2→11.5 ms | **49.0x** | -25.0% |
+| 1024 | 1016.1→4.8 ms | **212.1x** | 124.6→15.2 ms | **8.2x** | 951.3→15.4 ms | **61.9x** | -25.0% |
+| 2048 | 1883.8→8.6 ms | **218.6x** | 266.0→32.4 ms | **8.2x** | 2899.3→26.6 ms | **109.2x** | -25.0% |
+
+- INT4 `B=2` 每 batch 相对 MSE：K 为 0.0075 / 0.0072（修正前分别约 0.1617 / 0.0819）；
+  修复的是 scale `[N*B,G,1]` 被按 `[N]` 读取的 batch 索引缺陷。
+- 独立复跑受 CPU 调度影响，加速区间约 unpack 101-219x、reuse 7.3-8.2x、evict 49-109x；
+  所有运行均满足门槛（5x/3x/10x）。
+- 驱逐按每个精度桶各删 1/4 条目；实际字节与条目数同比例下降，未触碰条目反量化值逐位不变，
+  `group_size`/`num_groups` 保持不变，重复驱逐不复活。
+- `store_dense_kv=false` 时 packed 为单一驻留表示；`_load_kv` 按需反量化。
+- 本 AR 不把压缩 KV 回灌 attention，**不宣称端到端模型加速**；GPU/7B 驻留与延迟按
+  `specs/archive/AR012-canonical-kv-store/server-experiment.md` 在服务器回填。
 
 ### 实测数据（v3.13.0，2026-10-20，Windows / CPU）
 
@@ -1158,6 +1183,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.14.0（2026-10）
+
+- **紧凑 KV Store 热路径**：`PackedKVCache.unpack` / `apply_reuse_mask` / `evict` 全量张量化；unpack 按精度桶批量 gather+反量化，复用按 flat 索引批量拷贝，驱逐改为桶内就地删除（不再 unpack/re-pack）。
+- **INT4 正确性**：修正 `B>1` 时 scale 按 `[entry]` 而非 `[entry,batch]` 读取的缺陷（B=2 每 batch 相对 MSE 0.0075/0.0072）；压缩、打包、驱逐与成本模型统一 `int4_group_size`（默认 16），打包复用压缩阶段的 INT4 payload，不再二次量化。
+- **单源驻留**：新增 `store_dense_kv`（packed 模式下默认 `false`），packed cache 成为唯一驻留表示；`_load_kv` 按需反量化；新增 `resident_bytes()` 并统一 `KVCacheManager` 内存口径（dense shadow 存在时同时计入，超预算时先释放 shadow 再驱逐 packed 条目）。
+- **实测（CPU，3 次中位）**：unpack 512-2048 为 101-219x，复用 7.3-8.2x，驱逐 49-109x；驱逐 1/4 条目后字节真实下降 25.0%，未触碰条目逐位不变。
+- **复现资产**：`specs/archive/AR012-canonical-kv-store/`（srs/design/st-cases/bench/server-experiment），`configs/experiments/s7_kv_store_gpu.yaml`；853 passed / 1 skipped，覆盖率 83.23%。
 
 ### v3.13.0（2026-10）
 

@@ -50,8 +50,8 @@ class KVCacheEntry:
         reuse_step: 复用来源的 step id；若未复用则为 -1。
     """
 
-    k_tensor: Tensor
-    v_tensor: Tensor
+    k_tensor: Optional[Tensor]
+    v_tensor: Optional[Tensor]
     precision: str
     scale_k: Optional[Tensor] = None
     scale_v: Optional[Tensor] = None

@@ -23,17 +23,17 @@ PRECISION_CODE_DOWNGRADE = {0: 1, 1: 2, 2: 3}
 EVICTED_CODE = 4
 
 
-def entry_bytes(precision: str, batch: int, head_dim: int) -> float:
+def entry_bytes(precision: str, batch: int, head_dim: int, group_size: int = 16) -> float:
     """Return approximate stored bytes for one token-head (K+V, incl. scales).
 
-    Matches ``PackedKVCache.pack`` defaults: INT4 group size 16 when divisible,
+    Matches ``PackedKVCache.pack``: INT4 uses ``group_size`` when divisible,
     otherwise the whole ``head_dim`` as a single group.
     """
     p = precision.lower() if isinstance(precision, str) else precision
     if p == EVICTED:
         return 0.0
     if p == "int4":
-        group = 16 if head_dim % 16 == 0 else head_dim
+        group = group_size if group_size > 0 and head_dim % group_size == 0 else head_dim
         per_tensor = batch * head_dim / 2.0 + batch * (head_dim // group) * 4
     elif p == "int8":
         per_tensor = batch * head_dim + batch * 4
@@ -72,6 +72,7 @@ def admit_budget(
     rd_allocation: bool = True,
     allow_eviction: bool = False,
     protected: Optional[Set[Tuple[int, int]]] = None,
+    group_size: int = 16,
 ) -> Tuple[Dict[int, Dict[int, str]], int, int]:
     """Fit a precision map into ``budget_bytes``.
 
@@ -86,7 +87,7 @@ def admit_budget(
     if budget_bytes is None or budget_bytes < 0:
         predicted = int(
             sum(
-                entry_bytes(p, batch, head_dim)
+                entry_bytes(p, batch, head_dim, group_size=group_size)
                 for head_map in result.values()
                 for p in head_map.values()
             )
@@ -101,7 +102,7 @@ def admit_budget(
     if seq_len <= 0 or num_heads <= 0:
         predicted = int(
             sum(
-                entry_bytes(p, batch, head_dim)
+                entry_bytes(p, batch, head_dim, group_size=group_size)
                 for head_map in result.values()
                 for p in head_map.values()
             )
@@ -127,7 +128,7 @@ def admit_budget(
 
     predicted = int(
         sum(
-            entry_bytes(p, batch, head_dim)
+            entry_bytes(p, batch, head_dim, group_size=group_size)
             for head_map in result.values()
             for p in head_map.values()
         )
@@ -143,7 +144,8 @@ def admit_budget(
             index += 1
             continue
         predicted -= int(
-            entry_bytes(current, batch, head_dim) - entry_bytes(next_precision, batch, head_dim)
+            entry_bytes(current, batch, head_dim, group_size=group_size)
+            - entry_bytes(next_precision, batch, head_dim, group_size=group_size)
         )
         token_map[head_idx] = next_precision
         if next_precision == "int4":
@@ -157,7 +159,7 @@ def admit_budget(
             token_map = result.setdefault(token_idx, {})
             current = token_map.get(head_idx, "fp16")
             if current != EVICTED:
-                predicted -= int(entry_bytes(current, batch, head_dim))
+                predicted -= int(entry_bytes(current, batch, head_dim, group_size=group_size))
                 token_map[head_idx] = EVICTED
                 evicted_count += 1
             index += 1
@@ -165,7 +167,9 @@ def admit_budget(
     return result, int(predicted), evicted_count
 
 
-def predict_codes_bytes(codes: torch.Tensor, batch: int, head_dim: int) -> int:
+def predict_codes_bytes(
+    codes: torch.Tensor, batch: int, head_dim: int, group_size: int = 16
+) -> int:
     """Vectorized byte prediction for dense ``int8 [seq, heads]`` codes (AR010).
 
     Mirrors :func:`entry_bytes` over the five codes; used by both
@@ -173,7 +177,10 @@ def predict_codes_bytes(codes: torch.Tensor, batch: int, head_dim: int) -> int:
     iterates token-head entries in Python.
     """
     costs = torch.tensor(
-        [int(entry_bytes(CODE_PRECISIONS[code], batch, head_dim)) for code in range(5)],
+        [
+            int(entry_bytes(CODE_PRECISIONS[code], batch, head_dim, group_size=group_size))
+            for code in range(5)
+        ],
         dtype=torch.long,
         device=codes.device,
     )
@@ -191,6 +198,7 @@ def admit_codes(
     rd_allocation: bool = True,
     allow_eviction: bool = False,
     protected_mask: Optional[torch.Tensor] = None,
+    group_size: int = 16,
 ) -> Tuple[torch.Tensor, int, int]:
     """Dense ``int8 [seq, heads]`` variant of :func:`admit_budget` (AR010).
 
@@ -210,11 +218,14 @@ def admit_codes(
     flat = out.reshape(-1)
 
     costs = torch.tensor(
-        [int(entry_bytes(CODE_PRECISIONS[code], batch, head_dim)) for code in range(5)],
+        [
+            int(entry_bytes(CODE_PRECISIONS[code], batch, head_dim, group_size=group_size))
+            for code in range(5)
+        ],
         dtype=torch.long,
         device=codes.device,
     )
-    predicted = predict_codes_bytes(flat, batch, head_dim)
+    predicted = predict_codes_bytes(flat, batch, head_dim, group_size=group_size)
     if budget_bytes is None or budget_bytes < 0:
         return out, predicted, 0
 
@@ -238,8 +249,8 @@ def admit_codes(
 
     deltas = torch.tensor(
         [
-            int(entry_bytes(CODE_PRECISIONS[c], batch, head_dim))
-            - int(entry_bytes(CODE_PRECISIONS[c + 1], batch, head_dim))
+            int(entry_bytes(CODE_PRECISIONS[c], batch, head_dim, group_size=group_size))
+            - int(entry_bytes(CODE_PRECISIONS[c + 1], batch, head_dim, group_size=group_size))
             for c in (0, 1, 2)
         ],
         dtype=torch.long,
