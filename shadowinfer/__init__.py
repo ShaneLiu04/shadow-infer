@@ -1,10 +1,10 @@
 """ShadowInfer — Edge-optimized Diffusion LLM inference and profiling framework.
 
 Docs: README.md, ROADMAP.md
-Version: v3.12.0
+Version: v3.13.0
 """
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 
 from shadowinfer.core import (
     AgentRegistry,

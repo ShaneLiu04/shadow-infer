@@ -91,6 +91,14 @@ class ModelBackend(abc.ABC):
         """
         return {}
 
+    def enable_int8_ffn(self, keep_fp32_reference: bool = False) -> Dict[str, Any]:
+        """Enable an executable INT8 FFN path when the backend supports it.
+
+        Backends that cannot execute INT8 FFN return ``{"supported": False}``.
+        """
+        del keep_fp32_reference
+        return {"supported": False}
+
 
 class MockModelBackend(ModelBackend):
     """模拟模型后端，用于框架测试和无真实模型时的运行。"""

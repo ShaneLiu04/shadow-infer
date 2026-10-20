@@ -158,6 +158,8 @@ class HuggingFaceModelBackend(ModelBackend):
         self._tokenizer: Optional[Any] = None
         self._kv_cache: Dict[int, KVCacheEntry] = {}
         self._device = torch.device("cpu")
+        self._int8_ffn_stats: Optional[Dict[str, Any]] = None
+        self._fp32_ffn_reference: Optional[list] = None
 
     def load(
         self,
@@ -384,6 +386,44 @@ class HuggingFaceModelBackend(ModelBackend):
     def set_kv_cache(self, kv_cache: Dict[int, KVCacheEntry]) -> None:
         """Set the current KV cache state."""
         self._kv_cache = kv_cache
+
+    def enable_int8_ffn(self, keep_fp32_reference: bool = False) -> Dict[str, Any]:
+        """Replace common HF FFN linear modules with executable INT8 linears."""
+        if self._model is None:
+            raise RuntimeError("Model has not been loaded. Call load() first.")
+        from shadowinfer.ffn_optimizer.int8_linear import quantize_ffn_modules
+
+        stats = quantize_ffn_modules(self._model, keep_fp32_reference=keep_fp32_reference)
+        if not stats.get("supported", False):
+            return {"supported": False}
+        stats = dict(stats)
+        new_references = stats.pop("_references", None)
+        if keep_fp32_reference:
+            existing = getattr(self, "_fp32_ffn_reference", None) or []
+            self._fp32_ffn_reference = (
+                existing + new_references if new_references else existing
+            ) or None
+        else:
+            self._fp32_ffn_reference = None
+        self._int8_ffn_stats = stats
+        return stats
+
+    def restore_fp32_ffn(self) -> None:
+        """Restore original HF FFN modules when references were kept."""
+        references = getattr(self, "_fp32_ffn_reference", None)
+        if not references:
+            raise RuntimeError(
+                "no FP32 FFN reference available; enable_int8_ffn("
+                "keep_fp32_reference=True) must be called before restore"
+            )
+        for parent, attribute, module in references:
+            setattr(parent, attribute, module)
+        self._fp32_ffn_reference = None
+        self._int8_ffn_stats = None
+
+    def get_int8_ffn_stats(self) -> Optional[Dict[str, Any]]:
+        stats = getattr(self, "_int8_ffn_stats", None)
+        return None if stats is None else dict(stats)
 
     def get_model_config(self) -> Dict[str, Any]:
         """Return the model configuration."""

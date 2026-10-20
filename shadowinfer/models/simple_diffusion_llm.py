@@ -150,6 +150,8 @@ class SimpleDiffusionLLM(nn.Module):
         self.output_proj = nn.Linear(
             hidden_dim, vocab_size, bias=False, device=self._device, dtype=self._dtype
         )
+        self._fp32_ffn_reference: Optional[list] = None
+        self._int8_ffn_stats: Optional[Dict[str, object]] = None
 
     def forward_step(
         self,
@@ -202,6 +204,86 @@ class SimpleDiffusionLLM(nn.Module):
         hidden = self.out_norm(hidden)
         logits = self.output_proj(hidden)
         return logits, updated_kv, attention_scores
+
+    def enable_int8_ffn(self, keep_fp32_reference: bool = False) -> Dict[str, object]:
+        """Replace every FFN up/down projection with an executable INT8 linear.
+
+        By default the original FP32 modules are released so their weights can be
+        reclaimed. Set ``keep_fp32_reference=True`` for golden comparisons and a
+        later :meth:`restore_fp32_ffn`.
+        """
+        from shadowinfer.ffn_optimizer.int8_linear import INT8Linear
+
+        references = [] if keep_fp32_reference else None
+        modules = 0
+        weight_bytes = 0
+        dense_bytes = 0
+        fallback = False
+
+        for block in self.blocks:
+            for name in ("up_proj", "down_proj"):
+                module = getattr(block, name)
+                if isinstance(module, INT8Linear):
+                    modules += 1
+                    weight_bytes += module.memory_bytes()
+                    dense_bytes += module.dense_equivalent_bytes()
+                    fallback = fallback or not module.using_int_mm
+                    continue
+                if not isinstance(module, nn.Linear):
+                    raise TypeError(f"{name} must be nn.Linear, got {type(module).__name__}")
+                quantized = INT8Linear.from_linear(module)
+                if references is not None:
+                    references.append((block, name, module))
+                setattr(block, name, quantized)
+                modules += 1
+                weight_bytes += quantized.memory_bytes()
+                dense_bytes += quantized.dense_equivalent_bytes()
+                fallback = fallback or not quantized.using_int_mm
+
+        if references is not None:
+            # Repeated enable(keep=True) on already-quantized layers captures
+            # nothing new; preserve the original reference list for restore.
+            existing = self._fp32_ffn_reference or []
+            self._fp32_ffn_reference = (existing + references) if references else existing
+        else:
+            # Explicitly release any earlier reference so FP32 weights can be freed.
+            self._fp32_ffn_reference = None
+        stats: Dict[str, object] = {
+            "layers": len(self.blocks),
+            "modules": modules,
+            "weight_bytes": weight_bytes,
+            "dense_bytes": dense_bytes,
+            "fallback": fallback,
+        }
+        self._int8_ffn_stats = stats
+        return dict(stats)
+
+    def restore_fp32_ffn(self) -> None:
+        """Restore the FP32 FFN modules captured by ``keep_fp32_reference=True``."""
+        references = self._fp32_ffn_reference
+        if not references:
+            raise RuntimeError(
+                "no FP32 FFN reference available; enable_int8_ffn("
+                "keep_fp32_reference=True) must be called before restore"
+            )
+        for block, name, module in references:
+            setattr(block, name, module)
+        self._fp32_ffn_reference = None
+        self._int8_ffn_stats = None
+
+    @property
+    def int8_ffn_stats(self) -> Optional[Dict[str, object]]:
+        if self._int8_ffn_stats is None:
+            return None
+        from shadowinfer.ffn_optimizer.int8_linear import INT8Linear
+
+        stats = dict(self._int8_ffn_stats)
+        stats["fallback"] = any(
+            isinstance(getattr(block, name), INT8Linear) and not getattr(block, name).using_int_mm
+            for block in self.blocks
+            for name in ("up_proj", "down_proj")
+        )
+        return stats
 
     @property
     def device(self) -> torch.device:

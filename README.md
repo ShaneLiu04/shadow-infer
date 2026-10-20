@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.12.0 | 792 passed / 1 skipped | 82.99% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.13.0 | 812 passed / 1 skipped | 82.99% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -66,6 +66,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **FlashInfer 式 Plan/Run 融合（v3.10.0）** | 新增 `PrecisionPlan`：一次构建精度分组/flat 索引/复用索引/SHA-256 指纹，压缩与字节打包共享；生产路径不再构造未使用的逐条目 scale dict；pack 复用压缩阶段 fp16/int8 量化结果，消除重复分组与重复量化。保留 legacy 与逐元素 reference 作 golden，异常自动回退。CPU 多规模同批中位合计 2.81-3.74x（逐位一致）。 |
 | **率失真 KV 预算分配（v3.11.0）** | `rd_allocator` 以 `attention_importance × KV 幅值敏感度` 排序（量化误差近似），替代纯重要性降档；sink 与复用条目受保护。可选硬驱逐（`hard_eviction_enabled`）在预算低于 int4 底线时按同序驱逐低价值 token-head（零字节，解包为零），保证内存上限不再被突破。真实 8 层模型 5 seed：同字节加权 KV 重建误差 1.2MB -3.94%、1.5MB -6.58%；0.9MB 持平（-0.26%）。 |
 | **稠密精度码热路径（v3.12.0）** | 以 `int8[seq, heads]` codes 作为精度决策的唯一热路径状态：`allocate_precision_codes` 直接产出 codes，`admit_codes` 用稳定 argsort + 前缀和闭式求解降档/驱逐，`PrecisionPlan.from_codes` 张量化生成分组与 flat 索引，dict 仅在 API 边界转换一次。修复非连续 K/V 导致 `zeros_like().view()` 的静默回退（4 层管线 16 次压缩 0 次回退）。CPU 3 次中位 8192×32 元数据阶段 2443.2→135.7 ms（18.00x），512-4096 为 16.67-18.81x，输出与 v3.11 逐位一致。 |
+| **可执行 INT8 FFN（v3.13.0）** | `INT8Linear` 按输出通道对称量化权重、按 token 动态量化激活，使用真实 `torch._int_mm` INT8 GEMM 后按 `scale_x × scale_w` 反量化；`SimpleDiffusionLLM`/HF 后端可直接替换 FFN 线性层并释放 FP32 权重（可选保留 golden）。7B FFN 上投影（4096×11008，M>=16）CPU 复跑 4.8-6.7x，权重内存 3.99x 降低；中等模型端到端 1.37-1.47x；小模型 logits 相对误差 0.43%、top-1 99.22%。`_int_mm` 不可用时确定性回退且只告警一次。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -110,7 +111,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`772 passed, 1 skipped`，测试覆盖率 `82.93%`（pytest-cov，fail-under 75）。
+当前主分支：`812 passed, 1 skipped`，测试覆盖率 `82.99%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -713,7 +714,31 @@ python -m shadowinfer optimize \
 
 # 稠密精度码元数据基准（dict vs codes，含逐位一致性断言）
 python specs/archive/AR010-dense-precision-pipeline/ar010_bench.py
+
+# 可执行 INT8 FFN 基准（7B FFN 形状 / 中等模型 / logits golden）
+python specs/archive/AR011-int8-ffn-execution/ar011_bench.py
 ```
+
+### 实测数据（v3.13.0，2026-10-20，Windows / CPU）
+
+真实张量与真实 `SimpleDiffusionLLM`（`specs/archive/AR011-int8-ffn-execution/ar011_bench.py`，
+3 次中位[min-max]；`M` 为 token 行数）：
+
+| FFN 形状（M×K×N） | FP32 | INT8 | 加速 | 权重内存 |
+|---|---|---|---|---|
+| 16×4096×11008 | 29.44 ms | 4.37 ms | **6.74x** | 3.99x |
+| 64×4096×11008 | 35.02 ms | 5.90 ms | **5.93x** | 3.99x |
+| 128×4096×11008 | 45.67 ms | 9.51 ms | **4.80x** | 3.99x |
+| 1×4096×11008 | 4.51 ms | 3.61 ms | 1.25x | 3.99x |
+| 64×11008×4096（反向） | 14.85 ms | 8.80 ms | 1.69x | 4.00x |
+
+- 中等模型端到端（4 层 / hidden=1024 / intermediate=4096 / seq=256）：85.1→58.1 ms（**1.47x**），
+  logits 相对误差 0.46%。
+- 小模型（4 层/8 头/dim64/seq128，3 seed）：logits 相对误差 0.43%，top-1 一致率 99.22%。
+- 独立复跑区间：7B 上投影 4.8-6.7x，中等模型 1.37-1.47x；小尺寸存在交叉点
+  （128×128×512 为 0.23x，512×256×1024 为 0.59x），如实记录，不外推。
+- 7B 预训练模型/GPU 的端到端延迟与困惑度按 `server-experiment.md` 在服务器回填；
+  本机不宣称 7B 端到端结果。
 
 ### 实测数据（v3.12.0，2026-10-19，Windows / CPU）
 
@@ -1015,6 +1040,7 @@ ShadowInfer/
 │   │   ├── s3_longctx_gpu.yaml
 │   │   ├── s4_edge_eviction_gpu.yaml
 │   │   ├── s5_dense_precision_gpu.yaml
+│   │   ├── s6_int8_ffn_gpu.yaml
 │   │   └── model_7b_longctx.yaml
 │   ├── model_fast_dllm_7b.yaml
 │   ├── optimize_full.yaml
@@ -1050,6 +1076,7 @@ ShadowInfer/
 │   ├── qdrift/                     # 步感知调度
 │   ├── ffn_optimizer/              # FFN 优化
 │   │   ├── ffn_optimizer_agent.py
+│   │   ├── int8_linear.py          # 可执行 INT8 FFN（v3.13.0）
 │   │   └── packed_weight.py
 │   ├── kernels/                    # CUDA 算子 + CPU fallback
 │   ├── distributed/                # 多 GPU 脚手架
@@ -1131,6 +1158,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.13.0（2026-10）
+
+- **可执行 INT8 FFN**：新增 `INT8Linear`（per-output-channel 权重 scale + per-token 激活 scale，真实 `_int_mm`），替代原有“打包但不执行”的 FFN 路径；`_int_mm` 不可用时确定性回退且仅告警一次。
+- **模型级接线**：`SimpleDiffusionLLM.enable_int8_ffn()` 替换全部 FFN 上下投影并默认释放 FP32 权重，支持 `keep_fp32_reference`/`restore_fp32_ffn`；PyTorch 与 HuggingFace 后端均可启用（HF 按 `mlp.up_proj/down_proj/gate_proj`、`mlp.c_fc/c_proj` 匹配）。
+- **编排与配置**：修复 `ffn:` / `ffn_optimizer:` 配置键不一致；启用 INT8 执行后跳过重复的 FFN Agent 记账路径，`_run_ffn` 返回真实执行统计。
+- **实测（CPU，3 次中位）**：7B 上投影 M=16/64/128 为 6.74x/5.93x/4.80x（复跑 4.8-6.7x），权重内存 3.99x 降低；中等模型端到端 1.47x（复跑 1.37-1.47x）；小模型 logits 误差 0.43%、top-1 99.22%；小尺寸交叉点如实记录。
+- **复现资产**：`specs/archive/AR011-int8-ffn-execution/`（srs/design/tasks/st-cases/bench/server-experiment），`configs/experiments/s6_int8_ffn_gpu.yaml`；812 passed / 1 skipped，覆盖率 82.99%。
 
 ### v3.12.0（2026-10）
 

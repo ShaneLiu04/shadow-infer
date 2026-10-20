@@ -74,6 +74,7 @@ class PyTorchModelBackend(ModelBackend):
         self._model: Optional[SimpleDiffusionLLM] = None
         self._kv_cache: Dict[int, KVCacheEntry] = {}
         self._device = torch.device("cpu")
+        self._int8_ffn_stats: Optional[Dict[str, Any]] = None
 
     def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         del kwargs  # unused
@@ -182,6 +183,18 @@ class PyTorchModelBackend(ModelBackend):
 
     def set_kv_cache(self, kv_cache: Dict[int, KVCacheEntry]) -> None:
         self._kv_cache = kv_cache
+
+    def enable_int8_ffn(self, keep_fp32_reference: bool = False) -> Dict[str, Any]:
+        """Replace the loaded model's FFN projections with executable INT8 linears."""
+        if self._model is None:
+            raise RuntimeError("Model has not been loaded. Call load() first.")
+        stats = self._model.enable_int8_ffn(keep_fp32_reference=keep_fp32_reference)
+        self._int8_ffn_stats = dict(stats)
+        return {"supported": True, **stats}
+
+    def get_int8_ffn_stats(self) -> Optional[Dict[str, Any]]:
+        stats = getattr(self, "_int8_ffn_stats", None)
+        return None if stats is None else dict(stats)
 
     def get_model_config(self) -> Dict[str, Any]:
         return dict(self.model_config)

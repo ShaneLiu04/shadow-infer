@@ -124,6 +124,8 @@ class Orchestrator:
         }
         # AR003 T006：上一步 ShadowKV 聚合 ΔA（一步滞后喂 QDrift）
         self._last_importance_drift: Optional[float] = None
+        # AR011: executable INT8 FFN stats (None when disabled)
+        self._int8_ffn_stats: Optional[Dict[str, Any]] = None
         self.policy: PolicyEngine = self._load_policy()
         self.safety_net: Optional[ProductionSafetyNet] = None
         self.early_stopper: Optional[UncertaintyEarlyStopper] = None
@@ -192,9 +194,36 @@ class Orchestrator:
                 "max_memory_mb": 8192.0,
             }
         self.initialize_agents(model_config)
+        self._maybe_enable_int8_ffn()
         self._initialized = True
         for agent in self.registry:
             agent.set_state(AgentState.READY)
+
+    def _maybe_enable_int8_ffn(self) -> None:
+        """Enable executable INT8 FFN when configured and supported (AR011)."""
+        ffn_cfg = dict(self.config.get("ffn", {}))
+        ffn_cfg.update(dict(self.config.get("ffn_optimizer", {})))
+        enabled = bool(
+            ffn_cfg.get(
+                "int8_execution_enabled",
+                self.config.get("int8_ffn_enabled", False),
+            )
+        )
+        if not enabled or self.model_backend is None:
+            return
+        keep_reference = bool(ffn_cfg.get("int8_keep_fp32_reference", False))
+        stats = self.model_backend.enable_int8_ffn(keep_fp32_reference=keep_reference)
+        if not stats.get("supported", False):
+            self.logger.log_alert(
+                "warning", "INT8 FFN execution requested but backend does not support it"
+            )
+            return
+        self._int8_ffn_stats = dict(stats)
+        self.logger.log_event(
+            "int8_ffn_enabled",
+            "Executable INT8 FFN enabled",
+            data=dict(stats),
+        )
 
     def initialize_agents(self, model_config: Dict[str, Any]) -> None:
         """初始化所有 Agent（内置 + 插件）。
@@ -226,7 +255,13 @@ class Orchestrator:
             "ffn_optimizer": {"model_name": model_name, "run_id": run_id},
         }
         for key, defaults in builtin_cfgs.items():
-            user_cfg = dict(self.config.get(key, {}))
+            if key == "ffn_optimizer":
+                # AR011: shipped configs use ``ffn:``; legacy ``ffn_optimizer:``
+                # still works and takes precedence for explicit overrides.
+                user_cfg = dict(self.config.get("ffn", {}))
+                user_cfg.update(dict(self.config.get("ffn_optimizer", {})))
+            else:
+                user_cfg = dict(self.config.get(key, {}))
             user_cfg.update(defaults)
             builtin_cfgs[key] = user_cfg
 
@@ -407,6 +442,11 @@ class Orchestrator:
         model = getattr(backend, "_model", None)
         if model is not None and hasattr(model, "blocks") and len(model.blocks) > 0:
             block = model.blocks[0]
+            if self._int8_ffn_stats is not None:
+                # AR011: weights live in int8 modules and are executed in-forward;
+                # return empty placeholders to avoid materializing FP32 copies.
+                empty = torch.empty(0)
+                return {"up": empty, "down": empty}
             return {
                 "up": block.up_proj.weight.detach(),
                 "down": block.down_proj.weight.detach(),
@@ -1452,6 +1492,17 @@ class Orchestrator:
         sensitivity_score: float,
     ) -> Dict[str, Any]:
         """执行 FFN Optimizer Agent（逐层）并聚合结果。"""
+        if self._int8_ffn_stats is not None:
+            # AR011: the model already executed INT8 FFN inside its forward;
+            # do not run the accounting-only packer again.
+            return {
+                "compute_path": "int8_exec",
+                "quantization": {},
+                "sparse_update": {"overall": 0.0, "per_layer": {}},
+                "compute_stats": {},
+                "execution": dict(self._int8_ffn_stats),
+            }
+
         num_layers = self._model_config.get("num_layers", 32)
         all_ffn_results: List[Dict[str, Any]] = []
         for layer_id in range(num_layers):
