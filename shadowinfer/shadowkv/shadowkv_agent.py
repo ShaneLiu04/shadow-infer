@@ -52,12 +52,12 @@ class ShadowKVAgent(BaseAgent):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config, name="shadowkv")
-        self.kv_cache: Dict[
-            int, Dict[str, Any]
-        ] = {}  # layer_id -> {k: Tensor, v: Tensor, precision: str}
-        self.precision_map: Dict[
-            int, Dict[int, Dict[int, str]]
-        ] = {}  # layer_id -> token -> head -> precision
+        self.kv_cache: Dict[int, Dict[str, Any]] = (
+            {}
+        )  # layer_id -> {k: Tensor, v: Tensor, precision: str}
+        self.precision_map: Dict[int, Dict[int, Dict[int, str]]] = (
+            {}
+        )  # layer_id -> token -> head -> precision
         # AR003 T004：IRAP 跨步 EMA 状态（layer_id -> [seq_k, heads]，常数内存）；
         # 取代原无界 importance_history（KV-P9）
         self._irap_state: Dict[int, torch.Tensor] = {}

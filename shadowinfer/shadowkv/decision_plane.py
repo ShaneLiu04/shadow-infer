@@ -187,7 +187,11 @@ class KVDecisionPlane:
     def split_decisions(
         self,
         decisions: Dict[Tuple[int, int], KVPlaneDecision],
-    ) -> Tuple[Dict[int, Dict[int, str]], Dict[Tuple[int, int], bool], Set[Tuple[int, int]],]:
+    ) -> Tuple[
+        Dict[int, Dict[int, str]],
+        Dict[Tuple[int, int], bool],
+        Set[Tuple[int, int]],
+    ]:
         """Split a decision map into precision_map, reuse_mask, and evict_set."""
         precision_map: Dict[int, Dict[int, str]] = {}
         reuse_mask: Dict[Tuple[int, int], bool] = {}

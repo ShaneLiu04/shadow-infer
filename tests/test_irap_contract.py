@@ -574,7 +574,9 @@ class TestOrchestratorWiring:
 
         assert len(spy.calls) == 2, "应逐层调用 on_step"
         for kv_inputs in spy.calls:
-            assert kv_inputs.get("attn_is_probabilities") is True, "真实后端（post-softmax）应接线 True"
+            assert (
+                kv_inputs.get("attn_is_probabilities") is True
+            ), "真实后端（post-softmax）应接线 True"
 
     def test_mock_backend_wires_false(self):
         """mock 后端（randn logits）路径下 agent 收到 attn_is_probabilities=False。"""
@@ -585,7 +587,9 @@ class TestOrchestratorWiring:
 
         assert len(spy.calls) == 2, "应逐层调用 on_step"
         for kv_inputs in spy.calls:
-            assert kv_inputs.get("attn_is_probabilities") is False, "mock 后端（logits）应接线 False"
+            assert (
+                kv_inputs.get("attn_is_probabilities") is False
+            ), "mock 后端（logits）应接线 False"
 
 
 # =============================================================================
@@ -698,7 +702,9 @@ class TestUT4SinkProtectionReversal:
 
         precision_map = result["precision_map"]
         sink_heads = [precision_map[0][h] for h in range(HEADS)]
-        assert all(p == "fp32" for p in sink_heads), f"sink token 应全 head 最高档，实际 {sink_heads}"
+        assert all(
+            p == "fp32" for p in sink_heads
+        ), f"sink token 应全 head 最高档，实际 {sink_heads}"
 
         non_sink = [precision_map[t][h] for t in range(4, SEQ) for h in range(HEADS)]
         assert all(
@@ -713,7 +719,9 @@ class TestUT4SinkProtectionReversal:
             probs, LAYER_ID, NUM_LAYERS, attn_is_probabilities=True
         )
 
-        assert torch.allclose(imp[:4], torch.ones_like(imp[:4])), "sink 前缀（默认 4）应被硬保护为 1.0"
+        assert torch.allclose(
+            imp[:4], torch.ones_like(imp[:4])
+        ), "sink 前缀（默认 4）应被硬保护为 1.0"
         assert imp[4:].max().item() < 1.0, "非 sink token 不应被强制 1.0"
 
 
@@ -791,7 +799,9 @@ class TestGoldenNewFormula:
                 )
 
         diff = (vec - ref).abs().max().item()
-        assert diff <= 1e-6, f"probs={attn_is_probabilities} 契约新公式 vec/ref 差异 {diff:.3e} 应 <= 1e-6"
+        assert (
+            diff <= 1e-6
+        ), f"probs={attn_is_probabilities} 契约新公式 vec/ref 差异 {diff:.3e} 应 <= 1e-6"
 
     def test_golden_new_formula_probabilities_contract(self, mock_config):
         agent = _make_agent(mock_config)
@@ -896,7 +906,9 @@ class TestSinkBoundary:
             sink_tokens=0,
         )
 
-        assert not torch.allclose(imp[0], torch.ones(HEADS)), "sink_tokens=0 时 imp[0] 不应再被强制为 1.0"
+        assert not torch.allclose(
+            imp[0], torch.ones(HEADS)
+        ), "sink_tokens=0 时 imp[0] 不应再被强制为 1.0"
         assert imp[0].max().item() < 1.0
 
     def test_sink_boundary_covers_full_sequence(self, mock_config):
@@ -1024,7 +1036,9 @@ class TestIRAPStateEMA:
     def test_ut6_no_unbounded_importance_history(self, mock_config):
         """无界 importance_history 属性必须不存在（常数内存历史，KV-P9）。"""
         agent = _make_agent(mock_config, attn_is_probabilities=True)
-        assert not hasattr(agent, "importance_history"), "ShadowKVAgent 不应再持有无界 importance_history"
+        assert not hasattr(
+            agent, "importance_history"
+        ), "ShadowKVAgent 不应再持有无界 importance_history"
         assert isinstance(agent._irap_state, dict), "_irap_state 应为 per-layer 状态字典"
 
     def test_ut6_first_step_cold_start_equals_received(self, mock_config):
@@ -1091,7 +1105,9 @@ class TestIRAPConstantMemory:
             tuple(final.shape) == first_shape
         ), f"200 步后状态形状 {tuple(final.shape)} 应与首步 {first_shape} 相同"
         assert final.numel() == first_numel, "200 步后状态元素数不应增长"
-        assert final.element_size() * final.numel() == first_bytes, "200 步后状态字节数不应增长（O(1) 常数内存）"
+        assert (
+            final.element_size() * final.numel() == first_bytes
+        ), "200 步后状态字节数不应增长（O(1) 常数内存）"
         assert set(agent._irap_state.keys()) == {LAYER_ID}, "状态字典键数不应随步数增长"
 
 
@@ -1327,7 +1343,9 @@ class TestReviewFixes:
         state_after_first = agent._irap_state[LAYER_ID].clone()
         agent.on_step(_step_config(step_id=0), dict(inputs, memory_pressure=0.5))
         state_after_replay = agent._irap_state[LAYER_ID]
-        assert torch.allclose(state_after_first, state_after_replay, atol=1e-8), "重放不得二次推进 EMA"
+        assert torch.allclose(
+            state_after_first, state_after_replay, atol=1e-8
+        ), "重放不得二次推进 EMA"
 
     def test_review_i8_single_token_sequence(self, mock_config):
         """I8：seq_k=1 合法，不得抛 ZeroDivisionError，输出有限。"""

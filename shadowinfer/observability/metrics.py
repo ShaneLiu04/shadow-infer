@@ -626,7 +626,9 @@ class MetricsRegistry:
                 if new_type is not None:
                     new_type = metric.metadata.metric_type
                 if existing_type != new_type:
-                    raise ValueError(f"指标 '{name}' 已存在，类型为 {existing_type}，" f"无法注册为 {new_type}")
+                    raise ValueError(
+                        f"指标 '{name}' 已存在，类型为 {existing_type}，" f"无法注册为 {new_type}"
+                    )
                 return
             self._metrics[name] = metric
 

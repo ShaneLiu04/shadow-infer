@@ -528,5 +528,6 @@ class TestPackOnce:
             )
 
         assert len(calls) == NUM_LAYERS, (
-            f"正常路径每层每步应 pack 一次（预期 {NUM_LAYERS}，实际 {len(calls)}）；" "准入降档不得引入额外重打包"
+            f"正常路径每层每步应 pack 一次（预期 {NUM_LAYERS}，实际 {len(calls)}）；"
+            "准入降档不得引入额外重打包"
         )

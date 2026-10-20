@@ -42,8 +42,7 @@ class TestHotConfigReloader:
     def test_initial_load(self, tmp_path):
         """测试初始配置加载"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -55,8 +54,7 @@ ffn:
   enabled: true
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         assert reloader.get_status() == ReloadStatus.IDLE
@@ -67,8 +65,7 @@ constraints:
     def test_validation_pass(self, tmp_path):
         """测试配置验证通过"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -84,8 +81,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         errors = reloader.validate_config(reloader._current_raw)
@@ -94,8 +90,7 @@ constraints:
     def test_validation_fail_compression_ratio(self, tmp_path):
         """测试验证失败：压缩比超出范围"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -106,8 +101,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         errors = reloader.validate_config(reloader._current_raw)
@@ -116,8 +110,7 @@ constraints:
     def test_validation_fail_temperature(self, tmp_path):
         """测试验证失败：温度 <= 0"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -128,8 +121,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         errors = reloader.validate_config(reloader._current_raw)
@@ -138,8 +130,7 @@ constraints:
     def test_validation_fail_precision_level(self, tmp_path):
         """测试验证失败：非法精度级别"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -151,8 +142,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         errors = reloader.validate_config(reloader._current_raw)
@@ -161,8 +151,7 @@ constraints:
     def test_callback_notification(self, tmp_path):
         """测试配置变更回调通知"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -173,8 +162,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         callback_called = threading.Event()
@@ -185,8 +173,7 @@ constraints:
         reloader.on_config_change(callback)
 
         # 模拟文件变更
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -197,8 +184,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader.force_reload()
         assert callback_called.wait(timeout=1.0)
@@ -206,8 +192,7 @@ constraints:
     def test_force_reload(self, tmp_path):
         """测试强制重载"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -218,15 +203,13 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
         old_hash = reloader.get_config_hash()
 
         # 修改文件
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -237,8 +220,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         result = reloader.force_reload()
         assert result is True
@@ -247,8 +229,7 @@ constraints:
     def test_events_tracking(self, tmp_path):
         """测试事件记录"""
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -259,14 +240,12 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         reloader = HotConfigReloader(str(config_path))
 
         # 触发成功重载
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -277,8 +256,7 @@ ffn:
   delta_threshold: 0.05
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
         reloader.force_reload()
 
         events = reloader.get_events(limit=10)
@@ -292,8 +270,7 @@ class TestAgentConfigAdapter:
         from shadowinfer.core.config import Config
 
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -310,8 +287,7 @@ ffn:
   enabled: true
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         config = Config.from_yaml(str(config_path))
         shadowkv_cfg = AgentConfigAdapter.extract_shadowkv_config(config)
@@ -325,8 +301,7 @@ constraints:
         from shadowinfer.core.config import Config
 
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -340,8 +315,7 @@ ffn:
   enabled: true
 constraints:
   max_accuracy_drop: 0.01
-"""
-        )
+""")
 
         config = Config.from_yaml(str(config_path))
         qdrift_cfg = AgentConfigAdapter.extract_qdrift_config(config)
@@ -354,8 +328,7 @@ constraints:
         from shadowinfer.core.config import Config
 
         config_path = tmp_path / "test_config.yaml"
-        config_path.write_text(
-            """
+        config_path.write_text("""
 optimization:
   enabled: true
 shadowkv:
@@ -368,8 +341,7 @@ constraints:
   max_accuracy_drop: 0.01
   max_latency_ms: 100
   max_memory_mb: 4096
-"""
-        )
+""")
 
         config = Config.from_yaml(str(config_path))
         constraints = AgentConfigAdapter.extract_constraints(config)
