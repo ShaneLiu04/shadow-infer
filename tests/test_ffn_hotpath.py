@@ -559,9 +559,8 @@ def test_ut19_missing_previous_falls_back_to_full():
 
 
 def test_ut17_version_strings_consistent():
-    from pathlib import Path
-
     import tomllib
+    from pathlib import Path
 
     import shadowinfer
     import shadowinfer.__main__ as cli
