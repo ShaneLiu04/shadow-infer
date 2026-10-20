@@ -40,6 +40,7 @@ dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "pytest-timeout>=2.2.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 benchmark = [
     "matplotlib>=3.7.0",

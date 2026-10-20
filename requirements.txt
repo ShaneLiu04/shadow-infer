@@ -26,6 +26,7 @@ transformers>=4.30.0
 pytest>=7.4.0
 pytest-cov>=4.1.0
 pytest-timeout>=2.2.0
+tomli>=2.0; python_version < "3.11"
 
 # Development
 black>=23.0.0

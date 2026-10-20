@@ -559,7 +559,10 @@ def test_ut19_missing_previous_falls_back_to_full():
 
 
 def test_ut17_version_strings_consistent():
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+        import tomli as tomllib
     from pathlib import Path
 
     import shadowinfer
