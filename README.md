@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.15.0 | 876 passed / 1 skipped | 83.37% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.16.0 | 921 passed / 1 skipped | 83.78% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -69,6 +69,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **可执行 INT8 FFN（v3.13.0）** | `INT8Linear` 按输出通道对称量化权重、按 token 动态量化激活，使用真实 `torch._int_mm` INT8 GEMM 后按 `scale_x × scale_w` 反量化；`SimpleDiffusionLLM`/HF 后端可直接替换 FFN 线性层并释放 FP32 权重（可选保留 golden）。7B FFN 上投影（4096×11008，M>=16）CPU 复跑 4.8-6.7x，权重内存 3.99x 降低；中等模型端到端 1.37-1.47x；小模型 logits 相对误差 0.43%、top-1 99.22%。`_int_mm` 不可用时确定性回退且只告警一次。 |
 | **规范化紧凑 KV Store（v3.14.0）** | `PackedKVCache.unpack` / `apply_reuse_mask` / `evict` 全量张量化：unpack 按精度桶批量 gather+反量化（CPU 512-2048 为 101-219x），复用按 flat 索引批量拷贝（7.3-8.2x），驱逐改为桶内就地删除并真实释放字节（49-109x，25% 条目对应 25% 字节下降）。修正 INT4 `B>1` scale 的 batch 索引缺陷（B=2 每 batch 相对 MSE 0.0075/0.0072），统一压缩/打包/成本模型的 `int4_group_size`（默认 16）且只量化一次；默认 `store_dense_kv=false`，packed cache 成为单一驻留表示，`resident_bytes()` 与 `KVCacheManager` 统一口径（dense shadow 存在时同时计入，超预算先释放 shadow 再驱逐）。 |
 | **跨步复用与紧凑 KV 闭环执行（v3.15.0）** | `StepReuseState` 逐 block 缓存 `(input, output, K, V)`，按相对 L2 漂移门控复用整个 block：跳过 Q/K/V/O、attention 与 FFN，输出 `cached_out + (h - cached_in)`；`kv_lifecycle=replace` 修正 diffusion 固定序列的 KV 无限追加；`kv_execution=packed` 让每层 K/V 以 `PackedKVCache` 驻留并在 append 模式从 packed 读取 past。真实受控 denoising 轨迹（3 seed × 3 repeats，CPU）：reuse 1.76-1.94x、logits relL2 0.94-0.96%、跳过 50% block；int8 packed 数据平面驻留为 FP16 dense 的 53%（全口径含元数据 72%）、relL2 0；组合 1.09-1.44x。默认关闭，旧路径逐位不变；7B/GPU 按 `s8_step_reuse_gpu.yaml` 在服务器复现。 |
+| **分页增量 KV 驻留（v3.16.0）** | `PagedKVStore` 以 `[B,H,page_tokens,D]` 模型布局页存储 KV，append 仅量化/写入新 token 入页（向量化、零 Python 逐 token 循环），封存页 id 与数据指针不可变，读取走单遍 gather（零 permute/零 repack）；行级量化与 `PackedKVCache` 同元素逐位一致（fp32/fp16/int8/int4 golden `torch.equal`），支持按 token-head 驱逐（整页全驱逐真实释放字节、部分驱逐行置零、槽位空闲链复用、不复活）。`kv_execution="paged"`（`page_size` 可配，默认 32）消除 packed 路径每步全量 unpack+repack 与 precision_map 重建；执行统计新增 `paged`/`page_size`/`page_count`/`open_pages`/`appended_tokens_total`/`repack_tokens_saved`/`page_evictions` 等八键。KV 执行平面微基准（append 簿记，3 seed 中位，CPU）：加速 9.30x（S=512）/ 10.16x（S=2048），每步延迟斜率比为 packed 基线的 0.088-0.114，Python 堆瞬态峰值降约 51-57x；fp16 逐位等价、int8 驱逐前后逐位等价由 UT 证明。7B/GPU 长上下文按 `s9_paged_longctx_gpu.yaml` 在服务器复现。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -725,7 +726,36 @@ python specs/archive/AR012-canonical-kv-store/ar012_bench.py
 
 # 跨步复用 + packed KV 执行基准（受控 denoising 轨迹，3 seed）
 python specs/archive/AR013-step-reuse-packed-execution/ar013_bench.py
+
+# 分页增量 KV 驻留基准（append 簿记平面，2 规模 × 3 seed，含预注册断言）
+python specs/archive/AR014-paged-kv-store/ar014_bench.py
 ```
+
+### 实测数据（v3.16.0，2026-10-21，Windows / CPU）
+
+KV 执行平面微基准（append 每步每层簿记）：真实张量，fp16，`B=4/H=8/D=64/L=8` 层，
+`page_size=32`，3 seeds 报中位（`specs/archive/AR014-paged-kv-store/ar014_bench.py`）。
+baseline 为现行 packed 路径（每步全量 unpack+repack + precision_map 重建），paged 为
+`PagedKVStore` 增量入页 + 单遍 gather：
+
+| 规模 (N 步, S_new, max_seq) | 加速中位 [区间] | 每步延迟斜率比 | Python 堆峰值 baseline→paged |
+|---|---|---|---|
+| 8, 64, 512 | **9.303x** [9.209-9.751] | 0.088 | 2408KB → 47KB |
+| 16, 128, 2048 | **10.162x** [7.684-10.278] | 0.114 | 9975KB → 175KB |
+
+- fp16 全序列 gather 与 packed 全量 pack 参考解码 `torch.equal` 逐位一致（两规模均通过）。
+- 加速中 SRS 预估为 ~2x（仅张量算子口径 2×O(S) → 1×O(S)+O(S_new)）；实测 9-10x 的差额
+  来自基线每步每层 O(S·H) 的 precision_map 重建与 `_do_pack` 分组 Python 循环，分页路径
+  对 past token 完全绕开；两口径均如实报告，逐 seed 原始数据与诚实说明见
+  `specs/archive/AR014-paged-kv-store/bench-results.md`。
+- 规模 2 的 seed=1 加速 7.684x 低于其余 seed（10.2x+），为 CPU 调度抖动，如实保留。
+- fp16 页无压缩，`data_plane_bytes` 与 FP16 dense 基准一致（比值 1.0）；分页收益在每步
+  延迟斜率与 Python 瞬态，不在 fp16 驻留字节。
+- int8/int4 逐位等价与驱逐等价（驱逐前后未触碰元素逐位不变、字节真实释放、不复活）由
+  UT 覆盖（`tests/test_paged_kv_execution.py`）；端到端 logits 等价由
+  `tests/test_paged_backend_execution.py` 覆盖（fp16 `torch.equal`）。
+- 7B/GPU 延迟、显存与真实模型 logits 按 `server-experiment.md` 在服务器回填；本机不宣称
+  7B 结果，也不以微基准替代真实模型结论。
 
 ### 实测数据（v3.15.0，2026-10-20，Windows / CPU）
 
@@ -1210,6 +1240,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.16.0（2026-10）
+
+- **PagedKVStore 核心机制**：新增 `shadowinfer/shadowkv/paged_kv_store.py`；`[B,H,page_tokens,D]` 模型布局页存储，append 增量入页（仅量化新 token，向量化）、封存页 id 与数据指针不可变、读取单遍 gather（零 permute/零 repack）；开放页填充以整页对象替换，页张量按实际 token 数精确分配。
+- **行级量化逐位对齐**：fp16 直存、int8 行级 scale（dim=-1）、int4 行组 scale + 行级字节打包，与 `PackedKVCache.pack→unpack` 对同一元素 `torch.equal` 级一致（fp32/fp16/int8/int4 四精度 golden）。
+- **分页驱逐**：`evict_tokens(token_head_set)` 支持全 head token 删除（整页清空真实释放字节并退出页序）与部分 head 零值行（fp 置 0 / int8 q=0 / int4 打包字节 0x88 解码 0.0）；槽位空闲链复用，`_evicted_pairs` 防二次计数与复活；驱逐前后未触碰元素逐位不变。
+- **后端与编排接线**：`kv_execution="paged"`（`page_size` 可配，默认 32）；append 仅切新 token 入页、raw_cache 走 gather、replace 清页重入；shape mismatch 与 fallback 密集路径自适应；`KVCacheEntry.paged_kv` 字段与 orchestrator `_entry_kv_tensors` paged 分支；执行统计新增 `paged`/`page_size`/`page_count`/`open_pages`/`appended_tokens`/`appended_tokens_total`/`repack_tokens_saved`/`page_evictions` 八键。
+- **实测（CPU，3 seed 中位）**：KV 执行平面微基准加速 9.30x（S=512）/ 10.16x（S=2048），每步延迟斜率比为 packed 基线的 0.088-0.114，Python 堆瞬态峰值降约 51-57x；fp16 逐位等价。
+- **复现资产**：`specs/archive/AR014-paged-kv-store/`（srs/design/st-cases/bench/server-experiment），`configs/experiments/s9_paged_longctx_gpu.yaml`；921 passed / 1 skipped，覆盖率 83.78%。
 
 ### v3.15.0（2026-10）
 
