@@ -10,6 +10,7 @@ import torch
 
 from shadowinfer.core.model_backend import ModelBackend
 from shadowinfer.core.structs import KVCacheEntry, StepConfig
+from shadowinfer.execution.macro_mode import MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
 from shadowinfer.models import SimpleDiffusionLLM
 from shadowinfer.shadowkv.packed_kv_cache import PackedKVCache
@@ -90,6 +91,10 @@ class PyTorchModelBackend(ModelBackend):
         self._step_reuse_warmup_steps = 1
         self._int4_group_size = 16
         self._reuse_state: Optional[StepReuseState] = None
+        self._mode_control_enabled = False
+        self._macro_block_size = 32
+        self._mode_config: Optional[MacroModeConfig] = None
+        self._mode_state: Optional[MacroModeState] = None
         self._last_execution_stats: Dict[str, Any] = {}
 
     def configure_execution(
@@ -102,8 +107,14 @@ class PyTorchModelBackend(ModelBackend):
         step_reuse_warmup_steps: int = 1,
         int4_group_size: int = 16,
         page_size: int = 32,
+        mode_control_enabled: bool = False,
+        macro_block_size: int = 32,
+        skip_threshold: float = 0.1,
+        delta_min_active_ratio: float = 0.5,
+        mode_warmup_steps: int = 1,
+        force_refresh_every: int = 0,
     ) -> None:
-        """Configure the executable KV path (AR013; paged mode in AR014)."""
+        """Configure the executable KV path (AR013; paged AR014; mode control AR015)."""
         if kv_lifecycle not in ("append", "replace"):
             raise ValueError(f"Unsupported kv_lifecycle: {kv_lifecycle}")
         if kv_execution not in ("dense", "packed", "paged"):
@@ -125,6 +136,29 @@ class PyTorchModelBackend(ModelBackend):
             raise ValueError(f"int4_group_size must be >= 1, got {int4_group_size}")
         if page_size < 1:
             raise ValueError(f"page_size must be >= 1, got {page_size}")
+        mode_config = MacroModeConfig(
+            enabled=bool(mode_control_enabled),
+            macro_block_size=int(macro_block_size),
+            skip_threshold=float(skip_threshold),
+            delta_min_active_ratio=float(delta_min_active_ratio),
+            warmup_steps=int(mode_warmup_steps),
+            force_refresh_every=int(force_refresh_every),
+        )
+        if mode_config.enabled:
+            if kv_execution != "paged":
+                raise ValueError(
+                    "mode_control_enabled requires kv_execution='paged', got "
+                    f"{kv_execution!r} (explicit opt-in, no silent downgrade)"
+                )
+            if kv_lifecycle != "replace":
+                raise ValueError(
+                    "mode_control_enabled requires kv_lifecycle='replace', got "
+                    f"{kv_lifecycle!r} (explicit opt-in, no silent downgrade)"
+                )
+            if reuse_config.enabled:
+                raise ValueError(
+                    "mode_control_enabled and step_reuse_enabled are mutually exclusive"
+                )
 
         self._kv_lifecycle = kv_lifecycle
         self._kv_execution = kv_execution
@@ -135,6 +169,11 @@ class PyTorchModelBackend(ModelBackend):
         self._step_reuse_warmup_steps = int(step_reuse_warmup_steps)
         self._int4_group_size = int(int4_group_size)
         self._reuse_config = reuse_config
+        self._mode_config = mode_config
+        self._macro_block_size = mode_config.macro_block_size
+        mode_active = mode_config.enabled and kv_execution == "paged"
+        self._mode_state = MacroModeState() if mode_active else None
+        self._mode_control_enabled = mode_active
         reuse_active = reuse_config.enabled and kv_lifecycle == "replace"
         self._reuse_state = StepReuseState() if reuse_active else None
         if step_reuse_enabled and kv_lifecycle != "replace":
@@ -143,7 +182,7 @@ class PyTorchModelBackend(ModelBackend):
             self._reuse_state = None
 
     def reset_execution_state(self) -> None:
-        """Clear KV/packed/paged/reuse state between independent runs."""
+        """Clear KV/packed/paged/reuse/mode state between independent runs."""
         self._kv_cache = {}
         self._packed_cache = {}
         self._paged_cache = {}
@@ -153,6 +192,10 @@ class PyTorchModelBackend(ModelBackend):
             self._reuse_state = StepReuseState()
         else:
             self._reuse_state = None
+        if self._mode_control_enabled:
+            self._mode_state = MacroModeState()
+        else:
+            self._mode_state = None
 
     def load(self, model_name: str, device: Optional[str] = None, **kwargs: Any) -> None:
         del kwargs  # unused
@@ -241,6 +284,8 @@ class PyTorchModelBackend(ModelBackend):
                 kv_cache = {}
                 if self._reuse_state is not None:
                     self._reuse_state.reset()
+                if self._mode_state is not None:
+                    self._mode_state.reset()
 
         precision = _precision_for_shadowkv_mode(step_cfg.shadowkv_mode)
 
@@ -270,14 +315,39 @@ class PyTorchModelBackend(ModelBackend):
             if reuse_active
             else None
         )
-        logits, new_raw_kv, attention_scores = self._model.forward_step(
-            x=x,
-            step_t=step_cfg.step_id,
-            total_steps=step_cfg.total_steps,
-            kv_cache=raw_cache,
-            reuse_state=self._reuse_state if reuse_active else None,
-            reuse_config=reuse_config,
-        )
+        mode_active = self._mode_control_enabled and self._mode_state is not None
+        fallback = False
+        try:
+            logits, new_raw_kv, attention_scores = self._model.forward_step(
+                x=x,
+                step_t=step_cfg.step_id,
+                total_steps=step_cfg.total_steps,
+                kv_cache=raw_cache,
+                reuse_state=self._reuse_state if reuse_active else None,
+                reuse_config=reuse_config,
+                mode_state=self._mode_state if mode_active else None,
+                mode_config=self._mode_config if mode_active else None,
+            )
+        except Exception as exc:
+            if not mode_active:
+                raise
+            logger.warning(
+                "mode-controlled forward failed, degrading to dense full recompute: %s",
+                exc,
+            )
+            fallback = True
+            self._mode_state.reset()
+            mode_active = False
+            logits, new_raw_kv, attention_scores = self._model.forward_step(
+                x=x,
+                step_t=step_cfg.step_id,
+                total_steps=step_cfg.total_steps,
+                kv_cache=raw_cache,
+                reuse_state=None,
+                reuse_config=None,
+                mode_state=None,
+                mode_config=None,
+            )
 
         reused_layers = (
             set(self._reuse_state.last_reused_layers)
@@ -293,7 +363,6 @@ class PyTorchModelBackend(ModelBackend):
         resident_bytes = 0
         data_plane_bytes = 0
         dense_bytes = 0
-        fallback = False
 
         for layer_id in range(self._model.num_layers):
             old_entry = kv_cache.get(layer_id)
@@ -366,23 +435,50 @@ class PyTorchModelBackend(ModelBackend):
                         )
                     else:
                         store.validate_against(k.shape[0], k.shape[1], k.shape[3])
-                    if self._kv_lifecycle == "replace":
-                        store.clear()
-                        past = 0
-                    else:
-                        past = store.max_seq
-                        if k.shape[2] < past:
-                            raise ValueError(
-                                f"paged append anomaly: model output seq {k.shape[2]} "
-                                f"< stored past {past} at layer {layer_id}"
-                            )
-                    store.append(
-                        k[:, :, past:, :].contiguous(),
-                        v[:, :, past:, :].contiguous(),
-                        page_precision,
+                    seq_len = k.shape[2]
+                    mode_dispatch = (
+                        mode_active and self._kv_lifecycle == "replace" and store.max_seq == seq_len
                     )
-                    appended_this_step += k.shape[2] - past
-                    repack_saved_total += past
+                    if mode_dispatch:
+                        try:
+                            rewritten = self._mode_rewrite_dispatch(
+                                store, layer_id, k, v, page_precision
+                            )
+                            self._mode_state.record_rewritten(rewritten)
+                            repack_saved_total += seq_len - rewritten
+                        except Exception as exc:
+                            logger.warning(
+                                "mode rewrite dispatch failed at layer %s, degrading "
+                                "to clear+append: %s",
+                                layer_id,
+                                exc,
+                            )
+                            fallback = True
+                            self._mode_state.reset()
+                            mode_active = False
+                            store.clear()
+                            store.append(k.contiguous(), v.contiguous(), page_precision)
+                            appended_this_step += seq_len
+                    else:
+                        if self._kv_lifecycle == "replace":
+                            if mode_active and store.max_seq > 0 and store.max_seq != seq_len:
+                                self._mode_state.reset()
+                            store.clear()
+                            past = 0
+                        else:
+                            past = store.max_seq
+                            if seq_len < past:
+                                raise ValueError(
+                                    f"paged append anomaly: model output seq {seq_len} "
+                                    f"< stored past {past} at layer {layer_id}"
+                                )
+                        store.append(
+                            k[:, :, past:, :].contiguous(),
+                            v[:, :, past:, :].contiguous(),
+                            page_precision,
+                        )
+                        appended_this_step += seq_len - past
+                        repack_saved_total += past
                     updated_kv[layer_id] = KVCacheEntry(
                         k_tensor=None,
                         v_tensor=None,
@@ -491,6 +587,11 @@ class PyTorchModelBackend(ModelBackend):
         self._paged_appended_total += appended_this_step
         compression_ratio = (resident_bytes / dense_bytes) if dense_bytes > 0 else 0.0
         data_plane_ratio = (data_plane_bytes / dense_bytes) if dense_bytes > 0 else 0.0
+        mode_stats = (
+            self._mode_state.stats()
+            if self._mode_control_enabled and self._mode_state is not None
+            else {}
+        )
         self._last_execution_stats = {
             "kv_lifecycle": self._kv_lifecycle,
             "kv_execution": self._kv_execution,
@@ -524,6 +625,14 @@ class PyTorchModelBackend(ModelBackend):
             "attention_reused": bool(
                 reuse_active and self._reuse_state and self._reuse_state.attention_reused
             ),
+            "mode_control": bool(self._mode_control_enabled),
+            "macro_block_size": int(self._macro_block_size),
+            "skip_blocks": mode_stats.get("skip_blocks", 0),
+            "delta_blocks": mode_stats.get("delta_blocks", 0),
+            "refresh_blocks": mode_stats.get("refresh_blocks", 0),
+            "skipped_rows": mode_stats.get("skipped_rows", 0),
+            "rewritten_rows": mode_stats.get("rewritten_rows", 0),
+            "projected_rows": mode_stats.get("active_rows", 0),
         }
 
         return {
@@ -532,6 +641,63 @@ class PyTorchModelBackend(ModelBackend):
             "attention_scores": attention_scores,
             "execution_stats": self._last_execution_stats,
         }
+
+    def _mode_rewrite_dispatch(
+        self,
+        store: PagedKVStore,
+        layer_id: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        page_precision: str,
+    ) -> int:
+        """Rewrite only the rows the classifier marked active (SKIP zero-write).
+
+        DELTA blocks rewrite their contiguous active runs; REFRESH blocks
+        rewrite the whole macro interval; SKIP blocks leave the pages
+        untouched. Returns the number of rewritten token rows.
+        """
+        assert self._mode_state is not None and self._mode_config is not None
+        modes = self._mode_state.last_modes.get(layer_id, {})
+        active_rows = self._mode_state.last_active_rows.get(layer_id, [])
+        active_set = set(active_rows)
+        seq_len = k.shape[2]
+        block_size = self._mode_config.macro_block_size
+        all_refresh = not modes or all(mode == "REFRESH" for mode in modes.values())
+        if all_refresh and page_precision in ("fp32", "fp16"):
+            # Fast path: nothing is preserved, so a single full write beats
+            # per-block rewrites (content and page layout are identical).
+            store.clear()
+            store.append(k.contiguous(), v.contiguous(), page_precision)
+            return seq_len
+        rewritten = 0
+        for macro_idx, start in enumerate(range(0, seq_len, block_size)):
+            end = min(start + block_size, seq_len)
+            mode = modes.get(macro_idx, "REFRESH")
+            if mode == "SKIP":
+                continue
+            if mode == "REFRESH":
+                rewritten += store.rewrite_tokens(
+                    start,
+                    k[:, :, start:end, :].contiguous(),
+                    v[:, :, start:end, :].contiguous(),
+                    page_precision,
+                )
+                continue
+            run_start = None
+            for row in range(start, end + 1):
+                if row < end and row in active_set:
+                    if run_start is None:
+                        run_start = row
+                    continue
+                if run_start is not None:
+                    rewritten += store.rewrite_tokens(
+                        run_start,
+                        k[:, :, run_start:row, :].contiguous(),
+                        v[:, :, run_start:row, :].contiguous(),
+                        page_precision,
+                    )
+                    run_start = None
+        return rewritten
 
     @staticmethod
     def _entry_kv_tensors(entry: Any) -> Optional[tuple]:

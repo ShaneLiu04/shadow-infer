@@ -94,6 +94,8 @@ class PagedKVStore:
         self._max_seq = 0
         self._appended_tokens = 0
         self._page_evictions = 0
+        self._rewritten_tokens = 0
+        self._rewritten_pages = 0
         self._evicted_pairs: Set[Tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
@@ -124,6 +126,14 @@ class PagedKVStore:
     @property
     def page_evictions(self) -> int:
         return self._page_evictions
+
+    @property
+    def rewritten_tokens(self) -> int:
+        return self._rewritten_tokens
+
+    @property
+    def rewritten_pages(self) -> int:
+        return self._rewritten_pages
 
     @property
     def _int4_effective_group(self) -> int:
@@ -391,6 +401,126 @@ class PagedKVStore:
         return values.reshape(*values.shape[:-2], -1)
 
     # ------------------------------------------------------------------
+    # In-place row rewrite (FR15.1)
+    # ------------------------------------------------------------------
+
+    def rewrite_tokens(
+        self,
+        start_token: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        precision: str,
+    ) -> int:
+        """Overwrite token rows ``[start_token, start_token+T)`` in place.
+
+        Payload and scale rows are re-quantized through the same row-local
+        path as :meth:`append`, so rewritten content is bitwise identical
+        to a fresh append of the same values. Page layout (start_token /
+        num_tokens / sealed) never changes and untouched rows keep their
+        bytes exactly. All validation and quantization happen before the
+        first mutation, so a failed call leaves the store untouched.
+        Returns the number of rewritten tokens.
+        """
+        start = int(start_token)
+        self._validate_rewrite(start, k_new, v_new, precision)
+        end = start + int(k_new.shape[2])
+        hits = self._plan_rewrite(start, end, precision)
+        payloads = [
+            self._quantize_chunk(
+                k_new[:, :, g0 - start : g1 - start, :].contiguous(),
+                v_new[:, :, g0 - start : g1 - start, :].contiguous(),
+                precision,
+            )
+            for page, g0, g1 in hits
+        ]
+        for (page, g0, g1), (qk, qv, scale_k, scale_v) in zip(hits, payloads):
+            local_start = g0 - page.start_token
+            local_end = g1 - page.start_token
+            page.k[:, :, local_start:local_end, :].copy_(qk)
+            page.v[:, :, local_start:local_end, :].copy_(qv)
+            if page.scale_k is not None and scale_k is not None:
+                page.scale_k[:, :, local_start:local_end].copy_(scale_k)
+            if page.scale_v is not None and scale_v is not None:
+                page.scale_v[:, :, local_start:local_end].copy_(scale_v)
+        self._rewritten_tokens += end - start
+        self._rewritten_pages += len(hits)
+        return end - start
+
+    def _validate_rewrite(
+        self,
+        start: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        precision: str,
+    ) -> None:
+        if precision not in _PRECISIONS:
+            raise ValueError(f"Unsupported page precision: {precision}")
+        if k_new.dim() != 4 or v_new.dim() != 4:
+            raise ValueError(
+                "k_new/v_new must be 4-D [batch, heads, tokens, head_dim], got "
+                f"k.dim={k_new.dim()}, v.dim={v_new.dim()}"
+            )
+        if k_new.shape != v_new.shape:
+            raise ValueError(
+                f"k_new/v_new shapes disagree: {tuple(k_new.shape)} vs {tuple(v_new.shape)}"
+            )
+        if (
+            k_new.shape[0] != self.batch_size
+            or k_new.shape[1] != self.num_heads
+            or k_new.shape[3] != self.head_dim
+        ):
+            raise ValueError(
+                "PagedKVStore rewrite shape mismatch: expected "
+                f"({self.batch_size},{self.num_heads},T,{self.head_dim}), got "
+                f"{tuple(k_new.shape)}"
+            )
+        tokens = int(k_new.shape[2])
+        if tokens < 1:
+            raise ValueError(f"rewrite interval must cover at least one token, got {tokens}")
+        if start < 0 or start + tokens > self._max_seq:
+            raise ValueError(
+                f"rewrite interval [{start},{start + tokens}) exceeds stored range "
+                f"[0,{self._max_seq})"
+            )
+
+    def _plan_rewrite(
+        self,
+        start: int,
+        end: int,
+        precision: str,
+    ) -> List[Tuple[_Page, int, int]]:
+        hits: List[Tuple[_Page, int, int]] = []
+        covered = 0
+        for slot in self._order:
+            page = self.pages[slot]
+            if page is None:
+                continue
+            overlap_start = max(start, page.start_token)
+            overlap_end = min(end, page.end_token)
+            if overlap_start >= overlap_end:
+                continue
+            if page.precision != precision:
+                raise ValueError(
+                    "rewrite precision does not match hit page: requested "
+                    f"{precision}, page holds {page.precision}"
+                )
+            hits.append((page, overlap_start, overlap_end))
+            covered += overlap_end - overlap_start
+        if covered != end - start:
+            raise ValueError(
+                f"rewrite interval [{start},{end}) is not fully covered by pages "
+                f"({covered} of {end - start} tokens); evicted holes cannot be rewritten"
+            )
+        evicted_tokens = {token for token, _ in self._evicted_pairs}
+        for token in range(start, end):
+            if token in evicted_tokens:
+                raise ValueError(
+                    f"rewrite interval [{start},{end}) contains evicted token {token}; "
+                    "evicted positions cannot be rewritten"
+                )
+        return hits
+
+    # ------------------------------------------------------------------
     # Accounting (FR14.1, AR013 dual-ledger conventions)
     # ------------------------------------------------------------------
 
@@ -575,6 +705,8 @@ class PagedKVStore:
         self._max_seq = 0
         self._appended_tokens = 0
         self._page_evictions = 0
+        self._rewritten_tokens = 0
+        self._rewritten_pages = 0
         self._evicted_pairs = set()
 
     def __repr__(self) -> str:

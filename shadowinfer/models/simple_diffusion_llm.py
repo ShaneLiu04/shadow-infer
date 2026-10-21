@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shadowinfer.execution.macro_mode import MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
 
 
@@ -58,6 +59,8 @@ class DiffusionTransformerBlock(nn.Module):
         reuse_state: Optional[StepReuseState] = None,
         reuse_config: Optional[StepReuseConfig] = None,
         step_id: int = 0,
+        mode_state: Optional[MacroModeState] = None,
+        mode_config: Optional[MacroModeConfig] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Forward one block.
 
@@ -69,12 +72,19 @@ class DiffusionTransformerBlock(nn.Module):
             reuse_state: Optional cross-step cache (AR013).
             reuse_config: Optional reuse policy (AR013).
             step_id: Current denoising step (warmup gate).
+            mode_state: Optional macro-block mode control state (AR015).
+            mode_config: Optional macro-block mode control policy (AR015).
 
         Returns:
             A tuple of (updated hidden, new (k, v), attention weights).
         """
         batch, seq_len, _ = hidden.shape
         block_input = hidden
+
+        if mode_state is not None and mode_config is not None:
+            return self._forward_mode_control(
+                hidden, kv_cache, layer_id, step_id, mode_state, mode_config
+            )
 
         if reuse_state is not None and reuse_config is not None:
             should_reuse, drift = reuse_state.should_reuse(layer_id, hidden, step_id, reuse_config)
@@ -90,6 +100,28 @@ class DiffusionTransformerBlock(nn.Module):
                     attn = torch.empty(())
                 return reused, (entry.k, entry.v), attn
 
+        hidden, _, _, k, v, attn_weights = self._compute_block(hidden, kv_cache)
+
+        if reuse_state is not None:
+            reuse_state.record(layer_id, block_input, hidden, k, v)
+            reuse_state.last_computed_layers.add(layer_id)
+            reuse_state.last_attention = attn_weights.detach()
+
+        return hidden, (k, v), attn_weights
+
+    def _compute_block(
+        self,
+        hidden: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dense attention + FFN over the full sequence.
+
+        Returns ``(hidden_out, k_new, v_new, k_full, v_full, attn_weights)``
+        where ``k_new``/``v_new`` are this block's own projections and
+        ``k_full``/``v_full`` additionally include the past cache.
+        """
+        batch, seq_len, _ = hidden.shape
+
         normed = self.ln1(hidden)
         q = self.q_proj(normed).view(batch, seq_len, self.num_heads, self.head_dim)
         k = self.k_proj(normed).view(batch, seq_len, self.num_heads, self.head_dim)
@@ -98,15 +130,16 @@ class DiffusionTransformerBlock(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        k_full, v_full = k, v
 
         if kv_cache is not None:
             past_k, past_v = kv_cache
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
+            k_full = torch.cat([past_k, k], dim=2)
+            v_full = torch.cat([past_v, v], dim=2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k_full.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn_weights = F.softmax(scores, dim=-1)
-        attn_out = torch.matmul(attn_weights, v)
+        attn_out = torch.matmul(attn_weights, v_full)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_dim)
         hidden = hidden + self.o_proj(attn_out)
@@ -114,12 +147,150 @@ class DiffusionTransformerBlock(nn.Module):
         ffn_out = self.down_proj(F.gelu(self.up_proj(self.ln2(hidden))))
         hidden = hidden + ffn_out
 
-        if reuse_state is not None:
-            reuse_state.record(layer_id, block_input, hidden, k, v)
-            reuse_state.last_computed_layers.add(layer_id)
-            reuse_state.last_attention = attn_weights.detach()
+        return hidden, k, v, k_full, v_full, attn_weights
 
-        return hidden, (k, v), attn_weights
+    def _forward_mode_control(
+        self,
+        hidden: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        layer_id: int,
+        step_id: int,
+        mode_state: MacroModeState,
+        mode_config: MacroModeConfig,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Row-granularity mode-controlled forward (SKIP/DELTA/REFRESH)."""
+        batch, seq_len, _ = hidden.shape
+        block_input = hidden
+        block_size = mode_config.macro_block_size
+        modes, active_rows = mode_state.classify(layer_id, hidden, step_id, mode_config)
+
+        if len(active_rows) == seq_len:
+            out, k_new, v_new, k_full, v_full, attn_weights = self._compute_block(hidden, kv_cache)
+            for macro_idx, start in enumerate(range(0, seq_len, block_size)):
+                end = min(start + block_size, seq_len)
+                mode_state.record_rows(
+                    layer_id,
+                    macro_idx,
+                    (start, end),
+                    block_input[:, start:end, :],
+                    out[:, start:end, :],
+                    k_new[:, :, start:end, :],
+                    v_new[:, :, start:end, :],
+                )
+            mode_state.last_attention = attn_weights.detach()
+            return out, (k_full, v_full), attn_weights
+
+        if kv_cache is not None:
+            raise ValueError(
+                "mode-controlled partial/skip forward does not support a past "
+                "kv_cache (replace lifecycle rewrites the full sequence)"
+            )
+
+        macro_ranges = [
+            (macro_idx, start, min(start + block_size, seq_len))
+            for macro_idx, start in enumerate(range(0, seq_len, block_size))
+        ]
+
+        if not active_rows:
+            out = torch.empty_like(block_input)
+            k_full = torch.empty(
+                batch,
+                self.num_heads,
+                seq_len,
+                self.head_dim,
+                dtype=block_input.dtype,
+                device=block_input.device,
+            )
+            v_full = torch.empty_like(k_full)
+            for macro_idx, start, end in macro_ranges:
+                entry = mode_state.entries[(layer_id, macro_idx)]
+                out[:, start:end, :] = entry.hidden_out + (
+                    block_input[:, start:end, :] - entry.hidden_in
+                )
+                k_full[:, :, start:end, :] = entry.k
+                v_full[:, :, start:end, :] = entry.v
+            attn = mode_state.last_attention
+            if attn is None:
+                attn = torch.empty(())
+            return out, (k_full, v_full), attn
+
+        active_set = set(active_rows)
+        active = torch.tensor(active_rows, dtype=torch.long, device=hidden.device)
+        num_active = int(active.numel())
+
+        h_act = block_input.index_select(1, active)
+        normed = self.ln1(h_act)
+        q = self.q_proj(normed).view(batch, num_active, self.num_heads, self.head_dim)
+        k_act = self.k_proj(normed).view(batch, num_active, self.num_heads, self.head_dim)
+        v_act = self.v_proj(normed).view(batch, num_active, self.num_heads, self.head_dim)
+        q = q.transpose(1, 2)
+        k_act = k_act.transpose(1, 2)
+        v_act = v_act.transpose(1, 2)
+
+        k_full = torch.empty(
+            batch,
+            self.num_heads,
+            seq_len,
+            self.head_dim,
+            dtype=block_input.dtype,
+            device=block_input.device,
+        )
+        v_full = torch.empty_like(k_full)
+        out = torch.empty_like(block_input)
+
+        for macro_idx, start, end in macro_ranges:
+            local_frozen = [row - start for row in range(start, end) if row not in active_set]
+            if not local_frozen:
+                continue
+            entry = mode_state.entries[(layer_id, macro_idx)]
+            local_idx = torch.tensor(local_frozen, dtype=torch.long, device=hidden.device)
+            global_idx = local_idx + start
+            k_full.index_copy_(2, global_idx, entry.k.index_select(2, local_idx))
+            v_full.index_copy_(2, global_idx, entry.v.index_select(2, local_idx))
+            frozen_out = entry.hidden_out.index_select(1, local_idx) + (
+                block_input.index_select(1, global_idx) - entry.hidden_in.index_select(1, local_idx)
+            )
+            out.index_copy_(1, global_idx, frozen_out)
+
+        k_full.index_copy_(2, active, k_act)
+        v_full.index_copy_(2, active, v_act)
+
+        scores = torch.matmul(q, k_full.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_out = torch.matmul(attn_weights, v_full)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, num_active, self.hidden_dim)
+        h_act = h_act + self.o_proj(attn_out)
+        h_act = h_act + self.down_proj(F.gelu(self.up_proj(self.ln2(h_act))))
+        out.index_copy_(1, active, h_act)
+
+        for macro_idx, start, end in macro_ranges:
+            mode = modes[macro_idx]
+            if mode == "SKIP":
+                continue
+            if mode == "REFRESH":
+                mode_state.record_rows(
+                    layer_id,
+                    macro_idx,
+                    (start, end),
+                    block_input[:, start:end, :],
+                    out[:, start:end, :],
+                    k_full[:, :, start:end, :],
+                    v_full[:, :, start:end, :],
+                )
+                continue
+            entry = mode_state.entries[(layer_id, macro_idx)]
+            local_active = [row - start for row in active_rows if start <= row < end]
+            local_idx = torch.tensor(local_active, dtype=torch.long, device=hidden.device)
+            global_idx = local_idx + start
+            entry.hidden_in.index_copy_(
+                1, local_idx, block_input.index_select(1, global_idx).detach()
+            )
+            entry.hidden_out.index_copy_(1, local_idx, out.index_select(1, global_idx).detach())
+            entry.k.index_copy_(2, local_idx, k_full.index_select(2, global_idx).detach())
+            entry.v.index_copy_(2, local_idx, v_full.index_select(2, global_idx).detach())
+
+        mode_state.last_attention = attn_weights.detach()
+        return out, (k_full, v_full), attn_weights
 
 
 class SimpleDiffusionLLM(nn.Module):
@@ -191,6 +362,8 @@ class SimpleDiffusionLLM(nn.Module):
         kv_cache: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
         reuse_state: Optional[StepReuseState] = None,
         reuse_config: Optional[StepReuseConfig] = None,
+        mode_state: Optional[MacroModeState] = None,
+        mode_config: Optional[MacroModeConfig] = None,
     ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         """Run one denoising step.
 
@@ -200,6 +373,10 @@ class SimpleDiffusionLLM(nn.Module):
             step_t: Current denoising step index (0-based).
             total_steps: Total number of denoising steps.
             kv_cache: Optional dictionary mapping layer index to a (k, v) tuple.
+            reuse_state: Optional cross-step cache (AR013).
+            reuse_config: Optional reuse policy (AR013).
+            mode_state: Optional macro-block mode control state (AR015).
+            mode_config: Optional macro-block mode control policy (AR015).
 
         Returns:
             A tuple of (logits, updated kv_cache, attention_scores).
@@ -229,6 +406,8 @@ class SimpleDiffusionLLM(nn.Module):
         attention_scores: torch.Tensor = torch.empty(())
         if reuse_state is not None:
             reuse_state.begin_step()
+        if mode_state is not None:
+            mode_state.begin_step()
         for layer_id, block in enumerate(self.blocks):
             past = kv_cache.get(layer_id)
             hidden, new_kv, attn = block(
@@ -238,6 +417,8 @@ class SimpleDiffusionLLM(nn.Module):
                 reuse_state=reuse_state,
                 reuse_config=reuse_config,
                 step_id=step_t,
+                mode_state=mode_state,
+                mode_config=mode_config,
             )
             updated_kv[layer_id] = new_kv
             attention_scores = attn
