@@ -1,0 +1,94 @@
+# AR015: convergence-aware macro-block mode control (SKIP/DELTA/REFRESH) on
+# 7B-scale block semi-AR denoising serving.
+#
+# Model dimensions (configs/experiments/model_7b_longctx.yaml):
+#   num_layers=32  num_heads=32  head_dim=128  hidden_dim=4096
+#   intermediate_dim=11008  vocab_size=32000  max_seq_len=8192
+#
+# Arms (one run per seed 0/1/2, 3 repeats each):
+#   0) baseline: replace + dense (full recompute each step; no-gating golden)
+#   1) ar013:    replace + packed + step reuse (threshold=0.1)
+#   2) ar015:    replace + paged + mode control, default parameters
+#                (this file; force_refresh_every=0)
+#   3) ar015_f2: same as ar015 with execution.force_refresh_every=2
+#                (accuracy-insurance arm; run-time override)
+#
+# Record per-step latency median[min-max], total time, peak VRAM, logits relL2
+# vs arm 0, execution_stats keys (mode_control / macro_block_size /
+# skip_blocks / delta_blocks / refresh_blocks / skipped_rows /
+# rewritten_rows / projected_rows), and the freeze-rate curve
+# (skipped_rows / (L*S) per step). CPU-side evidence and honesty notes:
+#   specs/archive/AR015-macro-block-mode-control/bench-results.md
+# (CPU toy workload: end-to-end speedup 0.64-1.04x for the f2 insurance arm,
+# relL2 bounded <= 2.65%; boundary cases documented there).
+# Full protocol:
+#   specs/archive/AR015-macro-block-mode-control/server-experiment.md
+#
+# Usage:
+#   python scripts/run_experiment.py \
+#     --config configs/experiments/s10_mode_control_gpu.yaml \
+#     --model-config configs/experiments/model_7b_longctx.yaml \
+#     --backend pytorch --device cuda --steps 30 --repeats 3 --seed 0 \
+#     --out results/ar015_s10
+log_level: ERROR
+warmup_steps: 2
+latency_budget_ms: 300.0
+memory_budget_mb: 4096.0
+
+execution:
+  kv_lifecycle: replace
+  kv_execution: paged
+  page_size: 32
+  packed_precision: fp16
+  int4_group_size: 16
+  mode_control_enabled: true
+  macro_block_size: 64
+  skip_threshold: 0.1
+  delta_min_active_ratio: 0.5
+  mode_warmup_steps: 1
+  force_refresh_every: 0
+
+shadowkv:
+  enabled: true
+  use_packed_cache: true
+  store_dense_kv: false
+  int4_group_size: 16
+  dense_precision_enabled: true
+  rd_allocation_enabled: true
+  hard_eviction_enabled: false
+  compression_ratio: 0.2
+  irap_decay: 0.85
+  entropy_weight: 0.4
+  sink_tokens: 8
+  eviction_pressure_threshold: 0.8
+  memory_budget_mb: 4096
+  precision_levels: ["fp32", "fp16", "int8", "int4"]
+  reuse:
+    enabled: false
+
+qdrift:
+  enabled: true
+  noise_schedule: cosine
+  sensitivity_temperature: 1.2
+  drift_method: relative_l2
+  positional_prior_weight: 0.3
+  use_importance_drift: true
+  importance_drift_weight: 0.3
+
+ffn:
+  enabled: true
+  mixed_precision: true
+  channel_importance_threshold: 0.7
+  sparse_update: true
+  delta_threshold: 0.05
+
+profiler:
+  accuracy_warning: 0.03
+  accuracy_critical: 0.05
+  latency_warning_ratio: 1.5
+  memory_warning_ratio: 0.9
+
+constraints:
+  max_accuracy_drop: 0.03
+  max_latency_ms: 300
+  max_memory_mb: 4096
