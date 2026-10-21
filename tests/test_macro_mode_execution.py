@@ -1037,11 +1037,19 @@ class TestMacroModePartialForward:
 
         out_dense, (k_dense, v_dense), attn_dense = block(drifted, layer_id=0, step_id=1)
 
-        # Assembled full-sequence K/V is bitwise identical to the dense
-        # forward: frozen rows replay cached projections and the active row
-        # is re-projected from identical values (design.md 4.2.2).
-        assert torch.equal(k_mode, k_dense)
-        assert torch.equal(v_mode, v_dense)
+        # Assembled full-sequence K/V: frozen rows replay cached projections
+        # bitwise (asserted exactly below); the active row is re-projected by
+        # a subset matmul (M=A vs M=S), which can reorder the reduction in
+        # the last bit -- the same quantified-noise rationale as the
+        # attention matmul below (design.md 4.2.2 / 6.3(a)).
+        frozen_rows_kv = list(range(1, T003_SEQ))
+        assert torch.equal(k_mode[:, :, frozen_rows_kv, :], k_dense[:, :, frozen_rows_kv, :])
+        assert torch.equal(v_mode[:, :, frozen_rows_kv, :], v_dense[:, :, frozen_rows_kv, :])
+        for kv_mode, kv_dense in ((k_mode, k_dense), (v_mode, v_dense)):
+            active_rel_l2 = (kv_mode[:, :, 0, :] - kv_dense[:, :, 0, :]).norm() / kv_dense[
+                :, :, 0, :
+            ].norm()
+            assert active_rel_l2.item() <= 1e-6
         # Active rows are recomputed and match the dense forward. The
         # row-local ops (LN/projection/FFN) are bitwise identical, but the
         # attention matmul runs at M=A vs the dense M=S, and CPU kernel
