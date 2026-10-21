@@ -59,6 +59,7 @@ class KVCacheEntry:
     is_reused: bool = False
     reuse_step: int = -1
     packed_kv: Optional[Any] = None
+    paged_kv: Optional[Any] = None
 
 
 @dataclass

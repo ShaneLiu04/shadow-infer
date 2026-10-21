@@ -13,6 +13,7 @@ from shadowinfer.core.structs import KVCacheEntry, StepConfig
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
 from shadowinfer.models import SimpleDiffusionLLM
 from shadowinfer.shadowkv.packed_kv_cache import PackedKVCache
+from shadowinfer.shadowkv.paged_kv_store import PagedKVStore
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +77,13 @@ class PyTorchModelBackend(ModelBackend):
         self._model: Optional[SimpleDiffusionLLM] = None
         self._kv_cache: Dict[int, KVCacheEntry] = {}
         self._packed_cache: Dict[int, PackedKVCache] = {}
+        self._paged_cache: Dict[int, PagedKVStore] = {}
         self._device = torch.device("cpu")
         self._int8_ffn_stats: Optional[Dict[str, Any]] = None
         self._kv_lifecycle = "append"
         self._kv_execution = "dense"
+        self._page_size = 32
+        self._paged_appended_total = 0
         self._packed_precision: Optional[str] = None
         self._step_reuse_enabled = False
         self._step_reuse_threshold = 0.1
@@ -97,11 +101,12 @@ class PyTorchModelBackend(ModelBackend):
         step_reuse_threshold: float = 0.1,
         step_reuse_warmup_steps: int = 1,
         int4_group_size: int = 16,
+        page_size: int = 32,
     ) -> None:
-        """Configure the executable KV path (AR013)."""
+        """Configure the executable KV path (AR013; paged mode in AR014)."""
         if kv_lifecycle not in ("append", "replace"):
             raise ValueError(f"Unsupported kv_lifecycle: {kv_lifecycle}")
-        if kv_execution not in ("dense", "packed"):
+        if kv_execution not in ("dense", "packed", "paged"):
             raise ValueError(f"Unsupported kv_execution: {kv_execution}")
         if packed_precision is not None and packed_precision not in (
             "fp32",
@@ -118,10 +123,13 @@ class PyTorchModelBackend(ModelBackend):
         reuse_config.validate()
         if int4_group_size < 1:
             raise ValueError(f"int4_group_size must be >= 1, got {int4_group_size}")
+        if page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {page_size}")
 
         self._kv_lifecycle = kv_lifecycle
         self._kv_execution = kv_execution
         self._packed_precision = packed_precision
+        self._page_size = int(page_size)
         self._step_reuse_enabled = bool(step_reuse_enabled)
         self._step_reuse_threshold = float(step_reuse_threshold)
         self._step_reuse_warmup_steps = int(step_reuse_warmup_steps)
@@ -135,9 +143,11 @@ class PyTorchModelBackend(ModelBackend):
             self._reuse_state = None
 
     def reset_execution_state(self) -> None:
-        """Clear KV/packed/reuse state between independent runs."""
+        """Clear KV/packed/paged/reuse state between independent runs."""
         self._kv_cache = {}
         self._packed_cache = {}
+        self._paged_cache = {}
+        self._paged_appended_total = 0
         self._last_execution_stats = {}
         if self._step_reuse_enabled:
             self._reuse_state = StepReuseState()
@@ -204,6 +214,14 @@ class PyTorchModelBackend(ModelBackend):
                     ):
                         reset_reason = "shape_mismatch"
                         break
+                paged = getattr(entry, "paged_kv", None)
+                if paged is not None:
+                    if (
+                        paged.num_heads != self._model.num_heads
+                        or paged.head_dim != self._model.head_dim
+                    ):
+                        reset_reason = "shape_mismatch"
+                        break
                 elif entry.k_tensor is not None:
                     if (
                         entry.k_tensor.dim() != 4
@@ -219,6 +237,7 @@ class PyTorchModelBackend(ModelBackend):
                 )
                 self._kv_cache = {}
                 self._packed_cache = {}
+                self._paged_cache = {}
                 kv_cache = {}
                 if self._reuse_state is not None:
                     self._reuse_state.reset()
@@ -234,6 +253,9 @@ class PyTorchModelBackend(ModelBackend):
                     continue
                 if entry.packed_kv is not None:
                     k, v = entry.packed_kv.unpack()
+                    raw_cache[layer_id] = (k, v)
+                elif entry.paged_kv is not None:
+                    k, v = entry.paged_kv.gather()
                     raw_cache[layer_id] = (k, v)
                 else:
                     raw_cache[layer_id] = _dequantize_kv(entry)
@@ -265,6 +287,9 @@ class PyTorchModelBackend(ModelBackend):
         updated_kv: Dict[int, KVCacheEntry] = {}
         packed_count = 0
         skipped_repack = 0
+        paged_count = 0
+        appended_this_step = 0
+        repack_saved_total = 0
         resident_bytes = 0
         data_plane_bytes = 0
         dense_bytes = 0
@@ -282,6 +307,9 @@ class PyTorchModelBackend(ModelBackend):
                 if old_entry.packed_kv is not None:
                     resident_bytes += old_entry.packed_kv.resident_bytes()
                     data_plane_bytes += old_entry.packed_kv.data_plane_bytes()
+                elif old_entry.paged_kv is not None:
+                    resident_bytes += old_entry.paged_kv.resident_bytes()
+                    data_plane_bytes += old_entry.paged_kv.data_plane_bytes()
                 elif old_entry.k_tensor is not None and old_entry.v_tensor is not None:
                     stored = (
                         old_entry.k_tensor.numel() * old_entry.k_tensor.element_size()
@@ -302,10 +330,14 @@ class PyTorchModelBackend(ModelBackend):
                     is_reused=True,
                     reuse_step=step_cfg.step_id - 1,
                     packed_kv=old_entry.packed_kv,
+                    paged_kv=old_entry.paged_kv,
                 )
                 if old_entry.packed_kv is not None:
                     resident_bytes += old_entry.packed_kv.resident_bytes()
                     data_plane_bytes += old_entry.packed_kv.data_plane_bytes()
+                elif old_entry.paged_kv is not None:
+                    resident_bytes += old_entry.paged_kv.resident_bytes()
+                    data_plane_bytes += old_entry.paged_kv.data_plane_bytes()
                 elif old_entry.k_tensor is not None and old_entry.v_tensor is not None:
                     stored = (
                         old_entry.k_tensor.numel() * old_entry.k_tensor.element_size()
@@ -315,7 +347,79 @@ class PyTorchModelBackend(ModelBackend):
                     data_plane_bytes += stored
                 continue
 
-            if self._kv_execution == "packed":
+            if self._kv_execution == "paged":
+                page_precision = self._packed_precision or precision
+                try:
+                    store = (
+                        old_entry.paged_kv
+                        if old_entry is not None and old_entry.paged_kv is not None
+                        else None
+                    )
+                    if store is None:
+                        store = PagedKVStore(
+                            k.shape[0],
+                            k.shape[1],
+                            k.shape[3],
+                            page_size=self._page_size,
+                            device=k.device,
+                            int4_group_size=self._int4_group_size,
+                        )
+                    else:
+                        store.validate_against(k.shape[0], k.shape[1], k.shape[3])
+                    if self._kv_lifecycle == "replace":
+                        store.clear()
+                        past = 0
+                    else:
+                        past = store.max_seq
+                        if k.shape[2] < past:
+                            raise ValueError(
+                                f"paged append anomaly: model output seq {k.shape[2]} "
+                                f"< stored past {past} at layer {layer_id}"
+                            )
+                    store.append(
+                        k[:, :, past:, :].contiguous(),
+                        v[:, :, past:, :].contiguous(),
+                        page_precision,
+                    )
+                    appended_this_step += k.shape[2] - past
+                    repack_saved_total += past
+                    updated_kv[layer_id] = KVCacheEntry(
+                        k_tensor=None,
+                        v_tensor=None,
+                        precision="mixed",
+                        importance_score=0.0,
+                        is_reused=False,
+                        reuse_step=-1,
+                        paged_kv=store,
+                    )
+                    self._paged_cache[layer_id] = store
+                    resident_bytes += store.resident_bytes()
+                    data_plane_bytes += store.data_plane_bytes()
+                    paged_count += 1
+                    self._packed_cache.pop(layer_id, None)
+                except Exception as exc:
+                    logger.warning(
+                        "paged KV execution failed at layer %s, falling back to dense: %s",
+                        layer_id,
+                        exc,
+                    )
+                    fallback = True
+                    qk, qv, sk, sv = _quantize_kv(k, v, precision)
+                    updated_kv[layer_id] = KVCacheEntry(
+                        k_tensor=qk,
+                        v_tensor=qv,
+                        precision=precision,
+                        scale_k=sk,
+                        scale_v=sv,
+                        importance_score=0.0,
+                        is_reused=False,
+                        reuse_step=-1,
+                    )
+                    stored = qk.numel() * qk.element_size() + qv.numel() * qv.element_size()
+                    resident_bytes += stored
+                    data_plane_bytes += stored
+                    self._paged_cache.pop(layer_id, None)
+            elif self._kv_execution == "packed":
                 packed_precision = self._packed_precision or precision
                 try:
                     seq_len = k.shape[2]
@@ -339,6 +443,7 @@ class PyTorchModelBackend(ModelBackend):
                         packed_kv=packed,
                     )
                     self._packed_cache[layer_id] = packed
+                    self._paged_cache.pop(layer_id, None)
                     resident_bytes += packed.resident_bytes()
                     data_plane_bytes += packed.data_plane_bytes()
                     packed_count += 1
@@ -380,8 +485,10 @@ class PyTorchModelBackend(ModelBackend):
                 resident_bytes += stored
                 data_plane_bytes += stored
                 self._packed_cache.pop(layer_id, None)
+                self._paged_cache.pop(layer_id, None)
 
         self._kv_cache = updated_kv
+        self._paged_appended_total += appended_this_step
         compression_ratio = (resident_bytes / dense_bytes) if dense_bytes > 0 else 0.0
         data_plane_ratio = (data_plane_bytes / dense_bytes) if dense_bytes > 0 else 0.0
         self._last_execution_stats = {
@@ -395,6 +502,14 @@ class PyTorchModelBackend(ModelBackend):
             ),
             "packed_layers": packed_count,
             "skipped_repack": skipped_repack,
+            "paged": self._kv_execution == "paged",
+            "page_size": self._page_size,
+            "page_count": sum(store.page_count for store in self._paged_cache.values()),
+            "open_pages": sum(store.open_pages for store in self._paged_cache.values()),
+            "appended_tokens": appended_this_step,
+            "appended_tokens_total": self._paged_appended_total,
+            "repack_tokens_saved": repack_saved_total,
+            "page_evictions": sum(store.page_evictions for store in self._paged_cache.values()),
             "resident_bytes": resident_bytes,
             "data_plane_bytes": data_plane_bytes,
             "metadata_bytes": max(resident_bytes - data_plane_bytes, 0),
@@ -420,7 +535,7 @@ class PyTorchModelBackend(ModelBackend):
 
     @staticmethod
     def _entry_kv_tensors(entry: Any) -> Optional[tuple]:
-        """Return dense (k, v) for dense or packed KV entries (AR013)."""
+        """Return dense (k, v) for dense, packed or paged KV entries (AR013/14)."""
         if entry is None:
             return None
         if entry.k_tensor is not None and entry.v_tensor is not None:
@@ -428,6 +543,9 @@ class PyTorchModelBackend(ModelBackend):
         packed = getattr(entry, "packed_kv", None)
         if packed is not None:
             return packed.unpack()
+        paged = getattr(entry, "paged_kv", None)
+        if paged is not None:
+            return paged.gather()
         return None
 
     def get_kv_cache(self) -> Dict[int, KVCacheEntry]:

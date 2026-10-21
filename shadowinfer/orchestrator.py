@@ -482,7 +482,7 @@ class Orchestrator:
 
     @staticmethod
     def _entry_kv_tensors(entry: Any) -> Optional[tuple]:
-        """Return dense (k, v) for dense or packed KV entries (AR013)."""
+        """Return dense (k, v) for dense, packed or paged KV entries (AR013/14)."""
         if entry is None:
             return None
         if entry.k_tensor is not None and entry.v_tensor is not None:
@@ -490,6 +490,9 @@ class Orchestrator:
         packed = getattr(entry, "packed_kv", None)
         if packed is not None:
             return packed.unpack()
+        paged = getattr(entry, "paged_kv", None)
+        if paged is not None:
+            return paged.gather()
         return None
 
     def _build_baseline_kv_metrics(self, kv_cache: Dict[int, KVCacheEntry]) -> Dict[str, Any]:

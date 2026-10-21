@@ -17,12 +17,14 @@ from shadowinfer.shadowkv.eviction_policy import (
 from shadowinfer.shadowkv.importance_model import ImportanceModel, TokenHeadScore
 from shadowinfer.shadowkv.kv_cache_manager import KVCacheManager
 from shadowinfer.shadowkv.packed_kv_cache import PackedKVCache
+from shadowinfer.shadowkv.paged_kv_store import PagedKVStore
 from shadowinfer.shadowkv.shadowkv_agent import ShadowKVAgent
 
 __all__ = [
     "ShadowKVAgent",
     "KVCacheManager",
     "PackedKVCache",
+    "PagedKVStore",
     "ImportanceModel",
     "TokenHeadScore",
     "KVDecisionPlane",
