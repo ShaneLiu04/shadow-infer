@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
+
 
 def _default_intermediate_dim(hidden_dim: int) -> int:
     return 4 * hidden_dim
@@ -52,6 +54,10 @@ class DiffusionTransformerBlock(nn.Module):
         self,
         hidden: torch.Tensor,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        layer_id: int = 0,
+        reuse_state: Optional[StepReuseState] = None,
+        reuse_config: Optional[StepReuseConfig] = None,
+        step_id: int = 0,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Forward one block.
 
@@ -59,11 +65,30 @@ class DiffusionTransformerBlock(nn.Module):
             hidden: Input tensor of shape [batch, seq_len, hidden_dim].
             kv_cache: Optional previous (k, v) tuple of shape
                 [batch, num_heads, past_len, head_dim].
+            layer_id: Block index (for step reuse bookkeeping).
+            reuse_state: Optional cross-step cache (AR013).
+            reuse_config: Optional reuse policy (AR013).
+            step_id: Current denoising step (warmup gate).
 
         Returns:
             A tuple of (updated hidden, new (k, v), attention weights).
         """
         batch, seq_len, _ = hidden.shape
+        block_input = hidden
+
+        if reuse_state is not None and reuse_config is not None:
+            should_reuse, drift = reuse_state.should_reuse(layer_id, hidden, step_id, reuse_config)
+            if drift is not None:
+                reuse_state.last_drifts[layer_id] = drift
+            if should_reuse:
+                entry = reuse_state.entries[layer_id]
+                reused = entry.hidden_out + (hidden - entry.hidden_in)
+                reuse_state.last_reused_layers.add(layer_id)
+                reuse_state.attention_reused = True
+                attn = reuse_state.last_attention
+                if attn is None:
+                    attn = torch.empty(())
+                return reused, (entry.k, entry.v), attn
 
         normed = self.ln1(hidden)
         q = self.q_proj(normed).view(batch, seq_len, self.num_heads, self.head_dim)
@@ -88,6 +113,11 @@ class DiffusionTransformerBlock(nn.Module):
 
         ffn_out = self.down_proj(F.gelu(self.up_proj(self.ln2(hidden))))
         hidden = hidden + ffn_out
+
+        if reuse_state is not None:
+            reuse_state.record(layer_id, block_input, hidden, k, v)
+            reuse_state.last_computed_layers.add(layer_id)
+            reuse_state.last_attention = attn_weights.detach()
 
         return hidden, (k, v), attn_weights
 
@@ -159,6 +189,8 @@ class SimpleDiffusionLLM(nn.Module):
         step_t: int,
         total_steps: int,
         kv_cache: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        reuse_state: Optional[StepReuseState] = None,
+        reuse_config: Optional[StepReuseConfig] = None,
     ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         """Run one denoising step.
 
@@ -195,9 +227,18 @@ class SimpleDiffusionLLM(nn.Module):
 
         updated_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         attention_scores: torch.Tensor = torch.empty(())
+        if reuse_state is not None:
+            reuse_state.begin_step()
         for layer_id, block in enumerate(self.blocks):
             past = kv_cache.get(layer_id)
-            hidden, new_kv, attn = block(hidden, past)
+            hidden, new_kv, attn = block(
+                hidden,
+                past,
+                layer_id=layer_id,
+                reuse_state=reuse_state,
+                reuse_config=reuse_config,
+                step_id=step_t,
+            )
             updated_kv[layer_id] = new_kv
             attention_scores = attn
 

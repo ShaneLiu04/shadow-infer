@@ -862,6 +862,10 @@ class PackedKVCache:
                     total += tensor.numel() * tensor.element_size()
         return total
 
+    def data_plane_bytes(self) -> int:
+        """Return tensor storage bytes only (AR013, data-plane accounting)."""
+        return self._compute_data_bytes()
+
     def resident_bytes(self) -> int:
         """Return resident bytes including per-entry metadata (AR012).
 

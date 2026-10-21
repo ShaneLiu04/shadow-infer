@@ -195,9 +195,28 @@ class Orchestrator:
             }
         self.initialize_agents(model_config)
         self._maybe_enable_int8_ffn()
+        self._maybe_configure_execution()
         self._initialized = True
         for agent in self.registry:
             agent.set_state(AgentState.READY)
+
+    def _maybe_configure_execution(self) -> None:
+        """Apply AR013 execution config to backends that support it."""
+        cfg = dict(self.config.get("execution", {}) or {})
+        shadowkv_cfg = self.config.get("shadowkv", {}) or {}
+        if not cfg and isinstance(shadowkv_cfg, dict):
+            cfg = dict(shadowkv_cfg.get("execution", {}) or {})
+        if not cfg or self.model_backend is None:
+            return
+        configure = getattr(self.model_backend, "configure_execution", None)
+        if configure is None:
+            self.logger.log_event(
+                "execution_unsupported",
+                "Model backend does not support AR013 execution controls.",
+                data={"backend": type(self.model_backend).__name__},
+            )
+            return
+        configure(**cfg)
 
     def _maybe_enable_int8_ffn(self) -> None:
         """Enable executable INT8 FFN when configured and supported (AR011)."""
@@ -461,6 +480,18 @@ class Orchestrator:
             "down": torch.randn(hidden_dim, intermediate_dim, device=device),
         }
 
+    @staticmethod
+    def _entry_kv_tensors(entry: Any) -> Optional[tuple]:
+        """Return dense (k, v) for dense or packed KV entries (AR013)."""
+        if entry is None:
+            return None
+        if entry.k_tensor is not None and entry.v_tensor is not None:
+            return entry.k_tensor, entry.v_tensor
+        packed = getattr(entry, "packed_kv", None)
+        if packed is not None:
+            return packed.unpack()
+        return None
+
     def _build_baseline_kv_metrics(self, kv_cache: Dict[int, KVCacheEntry]) -> Dict[str, Any]:
         """根据真实后端返回的 KV cache 构建基线 profiler 输入。"""
         precision_map: Dict[int, Dict[int, str]] = {}
@@ -469,14 +500,20 @@ class Orchestrator:
         total_mem = 0.0
 
         for lid, entry in kv_cache.items():
-            k = entry.k_tensor
-            v = entry.v_tensor
-            mem_mb = (k.numel() * k.element_size() + v.numel() * v.element_size()) / (
-                1024.0 * 1024.0
-            )
+            kv = self._entry_kv_tensors(entry)
+            if kv is None:
+                continue
+            k, v = kv
+            packed = getattr(entry, "packed_kv", None)
+            if packed is not None:
+                mem_bytes = packed.resident_bytes()
+                num_heads = packed.num_heads
+            else:
+                mem_bytes = k.numel() * k.element_size() + v.numel() * v.element_size()
+                num_heads = k.shape[1]
+            mem_mb = mem_bytes / (1024.0 * 1024.0)
             per_layer_mem[lid] = mem_mb
             total_mem += mem_mb
-            num_heads = k.shape[1]
             precision_map[lid] = {h: entry.precision for h in range(num_heads)}
             reuse_decision[lid] = {"reused": entry.is_reused}
 
@@ -548,11 +585,9 @@ class Orchestrator:
         """将 ``backend.forward_step()`` 的结果转换为 Orchestrator 可用的输入。"""
         kv_cache = result.get("kv_cache", {})
         kv_entry = kv_cache.get(0)
-        if kv_entry is not None and hasattr(kv_entry, "k_tensor") and hasattr(kv_entry, "v_tensor"):
-            kv_current = {
-                "k": kv_entry.k_tensor.detach(),
-                "v": kv_entry.v_tensor.detach(),
-            }
+        kv = self._entry_kv_tensors(kv_entry)
+        if kv is not None:
+            kv_current = {"k": kv[0].detach(), "v": kv[1].detach()}
         else:
             kv_current = inputs.get("kv_current", {"k": torch.empty(()), "v": torch.empty(())})
 
@@ -570,6 +605,7 @@ class Orchestrator:
             "attention_scores": attention_scores,
             "kv_current": kv_current,
             "weights": inputs.get("weights"),
+            "execution_stats": result.get("execution_stats", {}),
             "_backend_full_kv_cache": kv_cache,
         }
 
@@ -600,6 +636,9 @@ class Orchestrator:
                 self.initialize()
             if self.profiler is None:
                 raise RuntimeError("Agents not initialized. Call initialize() first.")
+        reset_execution = getattr(self._get_model_backend(), "reset_execution_state", None)
+        if callable(reset_execution):
+            reset_execution()
 
         self.logger.log_event(
             "run_baseline_start",
@@ -853,6 +892,9 @@ class Orchestrator:
             优化结果字典。
         """
         self._ensure_initialized()
+        reset_execution = getattr(self._get_model_backend(), "reset_execution_state", None)
+        if callable(reset_execution):
+            reset_execution()
 
         self.logger.log_event(
             "run_optimized_start",
@@ -940,6 +982,9 @@ class Orchestrator:
             每个 step 的状态字典（与 run_step 返回格式一致）。
         """
         self._ensure_initialized()
+        reset_execution = getattr(self._get_model_backend(), "reset_execution_state", None)
+        if callable(reset_execution):
+            reset_execution()
         self.logger.log_event(
             "run_stream_start",
             f"Starting streaming optimized inference for {num_steps} steps.",
@@ -1219,6 +1264,24 @@ class Orchestrator:
                     recommendation="Falling back to simulation tensors for this step.",
                     step_id=step_id,
                 )
+                inputs["execution_stats"] = {
+                    "fallback": True,
+                    "fallback_reason": f"backend_forward_failed: {exc}",
+                }
+                # Keep downstream agents functional on the simulation fallback:
+                # the default placeholders are 0-D scalars, but ShadowKV's
+                # contract expects 4-D attention/KV tensors. Shape them from
+                # the model config (AR013 reliability: a fallback must not crash).
+                mc = self._model_config
+                fb_batch = int(mc.get("batch_size", 1))
+                fb_heads = int(mc.get("num_heads", 1))
+                fb_seq = int(mc.get("seq_len", mc.get("max_seq_len", 1)))
+                fb_dim = int(mc.get("head_dim", 1))
+                inputs["attention_scores"] = torch.zeros(fb_batch, fb_heads, fb_seq, fb_seq)
+                inputs["kv_current"] = {
+                    "k": torch.zeros(fb_batch, fb_heads, fb_seq, fb_dim),
+                    "v": torch.zeros(fb_batch, fb_heads, fb_seq, fb_dim),
+                }
 
         # Step 3: ShadowKV Agent 执行（逐层）
         # 真实后端的 KV cache 在 step 之间会追加 token，形状可能不一致，
@@ -1226,6 +1289,9 @@ class Orchestrator:
         if self._is_real_backend():
             inputs["kv_previous"] = None
         state.kv_result = self._run_shadowkv(step_config, inputs, sensitivity_score, drift_score)
+        execution_stats = inputs.get("execution_stats")
+        if execution_stats:
+            state.kv_result["execution"] = dict(execution_stats)
 
         # AR003 T006：缓存本步聚合 ΔA，供下一步 _run_qdrift 消费（一步滞后）
         self._last_importance_drift = state.kv_result.get("importance_drift")
@@ -1585,7 +1651,11 @@ class Orchestrator:
             "performance": perf_data,
             "accuracy": accuracy_data,
         }
-        return self.profiler.on_step(step_config, profiler_inputs)
+        result = self.profiler.on_step(step_config, profiler_inputs)
+        execution = aggregated_kv.get("execution")
+        if execution:
+            result["execution"] = dict(execution)
+        return result
 
     def _record_scheduler_experience(
         self,
@@ -1970,9 +2040,9 @@ class Orchestrator:
         kv_cache = result.get("kv_cache", {})
 
         kv_entry = kv_cache.get(0)
-        if kv_entry is not None and hasattr(kv_entry, "k_tensor") and hasattr(kv_entry, "v_tensor"):
-            k = kv_entry.k_tensor
-            v = kv_entry.v_tensor
+        kv = self._entry_kv_tensors(kv_entry)
+        if kv is not None:
+            k, v = kv
         else:
             k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
             v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
