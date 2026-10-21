@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.16.0 | 921 passed / 1 skipped | 83.78% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.17.0 | 1016 passed / 1 skipped | 84.25% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -70,6 +70,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **规范化紧凑 KV Store（v3.14.0）** | `PackedKVCache.unpack` / `apply_reuse_mask` / `evict` 全量张量化：unpack 按精度桶批量 gather+反量化（CPU 512-2048 为 101-219x），复用按 flat 索引批量拷贝（7.3-8.2x），驱逐改为桶内就地删除并真实释放字节（49-109x，25% 条目对应 25% 字节下降）。修正 INT4 `B>1` scale 的 batch 索引缺陷（B=2 每 batch 相对 MSE 0.0075/0.0072），统一压缩/打包/成本模型的 `int4_group_size`（默认 16）且只量化一次；默认 `store_dense_kv=false`，packed cache 成为单一驻留表示，`resident_bytes()` 与 `KVCacheManager` 统一口径（dense shadow 存在时同时计入，超预算先释放 shadow 再驱逐）。 |
 | **跨步复用与紧凑 KV 闭环执行（v3.15.0）** | `StepReuseState` 逐 block 缓存 `(input, output, K, V)`，按相对 L2 漂移门控复用整个 block：跳过 Q/K/V/O、attention 与 FFN，输出 `cached_out + (h - cached_in)`；`kv_lifecycle=replace` 修正 diffusion 固定序列的 KV 无限追加；`kv_execution=packed` 让每层 K/V 以 `PackedKVCache` 驻留并在 append 模式从 packed 读取 past。真实受控 denoising 轨迹（3 seed × 3 repeats，CPU）：reuse 1.76-1.94x、logits relL2 0.94-0.96%、跳过 50% block；int8 packed 数据平面驻留为 FP16 dense 的 53%（全口径含元数据 72%）、relL2 0；组合 1.09-1.44x。默认关闭，旧路径逐位不变；7B/GPU 按 `s8_step_reuse_gpu.yaml` 在服务器复现。 |
 | **分页增量 KV 驻留（v3.16.0）** | `PagedKVStore` 以 `[B,H,page_tokens,D]` 模型布局页存储 KV，append 仅量化/写入新 token 入页（向量化、零 Python 逐 token 循环），封存页 id 与数据指针不可变，读取走单遍 gather（零 permute/零 repack）；行级量化与 `PackedKVCache` 同元素逐位一致（fp32/fp16/int8/int4 golden `torch.equal`），支持按 token-head 驱逐（整页全驱逐真实释放字节、部分驱逐行置零、槽位空闲链复用、不复活）。`kv_execution="paged"`（`page_size` 可配，默认 32）消除 packed 路径每步全量 unpack+repack 与 precision_map 重建；执行统计新增 `paged`/`page_size`/`page_count`/`open_pages`/`appended_tokens_total`/`repack_tokens_saved`/`page_evictions` 等八键。KV 执行平面微基准（append 簿记，3 seed 中位，CPU）：加速 9.30x（S=512）/ 10.16x（S=2048），每步延迟斜率比为 packed 基线的 0.088-0.114，Python 堆瞬态峰值降约 51-57x；fp16 逐位等价、int8 驱逐前后逐位等价由 UT 证明。7B/GPU 长上下文按 `s9_paged_longctx_gpu.yaml` 在服务器复现。 |
+| **收敛感知宏块 KV 模式控制（v3.17.0）** | `MacroModeState` 将序列按宏块（`macro_block_size`，默认 32）分类为 SKIP / DELTA / REFRESH 三态：漂移低于 `skip_threshold` 的行冻结（残差回放），活跃比例超 `delta_min_active_ratio` 的块整块重算，warmup 与 `force_refresh_every` 强制全刷作精度保险；活跃行输出与全量前向 relL2 <= 1e-6（K/V 组装逐位相等），分类全程向量化。`PagedKVStore.rewrite_tokens` 提供行级覆写（校验全先于变异、驱逐行拒写、未覆写行逐位不变），SKIP 块零页写。模型侧行粒度分段前向 + 后端三态写回分派（全 REFRESH 走 clear+append 快路径），任一失败自动降级 dense 重算并 reset。`mode_control_enabled`（paged+replace 显式 opt-in，与 step reuse 互斥），执行统计新增 `mode_control`/`macro_block_size`/`skip_blocks`/`delta_blocks`/`refresh_blocks`/`skipped_rows`/`rewritten_rows`/`projected_rows` 键，默认关闭逐位回归。**诚实结论（CPU 玩具负载，机制说明口径）**：端到端无加速收益（f2 保险臂 0.64-1.04x，f0 默认臂 0.49-1.06x；行粒度重组开销 ~ 所省计算 35-60%，冻结行误差随陈旧深度线性累积），交付物为正确性（1016 UT）、误差有界语义（f2 保险臂全步 relL2 <= 2.65%）、漂移门自愈与 SKIP 零页写；三轮预注册历史（含两次断言失败与不可行性证明）完整落档，GPU/真实负载按 `s10_mode_control_gpu.yaml` 复现。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -729,7 +730,45 @@ python specs/archive/AR013-step-reuse-packed-execution/ar013_bench.py
 
 # 分页增量 KV 驻留基准（append 簿记平面，2 规模 × 3 seed，含预注册断言）
 python specs/archive/AR014-paged-kv-store/ar014_bench.py
+
+# 宏块模式控制基准（双轨迹 × 四臂 × 3 规模 × 3 seeds，含终版预注册断言）
+python specs/archive/AR015-macro-block-mode-control/ar015_bench.py
 ```
+
+### 实测数据（v3.17.0，2026-10-21，Windows / CPU）
+
+宏块模式控制端到端基准：真实 `SimpleDiffusionLLM` 六步去噪轨迹（sigma 0.9→0.02），
+双轨迹（T1 均匀收敛边界案例 / T2 块式半 AR 目标负载），四臂（dense golden / AR013 step
+reuse / AR015 默认 f=0 / AR015 保险 f=2），3 seeds
+（`specs/archive/AR015-macro-block-mode-control/ar015_bench.py`）：
+
+**T2 块式半 AR（目标负载，终版断言对象 = f2 保险臂）**：
+
+| 规模 (L,H,D,S) | f2 relL2 最差（3 seeds） | f2 末半程冻结率中位 | f2 加速中位 | f0 加速中位 | f0 relL2 最差 |
+|---|---|---|---|---|---|
+| 8/8/64/256 | 1.881% | 0.667 | 0.642x | 0.515x | 7.150% |
+| 16/8/64/512 | 2.649% | 0.667 | 0.831x | 0.725x | 10.083% |
+| 8/8/64/1024 | 1.988% | 0.667 | 1.043x | 1.045x | 7.571% |
+
+**T1 均匀收敛（边界案例，仅报告）**：f0 加速 0.516-0.789x、relL2 2.248-3.119%、
+冻结 0.667；均匀漂移下行粒度分类退化为全有全无，DELTA 机制不出现。
+
+- **终版预注册断言（f2 保险臂，全部通过）**：全步 relL2 <= 3%（实测最差 2.649%）；
+  末半程平均冻结率 >= 30%（实测 0.667）。
+- **诚实结论：端到端无加速收益**。f2 最优 1.043x（S=1024），S=256/512 为 0.64x/0.83x；
+  加速比与 >= AR013 臂比较在二次预注册失败后取消断言只报告。f-扫描诊断（27 组）证明
+  >=2x 与 <=2% 预算在本 CPU 玩具负载上不可同时达成：SKIP 冻结行残差回放不含 attention
+  对尾部 K/V 演化的跨行耦合（误差 ~ 尾窗质量分数 x 陈旧深度 x 层数，逐步线性累积，
+  S=512 十六层最差 10.1%），且 CPU 行粒度重组开销约为所省 dense 计算的 35-60%。
+- **机制交付物（实测验证）**：漂移门自愈（f0 陈旧累积至峰值后触发部分 DELTA 与级联
+  REFRESH，relL2 回落 2.6%）；f2 保险全步 relL2 有界（1.73-2.65%）；SKIP 步零页写
+  （页 id 不变，UT 证明）；f2 冻结率 0.667 与强制刷新调度精确一致。
+- 活跃行输出 vs 全量前向 relL2 <= 1e-6、K/V 组装逐位相等由 UT 覆盖
+  （`tests/test_macro_mode_execution.py`，95 用例）；三轮预注册历史（原 T1+>=2x 断言
+  失败、二次 T2+>=2x 失败、f-扫描不可行性证明、终版断言）完整落档于
+  `specs/archive/AR015-macro-block-mode-control/bench-results.md`。
+- 7B/GPU 真实块扩散负载（注意力耦合结构弱于均匀玩具）按 `s10_mode_control_gpu.yaml`
+  与 `server-experiment.md` 在服务器复现；本机不宣称 GPU 结果。
 
 ### 实测数据（v3.16.0，2026-10-21，Windows / CPU）
 
@@ -1240,6 +1279,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.17.0（2026-10）
+
+- **宏块模式分类**：新增 `shadowinfer/execution/macro_mode.py`；`MacroModeState` 按宏块将每层序列分类为 SKIP / DELTA / REFRESH（单门 `skip_threshold` + 比例门 `delta_min_active_ratio`），分类向量化（单层单次构建参考/有效行掩码，无逐块 `.item()`/`nonzero`）；warmup 步与 `force_refresh_every` 周期强制 REFRESH 作精度保险；entry 缺失/shape 失效逐块删除并强制全行活跃。
+- **行粒度分段前向**：`SimpleDiffusionLLM` / `DiffusionTransformerBlock` 支持按活跃行子集前向（全活跃捷径逐位等价、全 SKIP 残差回放、部分活跃行切片 + key 侧 scatter 组装）；三态 record（REFRESH 整块、DELTA 活跃行、SKIP 不触碰）；`last_modes`/`last_active_rows`/`last_attention` 可观测。
+- **行级页覆写**：`PagedKVStore.rewrite_tokens` 校验全先于变异（失败原子性）、驱逐行拒写、跨页自动拆分、未覆写行 payload 逐位不变；`rewritten_tokens`/`rewritten_pages` 记账。
+- **后端分派与降级**：`configure_execution` 六新参（`mode_control_enabled` 等，paged+replace 显式 opt-in，与 step reuse 互斥 ValueError）；写回三态分派（SKIP 零页写、DELTA 活跃行、REFRESH 整块；全 REFRESH 走 clear+append 快路径，页布局逐位相同）；模型调用或写回失败自动降级 dense 重算并 reset；shape 突变清空模式状态；执行统计新增八键恒存在；默认关闭逐位回归。
+- **实测（CPU，双轨迹 × 四臂 × 3 规模 × 3 seeds）**：f2 保险臂全步 relL2 <= 2.649%、末半程冻结率 0.667（终版预注册断言全过）；**端到端无加速收益（0.64-1.04x）如实报告**，f-扫描证明 >=2x 与 <=2% 在玩具负载不可同时达成，机制交付物为正确性、误差有界语义、漂移门自愈与 SKIP 零页写；三轮预注册历史完整落档。
+- **复现资产**：`specs/archive/AR015-macro-block-mode-control/`（srs/design/tasks/st-cases/bench/server-experiment），`configs/experiments/s10_mode_control_gpu.yaml`；1016 passed / 1 skipped，覆盖率 84.25%。
 
 ### v3.16.0（2026-10）
 
