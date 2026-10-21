@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.14.0 | 853 passed / 1 skipped | 83.23% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.15.0 | 876 passed / 1 skipped | 83.37% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -68,6 +68,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **稠密精度码热路径（v3.12.0）** | 以 `int8[seq, heads]` codes 作为精度决策的唯一热路径状态：`allocate_precision_codes` 直接产出 codes，`admit_codes` 用稳定 argsort + 前缀和闭式求解降档/驱逐，`PrecisionPlan.from_codes` 张量化生成分组与 flat 索引，dict 仅在 API 边界转换一次。修复非连续 K/V 导致 `zeros_like().view()` 的静默回退（4 层管线 16 次压缩 0 次回退）。CPU 3 次中位 8192×32 元数据阶段 2443.2→135.7 ms（18.00x），512-4096 为 16.67-18.81x，输出与 v3.11 逐位一致。 |
 | **可执行 INT8 FFN（v3.13.0）** | `INT8Linear` 按输出通道对称量化权重、按 token 动态量化激活，使用真实 `torch._int_mm` INT8 GEMM 后按 `scale_x × scale_w` 反量化；`SimpleDiffusionLLM`/HF 后端可直接替换 FFN 线性层并释放 FP32 权重（可选保留 golden）。7B FFN 上投影（4096×11008，M>=16）CPU 复跑 4.8-6.7x，权重内存 3.99x 降低；中等模型端到端 1.37-1.47x；小模型 logits 相对误差 0.43%、top-1 99.22%。`_int_mm` 不可用时确定性回退且只告警一次。 |
 | **规范化紧凑 KV Store（v3.14.0）** | `PackedKVCache.unpack` / `apply_reuse_mask` / `evict` 全量张量化：unpack 按精度桶批量 gather+反量化（CPU 512-2048 为 101-219x），复用按 flat 索引批量拷贝（7.3-8.2x），驱逐改为桶内就地删除并真实释放字节（49-109x，25% 条目对应 25% 字节下降）。修正 INT4 `B>1` scale 的 batch 索引缺陷（B=2 每 batch 相对 MSE 0.0075/0.0072），统一压缩/打包/成本模型的 `int4_group_size`（默认 16）且只量化一次；默认 `store_dense_kv=false`，packed cache 成为单一驻留表示，`resident_bytes()` 与 `KVCacheManager` 统一口径（dense shadow 存在时同时计入，超预算先释放 shadow 再驱逐）。 |
+| **跨步复用与紧凑 KV 闭环执行（v3.15.0）** | `StepReuseState` 逐 block 缓存 `(input, output, K, V)`，按相对 L2 漂移门控复用整个 block：跳过 Q/K/V/O、attention 与 FFN，输出 `cached_out + (h - cached_in)`；`kv_lifecycle=replace` 修正 diffusion 固定序列的 KV 无限追加；`kv_execution=packed` 让每层 K/V 以 `PackedKVCache` 驻留并在 append 模式从 packed 读取 past。真实受控 denoising 轨迹（3 seed × 3 repeats，CPU）：reuse 1.76-1.94x、logits relL2 0.94-0.96%、跳过 50% block；int8 packed 数据平面驻留为 FP16 dense 的 53%（全口径含元数据 72%）、relL2 0；组合 1.09-1.44x。默认关闭，旧路径逐位不变；7B/GPU 按 `s8_step_reuse_gpu.yaml` 在服务器复现。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -112,7 +113,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-当前主分支：`853 passed, 1 skipped`，测试覆盖率 `83.23%`（pytest-cov，fail-under 75）。
+当前主分支：`876 passed, 1 skipped`，测试覆盖率 `83.37%`（pytest-cov，fail-under 75）。
 
 ### 30 秒跑通完整流水线
 
@@ -721,7 +722,31 @@ python specs/archive/AR011-int8-ffn-execution/ar011_bench.py
 
 # 紧凑 KV Store 读写/复用/驱逐基准（含 INT4 batch 修正与字节下降断言）
 python specs/archive/AR012-canonical-kv-store/ar012_bench.py
+
+# 跨步复用 + packed KV 执行基准（受控 denoising 轨迹，3 seed）
+python specs/archive/AR013-step-reuse-packed-execution/ar013_bench.py
 ```
+
+### 实测数据（v3.15.0，2026-10-20，Windows / CPU）
+
+真实 `SimpleDiffusionLLM` forward、真实张量；受控轨迹 `x_t = x0 + sigma_t * noise`
+（sigma 0.9→0.02，10 步）；3 seed × 3 repeats 中位
+（`specs/archive/AR013-step-reuse-packed-execution/ar013_bench.py`）：
+
+| 规模 L/H/D/HN/S | reuse 加速 | reuse relL2 | 跳过 block | packed 驻留 (data-plane / 全口径) | packed relL2 | combined 加速 |
+|---|---|---|---|---|---|---|
+| 8/8/64/512/256 | 1.76-1.89x | 0.94-0.95% | 50% | 53% / 72% | 0.00% | 1.09-1.17x |
+| 8/8/64/512/512 | 1.86-1.87x | 0.95-0.96% | 50% | 53% / 72% | 0.00% | 1.13-1.17x |
+| 8/16/64/1024/256 | 1.93-1.94x | 0.96% | 50% | 53% / 72% | 0.00% | 1.42-1.44x |
+
+- baseline 为 `replace + dense` 的完整重算；reuse 使用 threshold=0.1、warmup=1。
+- packed 使用 int8；dense 基准为 FP16（SRS 口径），驻留列「data-plane」仅计张量字节（含
+  scale，GPU flat-buffer 部署承载的部分），「全口径」另含 48B/token-head 的 Python 簿记
+  估计（CPU 实现开销，GPU 部署不承载）；replace 模式下非复用层仍需重算，因此 packed 的
+  收益是驻留而非 CPU 延迟；append 模式下 packed past 会真实参与下一步 attention。
+- 组合模式同时启用 packed 与 reuse；跳过层保留同一 packed 对象、不重复 pack。
+- 7B/GPU 的延迟、显存与真实模型 logits 按 `server-experiment.md` 在服务器回填；
+  本机不宣称 7B 结果，也不以受控轨迹替代真实模型结论。
 
 ### 实测数据（v3.14.0，2026-10-20，Windows / CPU）
 
@@ -1088,6 +1113,8 @@ ShadowInfer/
 │   │   └── structs.py              # 核心数据结构
 │   ├── serving/                    # HTTP serving 脚手架
 │   ├── models/                     # 内置 Diffusion LLM 模型
+│   ├── execution/                  # 跨步复用/执行控制（v3.15.0）
+│   │   └── step_reuse.py
 │   ├── profiler/                   # Profiling Agent
 │   ├── shadowkv/                   # KV cache 优化
 │   │   ├── shadowkv_agent.py
@@ -1183,6 +1210,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.15.0（2026-10）
+
+- **跨步块复用**：新增 `shadowinfer/execution/step_reuse.py`；逐 block 缓存输入/输出/K/V，相对 L2 漂移低于阈值时跳过 Q/K/V/O、attention 与 FFN，输出 `cached_out + (h - cached_in)`；warmup、阈值、跳过率与误差全部可观测，默认关闭。
+- **Diffusion KV 生命周期**：`kv_lifecycle=replace` 让固定序列 denoising 每步替换 K/V，不再把上一步 concat 成 past（旧 append 保留为默认，行为逐位不变）。
+- **紧凑 KV 闭环执行**：`kv_execution=packed` 以 `PackedKVCache` 作为每层驻留表示；append 模式下下一步 attention 从 packed 反量化读取 past。复用层直接保留上一步 packed 对象，不重复 pack。
+- **编排接线**：`execution` 配置在 `initialize` 下发，`run_baseline`/`run_optimized` 每次 reset，执行统计随 forward 返回。
+- **实测（CPU，3 seed × 3 repeats）**：reuse 1.76-1.94x、logits relL2 0.94-0.96%、跳过 50% block；int8 packed 数据平面驻留为 FP16 dense 的 53%（全口径 72%）；组合 1.09-1.44x。
+- **复现资产**：`specs/archive/AR013-step-reuse-packed-execution/`（srs/design/tasks/bench/server-experiment），`configs/experiments/s8_step_reuse_gpu.yaml`；876 passed / 1 skipped，覆盖率 83.37%。
 
 ### v3.14.0（2026-10）
 
