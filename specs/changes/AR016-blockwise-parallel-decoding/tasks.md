@@ -17,8 +17,8 @@
 | T004 | 生成统计（FR16.4）：总量/逐块/派生键恒存在且解析一致 | T003 | passing | 2026-10-22 完成 |
 | T005 | e2e 精确性（FR16.3/3.5 前置）：fp32 臂 vs baseline 环路 token 序列逐位一致 + 逐步 relL2<=1e-6 + 页写行为核验 | T003 | passing | 2026-10-22 完成（含 design 4.5 erratum） |
 | T006 | 基准（FR16.5）：校准探针 -> 预注册登记 -> 四臂全量实跑 -> bench-results.md 逐 seed 落档 | T005 | passing | 2026-10-22 完成（A6 判据 v1→v3 两轮修订，见 bench-results §2.1） |
-| T007 | s11 GPU yaml + server-experiment.md + README 四检查点 + 版本 3.18.0 四处同步 | T006 | pending | FR16.6 + NFR |
-| T008 | 五件套质量门禁全绿：black/isort/flake8/mypy/pytest；总用例 >= 1016；覆盖率 >= 84.25% | T007 | pending | NFR |
+| T007 | s11 GPU yaml + server-experiment.md + README 四检查点 + 版本 3.18.0 四处同步 | T006 | passing | 2026-10-22 完成 |
+| T008 | 五件套质量门禁全绿：black/isort/flake8/mypy/pytest；总用例 >= 1016；覆盖率 >= 84.25% | T007 | passing | 2026-10-22 完成（1124 passed / 84.56%） |
 
 ## 状态说明
 
@@ -80,6 +80,15 @@
 - 第三次全量实跑（判据 v3）：**全部注册断言 PASS**——fp32 2.29x/3.68x/7.08x（S=256/512/1024 中位，tokens+逐轮 logits 全逐位）；fp16 relL2 ≤1.26e-5 全逐位；int8 一致率 [0.9961,1.0]、对齐点 relL2 3.6e-4；行缩减 4.9/8.4/15.4x；kv_writes 27/27 == P+G；G=192 诚实低于 3x（固定开销占比）
 - 附带代码改动：generate/baseline 统计新增 `block_time_ms`（逐块耗时）与 `unmask_positions_per_round`（逐轮解掩位置日志，FR16.4「至少包含」增量键）；108 UT 回归零破坏
 - 三跑交叉核对：fp32/fp16 指标一致，speedup 中位波动 <3.5%，int8 一致率区间稳定
+
+### 2026-10-22 会话记录（T007 + T008）
+
+- 完成任务：T007 GPU 协议/README/版本同步 + T008 五件套门禁
+- T007 产物：`configs/experiments/s11_blockwise_decoding_gpu.yaml`（7B 四臂协议，阈值/块宽可配，注释含 CPU 证据口径与阈值扫描建议）；`specs/changes/AR016-blockwise-parallel-decoding/server-experiment.md`（目标判定/环境/本机基线/四臂命令/质量取证（判据 v3 口径）/显存页统计/记录模板/落档纪律）；`serve_arm.py`（单臂真实运行器，公开 API 零 mock，artifacts.pt + stats.json 落盘）
+- README 四检查点：质量表 v3.18.0（1124/84.56%）；特性表新增 v3.18.0 行（含段因果 erratum、逐位精确性、加速 2.29/3.68/7.08x、int8 双态与判据修订史、S=256 诚实标注）；基准节新增 v3.18.0 实测表 + 复现命令；版本历史新增 v3.18.0 条目；TOC 无需变更（子节不入 TOC）；无 emoji
+- 版本 3.18.0 四处同步：pyproject.toml / `shadowinfer/__init__.py` / `shadowinfer/__main__.py` / `tests/test_ffn_hotpath.py::test_ut17`
+- T008 实测（全量）：**1124 passed / 1 skipped / 84.56%**（srs 门槛 ≥1016/≥84.25% 达标；v3.17.0 基线 1016/84.25% 零回退，净增 108 用例）；black/isort/flake8/mypy 全绿
+- 修复记录：README 特性表编辑时曾误将 v3.18.0 行替换 v3.6.0 行，当场发现并恢复（v3.6.0 行完整保留）
 
 ## 阶段门控记录
 

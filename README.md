@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.17.0 | 1016 passed / 1 skipped | 84.25% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.18.0 | 1124 passed / 1 skipped | 84.56% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -71,6 +71,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **跨步复用与紧凑 KV 闭环执行（v3.15.0）** | `StepReuseState` 逐 block 缓存 `(input, output, K, V)`，按相对 L2 漂移门控复用整个 block：跳过 Q/K/V/O、attention 与 FFN，输出 `cached_out + (h - cached_in)`；`kv_lifecycle=replace` 修正 diffusion 固定序列的 KV 无限追加；`kv_execution=packed` 让每层 K/V 以 `PackedKVCache` 驻留并在 append 模式从 packed 读取 past。真实受控 denoising 轨迹（3 seed × 3 repeats，CPU）：reuse 1.76-1.94x、logits relL2 0.94-0.96%、跳过 50% block；int8 packed 数据平面驻留为 FP16 dense 的 53%（全口径含元数据 72%）、relL2 0；组合 1.09-1.44x。默认关闭，旧路径逐位不变；7B/GPU 按 `s8_step_reuse_gpu.yaml` 在服务器复现。 |
 | **分页增量 KV 驻留（v3.16.0）** | `PagedKVStore` 以 `[B,H,page_tokens,D]` 模型布局页存储 KV，append 仅量化/写入新 token 入页（向量化、零 Python 逐 token 循环），封存页 id 与数据指针不可变，读取走单遍 gather（零 permute/零 repack）；行级量化与 `PackedKVCache` 同元素逐位一致（fp32/fp16/int8/int4 golden `torch.equal`），支持按 token-head 驱逐（整页全驱逐真实释放字节、部分驱逐行置零、槽位空闲链复用、不复活）。`kv_execution="paged"`（`page_size` 可配，默认 32）消除 packed 路径每步全量 unpack+repack 与 precision_map 重建；执行统计新增 `paged`/`page_size`/`page_count`/`open_pages`/`appended_tokens_total`/`repack_tokens_saved`/`page_evictions` 等八键。KV 执行平面微基准（append 簿记，3 seed 中位，CPU）：加速 9.30x（S=512）/ 10.16x（S=2048），每步延迟斜率比为 packed 基线的 0.088-0.114，Python 堆瞬态峰值降约 51-57x；fp16 逐位等价、int8 驱逐前后逐位等价由 UT 证明。7B/GPU 长上下文按 `s9_paged_longctx_gpu.yaml` 在服务器复现。 |
 | **收敛感知宏块 KV 模式控制（v3.17.0）** | `MacroModeState` 将序列按宏块（`macro_block_size`，默认 32）分类为 SKIP / DELTA / REFRESH 三态：漂移低于 `skip_threshold` 的行冻结（残差回放），活跃比例超 `delta_min_active_ratio` 的块整块重算，warmup 与 `force_refresh_every` 强制全刷作精度保险；活跃行输出与全量前向 relL2 <= 1e-6（K/V 组装逐位相等），分类全程向量化。`PagedKVStore.rewrite_tokens` 提供行级覆写（校验全先于变异、驱逐行拒写、未覆写行逐位不变），SKIP 块零页写。模型侧行粒度分段前向 + 后端三态写回分派（全 REFRESH 走 clear+append 快路径），任一失败自动降级 dense 重算并 reset。`mode_control_enabled`（paged+replace 显式 opt-in，与 step reuse 互斥），执行统计新增 `mode_control`/`macro_block_size`/`skip_blocks`/`delta_blocks`/`refresh_blocks`/`skipped_rows`/`rewritten_rows`/`projected_rows` 键，默认关闭逐位回归。**诚实结论（CPU 玩具负载，机制说明口径）**：端到端无加速收益（f2 保险臂 0.64-1.04x，f0 默认臂 0.49-1.06x；行粒度重组开销 ~ 所省计算 35-60%，冻结行误差随陈旧深度线性累积），交付物为正确性（1016 UT）、误差有界语义（f2 保险臂全步 relL2 <= 2.65%）、漂移门自愈与 SKIP 零页写；三轮预注册历史（含两次断言失败与不可行性证明）完整落档，GPU/真实负载按 `s10_mode_control_gpu.yaml` 复现。 |
+| **置信度感知块式并行解码（v3.18.0）** | 新增 `shadowinfer/execution/block_decoding.py`：`BlockDecodingConfig`（冻结校验）+ `schedule_round` 向量化调度（置信度过阈位置并行解掩、无过阈时保底 top-1、argmax 并列取最小位、`max_rounds` 保底完成）；`SimpleDiffusionLLM.forward_block` 尾块活跃前向（仅算 W 个块行、prefix_kv 条件 attention、块内双向）+ `attention_mask` 三层透传；**段因果掩码 `segment_causal_mask`**（`seg(i)<seg(j) -> -inf`，保证前缀 KV 时间不变，多块场景替代会自相矛盾的块因果公式，开发期 erratum 落档）。`PyTorchModelBackend.generate` 生成管线：预填充 append -> 逐块「gather -> 活跃前向 -> 调度解掩」轮循环 -> 保底完成 -> sealing 前向固化块 KV -> append，**轮间零页写**（每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，fail-fast 校验无副作用）；`blockwise_generate_baseline` 全量重算参考环路（golden）；统计 14 键（含逐块耗时/逐轮解掩位置/兜底标记/置信度区间/`rows_saved_vs_baseline` 闭式）。**实测（CPU 玩具负载，B=2 单线程，3 seeds 中位）**：fp32 臂 vs 全量重算 **2.29x / 3.68x / 7.08x**（S=256/512/1024），token 序列与逐轮 logits 全逐位一致（relL2 <= 3.25e-7），计算行缩减 4.9/8.4/15.4x，KV 行恰写一次零重写零逐出（== P+G，27/27 点）；fp16 页 relL2 <= 1.26e-5 全逐位；int8 页 token 一致率 >= 0.996（轨迹对齐点 relL2 3.6e-4；阈值边缘调度置换/近并列翻转机理与 A6 判据三轮修订完整落档）；**S=256 加速 2.29x 低于 3x 如实标注**（gather 与 sealing 固定开销占比高）；阈值校准史（设计值 0.9 在玩具模型机制退化 -> 注册 0.005）与敏感性扫描落档。7B/GPU 按 `s11_blockwise_decoding_gpu.yaml` 在服务器复现。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -733,7 +734,33 @@ python specs/archive/AR014-paged-kv-store/ar014_bench.py
 
 # 宏块模式控制基准（双轨迹 × 四臂 × 3 规模 × 3 seeds，含终版预注册断言）
 python specs/archive/AR015-macro-block-mode-control/ar015_bench.py
+
+# 块式并行解码基准（四臂 × 3 规模 × 3 seeds + 阈值敏感性，内置注册断言）
+python specs/archive/AR016-blockwise-parallel-decoding/ar016_bench.py
 ```
+
+### 实测数据（v3.18.0，2026-10-22，Windows / CPU）
+
+置信度感知块式并行解码四臂基准：真实 `SimpleDiffusionLLM`（8 层 / 8 头 / 64 head_dim，
+vocab 1000），P=64、W=32、B=2、`max_rounds=8`、单线程，threshold=0.005（校准注册值；
+设计值 0.9 在玩具模型上全轮兜底退化，校准史见 bench-results.md），3 seeds
+（`specs/archive/AR016-blockwise-parallel-decoding/ar016_bench.py`，内置注册断言全过）：
+
+| 规模 S=P+G | fp32 加速中位（区间） | 计算行缩减 | fp32 relL2 / tokens | fp16 relL2 / tokens | int8 relL2（对齐点）/ 一致率 |
+|---|---|---|---|---|---|
+| 256 | 2.29x (2.21-2.32) | 4.9x | 0.0 / 逐位 | 1.24e-5 / 逐位 | 3.6e-4 / 1.000 |
+| 512 | 3.68x (3.66-3.88) | 8.4x | 3.2e-7 / 逐位 | 1.25e-5 / 逐位 | - / >= 0.997 |
+| 1024 | 7.08x (6.93-7.17) | 15.4x | 3.2e-7 / 逐位 | 1.26e-5 / 逐位 | - / >= 0.996 |
+
+- **加速机制**：baseline 每轮全量重算 L+W 行 vs 活跃前向仅 W 行的行裁剪；KV 行恰写一次
+  （`kv_write_rows == P+G`，27/27 点，零重写零逐出）；逐块耗时与逐轮调度全部入统计键。
+- **诚实结论**：S=256 加速 2.29x 低于 3x（gather 重建与 sealing 前向固定开销占比高）；
+  全并行极端阈值（0.003）下轮数塌缩至每块 1 轮，两臂同享收益、比率收敛至 ~1.18x——
+  加速来自多轮场景的行裁剪复合，非并行解掩本身。
+- **int8 双态**：轨迹对齐点（逐轮解掩位置与终态均与 baseline 一致）relL2 3.6e-4；
+  阈值边缘调度置换 / 近并列 argmax 翻转点为错位伪影（~0.17-0.21），token 一致率
+  仍 >= 0.996；A6 判据三轮修订（v1 bitwise 代理证伪 / v2 实现 bug / v3 轨迹对齐）
+  与诊断证据完整落档 bench-results.md。
 
 ### 实测数据（v3.17.0，2026-10-21，Windows / CPU）
 
@@ -1279,6 +1306,16 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.18.0（2026-10）
+
+- **置信度调度**：新增 `shadowinfer/execution/block_decoding.py`；`BlockDecodingConfig` 冻结校验（块宽/轮数/阈值/页参数合法性），`schedule_round` 向量化（过阈置信度位置并行解掩 + 无过阈保底 top-1 + argmax 并列取最小位）；`GenerateResult` 携带序列与统计。
+- **尾块活跃前向**：`SimpleDiffusionLLM.forward_block` 只计算 W 个块行（prefix_kv 条件 attention、块内双向、活跃行 K/V 返回）；`attention_mask` 三层透传（forward_step / block.forward / _compute_block 可选参默认 None 逐位回归）。
+- **段因果掩码**：`segment_causal_mask`（`seg(i)=0 if i<P else 1+(i-P)//W`，`seg(i)<seg(j) -> -inf`）保证前缀 KV 时间不变；替代开发期发现自相矛盾的多块块因果公式（design 4.5 erratum 落档，单尾块情形逐位兼容）。
+- **生成管线**：`PyTorchModelBackend.generate`（预填充 append -> 逐块轮循环 -> 保底完成 -> sealing 前向固化 KV -> append；每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，轮间零页写，fail-fast 六类校验无副作用，`capture_block_logits` 可观测，`last_generate_stores` 页驻留取证）；`blockwise_generate_baseline` 全量重算参考环路（同调度/校验/保底语义，golden）。
+- **生成统计**：14 键恒存在（blocks / total_rounds / computed_rows_total / kv_write_rows_total / forced_completions / total_time_ms / page_precision / rounds_per_block / unmasked_per_round / fallback_per_round / mean_confidence_per_round / rows_saved_vs_baseline / block_time_ms / unmask_positions_per_round），解析一致性与页账本交叉验证由 UT 证明。
+- **实测（CPU，四臂 × 3 规模 × 3 seeds，注册断言全过）**：fp32 臂 **2.29x / 3.68x / 7.08x**（S=256/512/1024 中位）与全量重算参考环路 token 序列 + 全轮 logits 逐位一致（relL2 <= 3.25e-7）；计算行缩减 4.9/8.4/15.4x；KV 行恰写一次（== P+G，27/27）；fp16 relL2 <= 1.26e-5 全逐位；int8 一致率 >= 0.996（对齐点 relL2 3.6e-4；调度置换伪影机理与 A6 判据三轮修订落档）；S=256 低于 3x 与全并行态比率收敛 ~1.18x 均如实标注；阈值 0.9 -> 0.005 校准史落档。
+- **复现资产**：`specs/archive/AR016-blockwise-parallel-decoding/`（srs/design/tasks/bench-results/server-experiment/serve_arm），`configs/experiments/s11_blockwise_decoding_gpu.yaml`；1124 passed / 1 skipped，覆盖率 84.56%。
 
 ### v3.17.0（2026-10）
 

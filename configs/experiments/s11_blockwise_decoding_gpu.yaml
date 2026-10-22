@@ -1,0 +1,109 @@
+# AR016: confidence-aware blockwise parallel decoding on 7B-scale block
+# semi-AR denoising generation (LLaDA/Dream-style: prompt + multi-block
+# answer generation with per-block iterative unmasking).
+#
+# Model dimensions (configs/experiments/model_7b_longctx.yaml):
+#   num_layers=32  num_heads=32  head_dim=128  hidden_dim=4096
+#   intermediate_dim=11008  vocab_size=32000  max_seq_len=8192
+#
+# Arms (one run per seed 0/1/2, 3 repeats each; run via
+# PyTorchModelBackend.generate / blockwise_generate_baseline, see
+# specs/archive/AR016-blockwise-parallel-decoding/server-experiment.md):
+#   0) baseline:    blockwise_generate_baseline (same schedule, full
+#                   recompute per round under segment-causal mask; golden
+#                   for relL2 / token equality)
+#   1) fp32:        generate with page_precision=fp32 (exact arm; prefix KV
+#                   bitwise-reused from PagedKVStore pages, one write per
+#                   KV row, zero rewrites)
+#   2) fp16:        generate with page_precision=fp16 (near-lossless plane)
+#   3) int8:        generate with page_precision=int8 (aggressive plane;
+#                   threshold-edge schedule permutations possible, token
+#                   agreement is the registered quality metric)
+#
+# Record end-to-end time, per-block time (stats block_time_ms), total
+# rounds, computed_rows_total, kv_write_rows_total (== P+G expected),
+# fp32 arm logits relL2 + token equality vs arm 0, fp16/int8 relL2 +
+# token agreement. CPU-side evidence and honesty notes:
+#   specs/archive/AR016-blockwise-parallel-decoding/bench-results.md
+# (CPU toy workload: fp32 arm 2.29x/3.68x/7.08x at S=256/512/1024 median,
+# bitwise-exact; fp16 relL2 <= 1.26e-5; int8 agreement >= 0.996.)
+# Full protocol:
+#   specs/archive/AR016-blockwise-parallel-decoding/server-experiment.md
+#
+# Usage (see server-experiment.md section 4 for the full four-arm runner):
+#   python specs/archive/AR016-blockwise-parallel-decoding/serve_arm.py \
+#     --config configs/experiments/s11_blockwise_decoding_gpu.yaml \
+#     --model-config configs/experiments/model_7b_longctx.yaml \
+#     --arm fp32 --seed 0 --out results/ar016_s11_fp32
+log_level: ERROR
+warmup_steps: 1
+latency_budget_ms: 3000.0
+memory_budget_mb: 4096.0
+
+execution:
+  # Blockwise parallel decoding protocol (AR016). confidence_threshold is
+  # model-calibration dependent: real dLLM answer tokens show softmax-max
+  # confidence far above the toy-model range, so 0.9 is the protocol
+  # default; sweep {0.9, 0.8, 0.6} on the server (toy-model calibration
+  # evidence and the threshold-sensitivity sweep are in bench-results.md).
+  block_decoding_enabled: true
+  block_size: 32
+  confidence_threshold: 0.9
+  max_rounds: 8
+  mask_token_id: 0
+  kv_lifecycle: replace
+  kv_execution: paged
+  page_size: 32
+  page_precision: fp32
+  packed_precision: fp16
+  int4_group_size: 16
+  prompt_len: 256
+  gen_len: 512
+
+shadowkv:
+  enabled: true
+  use_packed_cache: true
+  store_dense_kv: false
+  int4_group_size: 16
+  dense_precision_enabled: true
+  rd_allocation_enabled: true
+  hard_eviction_enabled: false
+  compression_ratio: 0.2
+  irap_decay: 0.85
+  entropy_weight: 0.4
+  sink_tokens: 8
+  eviction_pressure_threshold: 0.8
+  memory_budget_mb: 4096
+  precision_levels: ["fp32", "fp16", "int8", "int4"]
+  reuse:
+    enabled: false
+
+qdrift:
+  enabled: true
+  noise_schedule: cosine
+  sensitivity_temperature: 1.2
+  drift_method: relative_l2
+  positional_prior_weight: 0.3
+  use_importance_drift: true
+  importance_drift_weight: 0.3
+
+ffn:
+  enabled: true
+  mixed_precision: true
+  channel_importance_threshold: 0.7
+  sparse_update: true
+  delta_threshold: 0.05
+
+profiler:
+  accuracy_warning: 0.03
+  accuracy_critical: 0.05
+  latency_warning_ratio: 1.5
+  memory_warning_ratio: 0.9
+
+constraints:
+  # fp32 arm must stay bitwise-exact vs baseline on equal trajectories;
+  # quantized arms are judged by token agreement (CPU evidence: fp16
+  # bitwise 9/9, int8 >= 0.996).
+  max_accuracy_drop: 0.01
+  max_latency_ms: 3000
+  max_memory_mb: 4096
