@@ -675,3 +675,223 @@ class TestForwardStepMaskValidation:
         mask = torch.zeros(shape)
         with pytest.raises(ValueError):
             model.forward_step(ids, 0, 0, attention_mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# T003: backend generate pipeline
+# ---------------------------------------------------------------------------
+
+GP_SEED = 2301
+GP_LAYERS = 2
+GP_HEADS = 2
+GP_HEAD_DIM = 16
+GP_HIDDEN = 32
+GP_VOCAB = 64
+GP_MAX_SEQ = 64
+GP_BATCH = 2
+GP_PROMPT = 6  # P
+GP_WIDTH = 4  # W (block size)
+GP_GEN = 8  # G: two blocks of W
+GP_THRESHOLD = 0.9
+
+
+def _gp_result_class():
+    from shadowinfer.execution.block_decoding import GenerateResult
+
+    return GenerateResult
+
+
+def _gp_model_config():
+    return {
+        "num_layers": GP_LAYERS,
+        "num_heads": GP_HEADS,
+        "head_dim": GP_HEAD_DIM,
+        "hidden_dim": GP_HIDDEN,
+        "vocab_size": GP_VOCAB,
+        "max_seq_len": GP_MAX_SEQ,
+    }
+
+
+def _gp_backend(seed):
+    from shadowinfer.core.backends.pytorch_backend import PyTorchModelBackend
+
+    backend = PyTorchModelBackend(model_config=_gp_model_config(), seed=seed)
+    backend.load(model_name="ar016-tiny", device="cpu")
+    return backend
+
+
+def _gp_prompt(seed, batch=GP_BATCH, length=GP_PROMPT):
+    """Random prompt ids in [1, vocab): never the mask token id (0)."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(1, GP_VOCAB, (batch, length), generator=gen)
+
+
+def _gp_config(**overrides):
+    from shadowinfer.execution.block_decoding import BlockDecodingConfig
+
+    settings = dict(
+        block_size=GP_WIDTH,
+        max_rounds=8,
+        confidence_threshold=GP_THRESHOLD,
+        mask_token_id=0,
+        page_size=GP_WIDTH,
+        page_precision="fp32",
+    )
+    settings.update(overrides)
+    return BlockDecodingConfig(**settings)
+
+
+def _gp_in_vocab(sequences):
+    """Every generated token lies in [0, vocab)."""
+    generated = sequences[:, GP_PROMPT:]
+    return bool(((generated >= 0) & (generated < GP_VOCAB)).all())
+
+
+class TestGenerateNormalCompletion:
+    def test_fp32_generate_returns_complete_result_and_stats(self):
+        GenerateResult = _gp_result_class()
+        backend = _gp_backend(GP_SEED)
+        prompt = _gp_prompt(GP_SEED + 1)
+
+        result = backend.generate(prompt, GP_GEN, _gp_config())
+
+        assert isinstance(result, GenerateResult)
+        assert isinstance(result.sequences, torch.Tensor)
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        assert _gp_in_vocab(result.sequences)
+        assert isinstance(result.stats, dict)
+        assert result.stats["blocks"] == GP_GEN // GP_WIDTH
+        assert "forced_completions" in result.stats
+        assert result.stats["page_precision"] == "fp32"
+
+
+class TestGeneratePageResidency:
+    def test_stores_none_before_any_generate(self):
+        backend = _gp_backend(GP_SEED + 10)
+        assert backend.last_generate_stores is None
+
+    def test_stores_cover_all_layers_with_exact_append_ledger(self):
+        from shadowinfer.shadowkv.paged_kv_store import PagedKVStore
+
+        backend = _gp_backend(GP_SEED + 11)
+        prompt = _gp_prompt(GP_SEED + 12)
+
+        backend.generate(prompt, GP_GEN, _gp_config())
+
+        stores = backend.last_generate_stores
+        assert stores is not None
+        assert set(stores.keys()) == set(range(GP_LAYERS))
+        for layer_id in range(GP_LAYERS):
+            store = stores[layer_id]
+            assert isinstance(store, PagedKVStore)
+            # Prefill appends P once; each block's sealing pass appends W
+            # once (G total). Rounds only gather, so the append ledger
+            # equals P + G iff zero page writes happened between rounds.
+            assert store.appended_tokens == GP_PROMPT + GP_GEN
+            assert store.rewritten_tokens == 0
+            assert store.page_evictions == 0
+            assert store.max_seq == GP_PROMPT + GP_GEN
+
+    def test_stores_reflect_the_most_recent_generate(self):
+        backend = _gp_backend(GP_SEED + 13)
+        prompt = _gp_prompt(GP_SEED + 14)
+        backend.generate(prompt, GP_GEN, _gp_config())
+
+        backend.generate(prompt, GP_GEN, _gp_config())
+
+        stores = backend.last_generate_stores
+        assert stores is not None
+        for layer_id in range(GP_LAYERS):
+            # The second run must expose fresh per-run ledgers, not an
+            # accumulation across generate calls.
+            assert stores[layer_id].appended_tokens == GP_PROMPT + GP_GEN
+            assert stores[layer_id].max_seq == GP_PROMPT + GP_GEN
+
+
+class TestGenerateForcedCompletion:
+    def test_max_rounds_one_completes_via_forced_completions(self):
+        backend = _gp_backend(GP_SEED + 20)
+        prompt = _gp_prompt(GP_SEED + 21)
+        config = _gp_config(max_rounds=1)
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        assert _gp_in_vocab(result.sequences)
+        assert result.stats["forced_completions"] >= 1
+        assert result.stats["blocks"] == GP_GEN // GP_WIDTH
+
+
+class TestGeneratePrecisionPlanes:
+    @pytest.mark.parametrize("precision", ["fp32", "fp16", "int8"])
+    def test_all_precisions_complete_and_preserve_prompt(self, precision):
+        backend = _gp_backend(GP_SEED + 30)
+        prompt = _gp_prompt(GP_SEED + 31)
+        config = _gp_config(page_precision=precision)
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        assert _gp_in_vocab(result.sequences)
+        assert result.stats["page_precision"] == precision
+        assert result.stats["blocks"] == GP_GEN // GP_WIDTH
+
+
+class TestGenerateFailFast:
+    def test_prompt_with_mask_token_raises(self):
+        backend = _gp_backend(GP_SEED + 40)
+        prompt = _gp_prompt(GP_SEED + 41)
+        prompt[0, 2] = 0  # == config.mask_token_id
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config())
+        assert backend.last_generate_stores is None
+
+    def test_prompt_plus_gen_len_over_max_seq_len_raises(self):
+        backend = _gp_backend(GP_SEED + 42)
+        prompt = _gp_prompt(GP_SEED + 43)
+        gen_len = 60  # 60 % W == 0 and P + 60 > max_seq_len
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, gen_len, _gp_config())
+        assert backend.last_generate_stores is None
+
+    def test_gen_len_not_multiple_of_block_size_raises(self):
+        backend = _gp_backend(GP_SEED + 44)
+        prompt = _gp_prompt(GP_SEED + 45)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, 6, _gp_config())  # 6 % 4 != 0
+        assert backend.last_generate_stores is None
+
+    def test_prompt_1d_raises(self):
+        backend = _gp_backend(GP_SEED + 46)
+        prompt = _gp_prompt(GP_SEED + 47)[0]  # [P]: not 2-D
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config())
+        assert backend.last_generate_stores is None
+
+    def test_prompt_float_dtype_raises(self):
+        backend = _gp_backend(GP_SEED + 48)
+        gen = torch.Generator().manual_seed(GP_SEED + 49)
+        prompt = torch.rand(GP_BATCH, GP_PROMPT, generator=gen)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config())
+        assert backend.last_generate_stores is None
+
+    def test_unloaded_backend_raises_runtime_error(self):
+        from shadowinfer.core.backends.pytorch_backend import PyTorchModelBackend
+
+        backend = PyTorchModelBackend(model_config=_gp_model_config(), seed=GP_SEED + 50)
+        prompt = _gp_prompt(GP_SEED + 51)
+
+        with pytest.raises(RuntimeError):
+            backend.generate(prompt, GP_GEN, _gp_config())
+        assert backend.last_generate_stores is None

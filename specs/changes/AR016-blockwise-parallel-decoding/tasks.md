@@ -13,7 +13,7 @@
 |----|---------|------|------|------|
 | T001 | ConfidenceSchedule + BlockDecodingConfig（FR16.1）：置信度并行解掩/保底 top-1/max_rounds 保底完成/配置校验；TDD：Red 子代理产 UT | - | passing | 2026-10-22 完成 |
 | T002 | 模型 `forward_block`（FR16.2）：尾块连续活跃前向 + per-layer 前缀 K/V 条件 attention + 活跃行 K/V 返回；vs 全量前向 relL2<=1e-6 + K/V 逐位 | T001 | passing | 2026-10-22 完成 |
-| T003 | 后端 `generate` 管线（FR16.3）：预填充 append / 逐块循环 / 封存 append / 轮间零页写 / fp32-fp16-int8 精度平面 / fail-fast 校验 | T002 | pending | FR16.3 |
+| T003 | 后端 `generate` 管线（FR16.3）：预填充 append / 逐块循环 / 封存 append / 轮间零页写 / fp32-fp16-int8 精度平面 / fail-fast 校验 | T002 | passing | 2026-10-22 完成 |
 | T004 | 生成统计（FR16.4）：总量/逐块/派生键恒存在且解析一致 | T003 | pending | FR16.4 |
 | T005 | e2e 精确性（FR16.3/3.5 前置）：fp32 臂 vs baseline 环路 token 序列逐位一致 + 逐步 relL2<=1e-6 + 页写行为核验 | T003 | pending | FR16.3 |
 | T006 | 基准（FR16.5）：校准探针 -> 预注册登记 -> 四臂全量实跑 -> bench-results.md 逐 seed 落档 | T005 | pending | FR16.5 |
@@ -47,6 +47,14 @@
 - 测试：本文件 69 passed（T001 43 + T002 26）；关键证据：forward_block vs forward_step(块因果掩码) 块行 logits relL2<=1e-6 + 活跃行 K/V 逐位相等；前缀行 == 前缀-only 前向逐位（exp(-inf)=0 精确归零）；prefix_len=0 等价；两形态输入逐位一致
 - 全量回归：1085 passed / 1 skipped / 84.36%（v3.17.0 基线 1016/84.25% 零回退，attention_mask=None 逐位安全）
 - 实现要点：2D float 输入显式 ValueError（区别 token ids/hidden 形态，防 embed OOB 索引）；mask 与 kv_cache/reuse/mode 路径互斥显式报错（防静默忽略）
+
+### 2026-10-22 会话记录（T003）
+
+- 完成任务：T003 backend generate 管线（FR16.3）
+- 修改文件：`shadowinfer/core/backends/pytorch_backend.py`（generate 方法 + last_generate_stores 只读属性；fresh per-call stores，不动 forward_step 服务路径状态）；`shadowinfer/execution/block_decoding.py`（GenerateResult）；`shadowinfer/execution/__init__.py`（导出）；`tests/test_block_decoding.py`（T003 分区 14 用例，Red 子代理产出）
+- 测试：本文件 83 passed（T001 43 + T002 26 + T003 14）；页驻留证据：每层 appended_tokens == P+G 且 rewritten_tokens == 0 且 page_evictions == 0（轮间零页写充要）；max_rounds=1 保底完成 forced_completions >= 1；三精度平面完成；fail-fast 六类无副作用（stores None）
+- 回归：backend 相关五套件 201 passed
+- 实现要点：sealing pass 每块恒执行（全终态 forward_block 固化块 KV）；保底完成用最后一轮 logits argmax 填充；stats 本任务最小集（blocks/forced_completions/page_precision），完整八键集在 T004 落地
 
 ## 阶段门控记录
 

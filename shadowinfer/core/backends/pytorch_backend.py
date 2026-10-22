@@ -10,6 +10,7 @@ import torch
 
 from shadowinfer.core.model_backend import ModelBackend
 from shadowinfer.core.structs import KVCacheEntry, StepConfig
+from shadowinfer.execution.block_decoding import BlockDecodingConfig, GenerateResult, schedule_round
 from shadowinfer.execution.macro_mode import MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
 from shadowinfer.models import SimpleDiffusionLLM
@@ -96,6 +97,7 @@ class PyTorchModelBackend(ModelBackend):
         self._mode_config: Optional[MacroModeConfig] = None
         self._mode_state: Optional[MacroModeState] = None
         self._last_execution_stats: Dict[str, Any] = {}
+        self._last_generate_stores: Optional[Dict[int, PagedKVStore]] = None
 
     def configure_execution(
         self,
@@ -734,3 +736,131 @@ class PyTorchModelBackend(ModelBackend):
 
     def get_model_config(self) -> Dict[str, Any]:
         return dict(self.model_config)
+
+    @property
+    def last_generate_stores(self) -> Optional[Dict[int, PagedKVStore]]:
+        """Per-layer PagedKVStore instances from the most recent generate().
+
+        Returns None before any successful generate call (and after a
+        fail-fast validation error, which creates no stores).
+        """
+        return self._last_generate_stores
+
+    def generate(
+        self,
+        prompt_ids: torch.Tensor,
+        gen_len: int,
+        config: BlockDecodingConfig,
+    ) -> GenerateResult:
+        """Blockwise confidence-aware parallel generation (AR016, FR16.3).
+
+        Batch-style API, fully independent of the forward_step serving
+        path: fresh per-layer PagedKVStore instances are created per call.
+        The prefix K/V is appended exactly twice per row lifetime -- once
+        at prefill (P rows) and once at each block's sealing pass (W rows)
+        -- while decoding rounds only gather (zero inter-round page writes).
+
+        Args:
+            prompt_ids: [B, P] integer prompt token ids; must not contain
+                ``config.mask_token_id``.
+            gen_len: Number of tokens to generate G; must be a multiple of
+                ``config.block_size``.
+            config: BlockDecodingConfig with block/threshold/page settings.
+
+        Returns:
+            GenerateResult with [B, P + G] sequences (prompt preserved
+            bit-for-bit) and generation stats.
+
+        Raises:
+            RuntimeError: If no model has been loaded.
+            ValueError: On invalid prompt shape/dtype, over-length
+                sequences, mask tokens inside the prompt, or gen_len not
+                divisible by the block size (all fail-fast: no stores are
+                created and no state is mutated).
+        """
+        if self._model is None:
+            raise RuntimeError("generate requires a loaded model; call load() first")
+        if prompt_ids.dim() != 2:
+            raise ValueError(f"prompt_ids must be 2-D [B, P], got dim={prompt_ids.dim()}")
+        if prompt_ids.dtype not in (torch.long, torch.int):
+            raise ValueError(f"prompt_ids must be integer token ids, got dtype={prompt_ids.dtype}")
+        batch, prompt_len = prompt_ids.shape
+        if prompt_len + gen_len > self._model.max_seq_len:
+            raise ValueError(
+                f"prompt_len + gen_len ({prompt_len} + {gen_len}) exceeds model "
+                f"max_seq_len ({self._model.max_seq_len})"
+            )
+        if bool((prompt_ids == config.mask_token_id).any()):
+            raise ValueError(f"prompt_ids must not contain mask_token_id ({config.mask_token_id})")
+        if gen_len % config.block_size != 0:
+            raise ValueError(
+                f"gen_len ({gen_len}) must be a multiple of block_size " f"({config.block_size})"
+            )
+
+        model = self._model
+        width = config.block_size
+        num_blocks = gen_len // width
+        num_layers = model.num_layers
+
+        stores: Dict[int, PagedKVStore] = {
+            layer_id: PagedKVStore(
+                batch_size=batch,
+                num_heads=model.num_heads,
+                head_dim=model.head_dim,
+                page_size=config.page_size,
+                device=model.device,
+            )
+            for layer_id in range(num_layers)
+        }
+
+        _, prefill_kv, _ = model.forward_step(prompt_ids, 0, 0)
+        for layer_id in range(num_layers):
+            k, v = prefill_kv[layer_id]
+            stores[layer_id].append(k, v, config.page_precision)
+
+        sequences = torch.cat(
+            [
+                prompt_ids.long(),
+                torch.full((batch, gen_len), config.mask_token_id, dtype=torch.long),
+            ],
+            dim=1,
+        )
+
+        forced_completions = 0
+        prefix_len = prompt_len
+        for _ in range(num_blocks):
+            block_tokens = sequences[:, prefix_len : prefix_len + width]
+            masked = torch.ones(batch, width, dtype=torch.bool)
+            rounds = 0
+            logits: Optional[torch.Tensor] = None
+            while bool(masked.any()) and rounds < config.max_rounds:
+                prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
+                logits, _ = model.forward_block(
+                    block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
+                )
+                decision = schedule_round(logits, masked, config)
+                block_tokens[decision.unmask] = decision.tokens[decision.unmask]
+                masked &= ~decision.unmask
+                rounds += 1
+            if bool(masked.any()):
+                remaining = logits.argmax(dim=-1) if logits is not None else None
+                if remaining is None:
+                    raise RuntimeError("forced completion requires computed logits")
+                block_tokens[masked] = remaining[masked]
+                forced_completions += 1
+            prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
+            _, block_kv = model.forward_block(
+                block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
+            )
+            for layer_id in range(num_layers):
+                k, v = block_kv[layer_id]
+                stores[layer_id].append(k, v, config.page_precision)
+            prefix_len += width
+
+        stats: Dict[str, object] = {
+            "blocks": num_blocks,
+            "forced_completions": forced_completions,
+            "page_precision": config.page_precision,
+        }
+        self._last_generate_stores = stores
+        return GenerateResult(sequences=sequences, stats=stats)

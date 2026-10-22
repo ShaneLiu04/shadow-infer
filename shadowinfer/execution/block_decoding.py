@@ -13,6 +13,7 @@ smallest sequence position for determinism.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict
 
 import torch
 
@@ -119,6 +120,19 @@ def schedule_round(
         confidences=retained_confidences,
         progress_fallback=needs_fallback,
     )
+
+
+@dataclass
+class GenerateResult:
+    """Result of one blockwise parallel generation call (FR16.3).
+
+    ``sequences`` holds the [B, P + G] long tensor whose prompt region is
+    preserved bit-for-bit; ``stats`` carries generation statistics
+    (FR16.4 keys are pinned by tests/test_block_decoding.py T004).
+    """
+
+    sequences: torch.Tensor
+    stats: Dict[str, object]
 
 
 def block_causal_mask(
