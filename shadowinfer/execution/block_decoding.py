@@ -12,10 +12,14 @@ smallest sequence position for determinism.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
 import torch
+
+if TYPE_CHECKING:
+    from shadowinfer.models.simple_diffusion_llm import SimpleDiffusionLLM
 
 PAGE_PRECISIONS = ("fp32", "fp16", "int8")
 
@@ -170,3 +174,199 @@ def block_causal_mask(
     if prefix_len > 0:
         mask[:prefix_len, prefix_len:] = float("-inf")
     return mask
+
+
+def segment_causal_mask(
+    seq_len: int,
+    prefix_len: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the segment-causal additive attention mask (AR016 erratum 4.5).
+
+    Rows are grouped into segments: the prompt occupies segment 0
+    ([0, prefix_len)) and every following block of ``block_size`` rows
+    occupies segment 1, 2, ... A row may only attend to columns within
+    its own segment or earlier segments:
+    ``mask[i, j] = -inf`` iff ``seg(i) < seg(j)``.
+
+    This keeps every row's receptive field time-invariant after sealing
+    (prompt rows forever see only the prompt; block-j rows forever see
+    the prompt plus blocks 0..j), which is what makes the baseline's
+    in-context recomputed prefix K/V bit-identical to the sealed pages.
+    For a single trailing block (seq_len == prefix_len + block_size) the
+    result is element-wise identical to ``block_causal_mask``.
+
+    Args:
+        seq_len: Total sequence length S, >= 1.
+        prefix_len: Prompt length P, 0 <= P <= S.
+        block_size: Block width W, >= 1.
+        device: Device to place the mask on.
+
+    Returns:
+        [S, S] float additive mask.
+
+    Raises:
+        ValueError: On seq_len < 1, prefix_len < 0, prefix_len > seq_len
+            or block_size < 1.
+    """
+    if seq_len < 1:
+        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+    if prefix_len < 0:
+        raise ValueError(f"prefix_len must be >= 0, got {prefix_len}")
+    if prefix_len > seq_len:
+        raise ValueError(f"prefix_len ({prefix_len}) must not exceed seq_len ({seq_len})")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+
+    indices = torch.arange(seq_len, device=device)
+    segments = torch.where(
+        indices < prefix_len,
+        torch.zeros_like(indices),
+        1 + (indices - prefix_len) // block_size,
+    )
+    blocked = segments[:, None] < segments[None, :]
+    return torch.where(blocked, float("-inf"), 0.0)
+
+
+def validate_generate_inputs(
+    model: SimpleDiffusionLLM,
+    prompt_ids: torch.Tensor,
+    gen_len: int,
+    config: BlockDecodingConfig,
+) -> int:
+    """Shared fail-fast validation for both generation arms (FR16.3).
+
+    Returns the prompt length P; raises ValueError before any state is
+    created so failed calls have no side effects.
+    """
+    if prompt_ids.dim() != 2:
+        raise ValueError(f"prompt_ids must be 2-D [B, P], got dim={prompt_ids.dim()}")
+    if prompt_ids.dtype not in (torch.long, torch.int):
+        raise ValueError(f"prompt_ids must be integer token ids, got dtype={prompt_ids.dtype}")
+    prompt_len = int(prompt_ids.shape[1])
+    if prompt_len + gen_len > model.max_seq_len:
+        raise ValueError(
+            f"prompt_len + gen_len ({prompt_len} + {gen_len}) exceeds model "
+            f"max_seq_len ({model.max_seq_len})"
+        )
+    if bool((prompt_ids == config.mask_token_id).any()):
+        raise ValueError(f"prompt_ids must not contain mask_token_id ({config.mask_token_id})")
+    if gen_len % config.block_size != 0:
+        raise ValueError(
+            f"gen_len ({gen_len}) must be a multiple of block_size " f"({config.block_size})"
+        )
+    return prompt_len
+
+
+def blockwise_generate_baseline(
+    model: SimpleDiffusionLLM,
+    prompt_ids: torch.Tensor,
+    gen_len: int,
+    config: BlockDecodingConfig,
+    capture_block_logits: bool = False,
+) -> GenerateResult:
+    """Full-recompute reference loop for blockwise decoding (AR016, FR16.3).
+
+    Mirror image of ``PyTorchModelBackend.generate`` sharing the same
+    ``BlockDecodingConfig`` and ``schedule_round`` (decision-equivalent
+    arms): every round recomputes the full [B, L_j + W] context through
+    ``model.forward_step`` under the block-causal mask, so no prefix KV
+    store and no sealing pass exist. Serves as the exactness reference
+    for unit tests and the baseline arm for benchmarks.
+
+    Args:
+        model: SimpleDiffusionLLM instance (eval mode recommended).
+        prompt_ids: [B, P] integer prompt token ids.
+        gen_len: Tokens to generate; multiple of ``config.block_size``.
+        config: BlockDecodingConfig (threshold/block/round settings).
+        capture_block_logits: When True, stats additionally carries
+            ``"block_logits_per_round"`` ([B, W, V] per round per block).
+
+    Returns:
+        GenerateResult whose stats follow the recompute semantics:
+        ``computed_rows_total == sum(rounds_j * (L_j + W))``,
+        ``kv_write_rows_total == 0``, ``rows_saved_vs_baseline == 0``.
+
+    Raises:
+        ValueError: On the same fail-fast conditions as ``generate``.
+    """
+    prompt_len = validate_generate_inputs(model, prompt_ids, gen_len, config)
+    batch = int(prompt_ids.shape[0])
+    width = config.block_size
+    num_blocks = gen_len // width
+
+    sequences = torch.cat(
+        [
+            prompt_ids.long(),
+            torch.full((batch, gen_len), config.mask_token_id, dtype=torch.long),
+        ],
+        dim=1,
+    )
+
+    forced_completions = 0
+    rounds_per_block: list = []
+    unmasked_per_round: list = []
+    fallback_per_round: list = []
+    mean_confidence_per_round: list = []
+    block_logits_per_round: list = []
+    start_time = time.perf_counter()
+    prefix_len = prompt_len
+    for _ in range(num_blocks):
+        block_tokens = sequences[:, prefix_len : prefix_len + width]
+        masked = torch.ones(batch, width, dtype=torch.bool)
+        rounds = 0
+        logits: torch.Tensor = torch.empty(0)
+        block_unmasked: list = []
+        block_fallback: list = []
+        block_confidence: list = []
+        captured_rounds: list = []
+        while bool(masked.any()) and rounds < config.max_rounds:
+            full_ids = sequences[:, : prefix_len + width]
+            mask = segment_causal_mask(prefix_len + width, prompt_len, width, sequences.device)
+            full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+            logits = full_logits[:, prefix_len:]
+            decision = schedule_round(logits, masked, config)
+            block_tokens[decision.unmask] = decision.tokens[decision.unmask]
+            masked &= ~decision.unmask
+            block_unmasked.append(int(decision.unmask.sum()))
+            block_fallback.append(bool(decision.progress_fallback.any()))
+            round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
+            block_confidence.append(float(round_confidence[decision.unmask].mean()))
+            if capture_block_logits:
+                captured_rounds.append(logits.detach().clone())
+            rounds += 1
+        if bool(masked.any()):
+            remaining = logits.argmax(dim=-1)
+            block_tokens[masked] = remaining[masked]
+            forced_completions += 1
+        rounds_per_block.append(rounds)
+        unmasked_per_round.append(block_unmasked)
+        fallback_per_round.append(block_fallback)
+        mean_confidence_per_round.append(block_confidence)
+        if capture_block_logits:
+            block_logits_per_round.append(captured_rounds)
+        prefix_len += width
+    total_time_ms = (time.perf_counter() - start_time) * 1000.0
+
+    computed_rows_total = sum(
+        rounds * (prompt_len + block_index * width + width)
+        for block_index, rounds in enumerate(rounds_per_block)
+    )
+    stats: Dict[str, object] = {
+        "blocks": num_blocks,
+        "total_rounds": sum(rounds_per_block),
+        "computed_rows_total": computed_rows_total,
+        "kv_write_rows_total": 0,
+        "forced_completions": forced_completions,
+        "total_time_ms": float(total_time_ms),
+        "page_precision": "fp32",
+        "rounds_per_block": rounds_per_block,
+        "unmasked_per_round": unmasked_per_round,
+        "fallback_per_round": fallback_per_round,
+        "mean_confidence_per_round": mean_confidence_per_round,
+        "rows_saved_vs_baseline": 0,
+    }
+    if capture_block_logits:
+        stats["block_logits_per_round"] = block_logits_per_round
+    return GenerateResult(sequences=sequences, stats=stats)

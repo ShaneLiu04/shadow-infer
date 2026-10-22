@@ -11,7 +11,12 @@ import torch
 
 from shadowinfer.core.model_backend import ModelBackend
 from shadowinfer.core.structs import KVCacheEntry, StepConfig
-from shadowinfer.execution.block_decoding import BlockDecodingConfig, GenerateResult, schedule_round
+from shadowinfer.execution.block_decoding import (
+    BlockDecodingConfig,
+    GenerateResult,
+    schedule_round,
+    validate_generate_inputs,
+)
 from shadowinfer.execution.macro_mode import MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
 from shadowinfer.models import SimpleDiffusionLLM
@@ -752,6 +757,7 @@ class PyTorchModelBackend(ModelBackend):
         prompt_ids: torch.Tensor,
         gen_len: int,
         config: BlockDecodingConfig,
+        capture_block_logits: bool = False,
     ) -> GenerateResult:
         """Blockwise confidence-aware parallel generation (AR016, FR16.3).
 
@@ -781,16 +787,8 @@ class PyTorchModelBackend(ModelBackend):
         """
         if self._model is None:
             raise RuntimeError("generate requires a loaded model; call load() first")
-        if prompt_ids.dim() != 2:
-            raise ValueError(f"prompt_ids must be 2-D [B, P], got dim={prompt_ids.dim()}")
-        if prompt_ids.dtype not in (torch.long, torch.int):
-            raise ValueError(f"prompt_ids must be integer token ids, got dtype={prompt_ids.dtype}")
-        batch, prompt_len = prompt_ids.shape
-        if prompt_len + gen_len > self._model.max_seq_len:
-            raise ValueError(
-                f"prompt_len + gen_len ({prompt_len} + {gen_len}) exceeds model "
-                f"max_seq_len ({self._model.max_seq_len})"
-            )
+        prompt_len = validate_generate_inputs(self._model, prompt_ids, gen_len, config)
+        batch = int(prompt_ids.shape[0])
         if bool((prompt_ids == config.mask_token_id).any()):
             raise ValueError(f"prompt_ids must not contain mask_token_id ({config.mask_token_id})")
         if gen_len % config.block_size != 0:
@@ -832,6 +830,7 @@ class PyTorchModelBackend(ModelBackend):
         unmasked_per_round: List[List[int]] = []
         fallback_per_round: List[List[bool]] = []
         mean_confidence_per_round: List[List[float]] = []
+        block_logits_per_round: List[List[torch.Tensor]] = []
         start_time = time.perf_counter()
         prefix_len = prompt_len
         for _ in range(num_blocks):
@@ -842,6 +841,7 @@ class PyTorchModelBackend(ModelBackend):
             block_unmasked: List[int] = []
             block_fallback: List[bool] = []
             block_confidence: List[float] = []
+            captured_rounds: List[torch.Tensor] = []
             while bool(masked.any()) and rounds < config.max_rounds:
                 prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
                 logits, _ = model.forward_block(
@@ -854,6 +854,8 @@ class PyTorchModelBackend(ModelBackend):
                 block_fallback.append(bool(decision.progress_fallback.any()))
                 round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
                 block_confidence.append(float(round_confidence[decision.unmask].mean()))
+                if capture_block_logits:
+                    captured_rounds.append(logits.detach().clone())
                 rounds += 1
             if bool(masked.any()):
                 remaining = logits.argmax(dim=-1) if logits is not None else None
@@ -872,6 +874,8 @@ class PyTorchModelBackend(ModelBackend):
             unmasked_per_round.append(block_unmasked)
             fallback_per_round.append(block_fallback)
             mean_confidence_per_round.append(block_confidence)
+            if capture_block_logits:
+                block_logits_per_round.append(captured_rounds)
             prefix_len += width
         total_time_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -894,5 +898,7 @@ class PyTorchModelBackend(ModelBackend):
             "mean_confidence_per_round": mean_confidence_per_round,
             "rows_saved_vs_baseline": rows_saved_vs_baseline,
         }
+        if capture_block_logits:
+            stats["block_logits_per_round"] = block_logits_per_round
         self._last_generate_stores = stores
         return GenerateResult(sequences=sequences, stats=stats)

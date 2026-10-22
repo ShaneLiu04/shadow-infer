@@ -15,7 +15,7 @@
 | T002 | 模型 `forward_block`（FR16.2）：尾块连续活跃前向 + per-layer 前缀 K/V 条件 attention + 活跃行 K/V 返回；vs 全量前向 relL2<=1e-6 + K/V 逐位 | T001 | passing | 2026-10-22 完成 |
 | T003 | 后端 `generate` 管线（FR16.3）：预填充 append / 逐块循环 / 封存 append / 轮间零页写 / fp32-fp16-int8 精度平面 / fail-fast 校验 | T002 | passing | 2026-10-22 完成 |
 | T004 | 生成统计（FR16.4）：总量/逐块/派生键恒存在且解析一致 | T003 | passing | 2026-10-22 完成 |
-| T005 | e2e 精确性（FR16.3/3.5 前置）：fp32 臂 vs baseline 环路 token 序列逐位一致 + 逐步 relL2<=1e-6 + 页写行为核验 | T003 | pending | FR16.3 |
+| T005 | e2e 精确性（FR16.3/3.5 前置）：fp32 臂 vs baseline 环路 token 序列逐位一致 + 逐步 relL2<=1e-6 + 页写行为核验 | T003 | passing | 2026-10-22 完成（含 design 4.5 erratum） |
 | T006 | 基准（FR16.5）：校准探针 -> 预注册登记 -> 四臂全量实跑 -> bench-results.md 逐 seed 落档 | T005 | pending | FR16.5 |
 | T007 | s11 GPU yaml + server-experiment.md + README 四检查点 + 版本 3.18.0 四处同步 | T006 | pending | FR16.6 + NFR |
 | T008 | 五件套质量门禁全绿：black/isort/flake8/mypy/pytest；总用例 >= 1016；覆盖率 >= 84.25% | T007 | pending | NFR |
@@ -63,6 +63,14 @@
 - 测试：本文件 95 passed（+12）；解析一致性：computed_rows == W×Σ(r+1)、kv_write_rows == P+G 且与页账本交叉验证、每块 unmasked 合计 == B×W（默认无保底）、rows_saved 闭式回代、保底路径记账（max_rounds=1）、fp16/int8 完整键集
 - 统计语义决定：unmasked_per_round 为 batch 合计计数；fallback_per_round = progress_fallback.any()；mean_confidence_per_round = 该轮解掩位 softmax-max 均值；rows_saved_vs_baseline = Σ r_j×(L_j+W) − W×(r_j+1)（均不含 batch 因子，与 design 公式一致）
 - 回归：test_block_decoding + test_pytorch_backend 111 passed
+
+### 2026-10-22 会话记录（T005）
+
+- 完成任务：T005 e2e 精确性（FR16.3 验收）+ `blockwise_generate_baseline` 参考环路实现 + `capture_block_logits` 可观测参数（generate/baseline 双侧，默认 False 逐位不变）
+- **design 4.5 erratum（开发中发现的设计缺陷，已修正落档 design.md §4.5）**：原块因果掩码公式 `mask[i,j]=-inf iff i<L and j>=L` 在多块场景与方案 A「前缀 KV 时间不变」前提自相矛盾（block 1 轮次 prompt 行会看见已封存的 block 0）。T005 Red 测试的逐步 relL2 断言捕获该缺陷（block 1 恒定 5.2e-3，逐层定位：layer-0 K 逐位、layer-1 prompt K 差 0.1 = attention 上下文不同）。修正为段因果掩码 `segment_causal_mask`：`seg(i)=0 if i<P else 1+(i-P)//W`，`mask[i,j]=-inf iff seg(i)<seg(j)`——每行感受野封存后时间不变；单尾块情形与原公式逐位一致（T002 测试零改动）；期间还修正了一处调用参数误传（prefix_len 误当 prompt_len）
+- 修正后实测：两臂**全轮 logits relL2 = 0.000e+00（逐位一致）**，优于 1e-6 容差预期；两规模点 (P=6,G=8) / (P=10,G=16) + max_rounds=1 保底路径 sequences 逐位一致；capture 无副作用；baseline 确定性；fp16 臂完成；baseline fail-fast 五类
+- 修改文件：`shadowinfer/execution/block_decoding.py`（baseline + segment_causal_mask + validate_generate_inputs 共享校验）；`shadowinfer/core/backends/pytorch_backend.py`（generate 增 capture_block_logits + 复用共享校验）；`shadowinfer/execution/__init__.py`（导出掩码）；`tests/test_block_decoding.py`（T005 分区 13 用例，Red 子代理产出）；`specs/changes/AR016-blockwise-parallel-decoding/design.md`（§4.1/§4.2.2/§4.3 掩码口径 + §4.5 erratum）
+- 测试：本文件 108 passed（95 + 13）；新增接口备注：blockwise_generate_baseline 与 generate 共享调度/校验/保底语义，stats 键集一致（computed_rows_total=Σ r_j×(L_j+W)、kv_write_rows_total=0、rows_saved_vs_baseline=0）
 
 ## 阶段门控记录
 

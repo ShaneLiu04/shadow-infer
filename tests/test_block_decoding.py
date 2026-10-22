@@ -1102,3 +1102,265 @@ class TestGenerateStatsPrecisionPlanes:
         _, result = _gp_generate(GP_SEED + 71, page_precision=precision)
         _gp_assert_stats_structure(result.stats)
         assert result.stats["page_precision"] == precision
+
+
+# ---------------------------------------------------------------------------
+# T005: end-to-end exactness vs baseline recompute loop
+# ---------------------------------------------------------------------------
+
+T5_SEED = 2401
+T5_RELL2_TOL = 1e-6
+
+
+def _t5_direct_model(seed):
+    """SimpleDiffusionLLM built exactly like PyTorchModelBackend.load():
+    the same ``torch.manual_seed(seed)`` call followed by the same
+    constructor kwargs (cpu device, fp32 dtype), so the weights are
+    bit-identical to a backend loaded with the same seed."""
+    from shadowinfer.models.simple_diffusion_llm import SimpleDiffusionLLM
+
+    torch.manual_seed(seed)
+    model = SimpleDiffusionLLM(
+        num_layers=GP_LAYERS,
+        num_heads=GP_HEADS,
+        head_dim=GP_HEAD_DIM,
+        hidden_dim=GP_HIDDEN,
+        vocab_size=GP_VOCAB,
+        max_seq_len=GP_MAX_SEQ,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    model.eval()
+    return model
+
+
+def _t5_baseline(model, prompt, gen_len, config, capture=False):
+    """Full-recompute reference loop (blockwise_generate_baseline)."""
+    from shadowinfer.execution.block_decoding import blockwise_generate_baseline
+
+    return blockwise_generate_baseline(model, prompt, gen_len, config, capture_block_logits=capture)
+
+
+def _t5_assert_bitwise_equal(actual, expected, label):
+    """Bit-for-bit sequence equality with a diagnostic first-divergence
+    report (row, col, both tokens, total mismatch count). The assertion is
+    never relaxed: any divergence is a hard failure of the core exactness
+    acceptance (FR16.3)."""
+    assert (
+        actual.shape == expected.shape
+    ), f"{label}: shape {tuple(actual.shape)} != baseline {tuple(expected.shape)}"
+    assert (
+        actual.dtype == expected.dtype
+    ), f"{label}: dtype {actual.dtype} != baseline {expected.dtype}"
+    mismatch = actual != expected
+    if bool(mismatch.any()):
+        row, col = mismatch.nonzero()[0].tolist()
+        raise AssertionError(
+            f"{label}: {int(mismatch.sum())} token(s) differ; first divergence at "
+            f"(row={row}, col={col}): {label}={int(actual[row, col])} vs "
+            f"baseline={int(expected[row, col])}"
+        )
+
+
+def _t5_assert_block_logits_structure(captured, rounds_per_block, blocks, label):
+    """block_logits_per_round isomorphism: outer length == blocks, inner
+    length == rounds_per_block[j], each tensor [B, W, V]."""
+    assert isinstance(captured, list), f"{label}: block_logits_per_round must be a list"
+    assert len(captured) == blocks
+    for j, per_round in enumerate(captured):
+        assert isinstance(per_round, list)
+        assert len(per_round) == rounds_per_block[j]
+        for logits in per_round:
+            assert isinstance(logits, torch.Tensor)
+            assert logits.shape == (GP_BATCH, GP_WIDTH, GP_VOCAB)
+
+
+class TestT005Fp32BitwiseMatch:
+    @pytest.mark.parametrize(
+        "prompt_len,gen_len",
+        [
+            (GP_PROMPT, GP_GEN),  # (P=6, G=8, W=4)
+            (10, 16),  # (P=10, G=16, W=4)
+        ],
+    )
+    def test_generate_matches_baseline_bitwise(self, prompt_len, gen_len):
+        # (a) fp32 exactness at two scales: the store-backed generate arm
+        # and the full-recompute baseline arm must agree bit-for-bit.
+        seed = T5_SEED + prompt_len
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+        config = _gp_config()
+
+        gen_result = backend.generate(prompt, gen_len, config)
+        base_result = _t5_baseline(_t5_direct_model(seed), prompt, gen_len, config)
+
+        assert gen_result.sequences.shape == (GP_BATCH, prompt_len + gen_len)
+        assert torch.equal(gen_result.sequences[:, :prompt_len], prompt)
+        assert torch.equal(base_result.sequences[:, :prompt_len], prompt)
+        _t5_assert_bitwise_equal(gen_result.sequences, base_result.sequences, "generate")
+
+
+class TestT005ForcedCompletionBitwiseMatch:
+    def test_max_rounds_one_both_arms_bitwise_equal(self):
+        # (b) Forced-completion path: with max_rounds=1 every block runs a
+        # single scheduling round and the still-masked positions are
+        # force-filled from the last block-row logits; both arms share the
+        # semantics, so the sequences stay bit-identical. Seeds GP_SEED+20
+        # /+21 are known (T003) to exercise the forced path on this model.
+        seed = GP_SEED + 20
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(max_rounds=1)
+
+        gen_result = backend.generate(prompt, GP_GEN, config)
+        base_result = _t5_baseline(_t5_direct_model(seed), prompt, GP_GEN, config)
+
+        _t5_assert_bitwise_equal(gen_result.sequences, base_result.sequences, "generate")
+        assert gen_result.stats["forced_completions"] >= 1
+        assert base_result.stats["forced_completions"] == gen_result.stats["forced_completions"]
+
+
+class TestT005StepwiseBlockLogitsRelL2:
+    def test_per_round_block_logits_within_tolerance(self):
+        # (c) Stepwise evidence behind the bitwise match: with both arms
+        # capturing block-row logits, the per-block round counts agree and
+        # every captured [B, W, V] logits tensor is within relL2 <= 1e-6.
+        seed = T5_SEED + 50
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config()
+        blocks = GP_GEN // GP_WIDTH
+
+        gen_result = backend.generate(prompt, GP_GEN, config, capture_block_logits=True)
+        base_result = _t5_baseline(_t5_direct_model(seed), prompt, GP_GEN, config, capture=True)
+
+        assert gen_result.stats["rounds_per_block"] == base_result.stats["rounds_per_block"]
+        rounds = gen_result.stats["rounds_per_block"]
+        gen_logits = gen_result.stats["block_logits_per_round"]
+        base_logits = base_result.stats["block_logits_per_round"]
+        _t5_assert_block_logits_structure(gen_logits, rounds, blocks, "generate")
+        _t5_assert_block_logits_structure(base_logits, rounds, blocks, "baseline")
+        for j in range(blocks):
+            for r in range(rounds[j]):
+                rel = _rel_l2(gen_logits[j][r], base_logits[j][r])
+                assert rel <= T5_RELL2_TOL, (
+                    f"block {j} round {r}: relL2 {rel:.3e} exceeds " f"{T5_RELL2_TOL:.0e}"
+                )
+
+
+class TestT005CaptureBlockLogitsNoSideEffect:
+    def test_capture_flag_leaves_sequences_bitwise_unchanged(self):
+        # (d) capture_block_logits is observation-only: the same backend
+        # and prompt produce bit-identical sequences with and without it,
+        # the default call surfaces no capture key, and the capture call
+        # still reports the full stats key set.
+        backend = _gp_backend(T5_SEED + 60)
+        prompt = _gp_prompt(T5_SEED + 61)
+        config = _gp_config()
+
+        plain_result = backend.generate(prompt, GP_GEN, config)
+        captured_result = backend.generate(prompt, GP_GEN, config, capture_block_logits=True)
+
+        _t5_assert_bitwise_equal(captured_result.sequences, plain_result.sequences, "capture")
+        assert "block_logits_per_round" not in plain_result.stats
+        rounds = _gp_assert_stats_structure(captured_result.stats)
+        _t5_assert_block_logits_structure(
+            captured_result.stats["block_logits_per_round"],
+            rounds,
+            GP_GEN // GP_WIDTH,
+            "generate",
+        )
+
+
+class TestT005BaselineDeterminism:
+    def test_same_model_same_prompt_two_runs_bitwise_equal(self):
+        # (e) The baseline recompute loop is deterministic: two runs on the
+        # same model instance with the same prompt/config agree bit-for-bit.
+        model = _t5_direct_model(T5_SEED + 70)
+        prompt = _gp_prompt(T5_SEED + 71)
+        config = _gp_config()
+
+        first = _t5_baseline(model, prompt, GP_GEN, config)
+        second = _t5_baseline(model, prompt, GP_GEN, config)
+
+        _t5_assert_bitwise_equal(second.sequences, first.sequences, "baseline rerun")
+
+
+class TestT005Fp16ArmCompletes:
+    def test_fp16_generate_completes_and_preserves_prompt(self):
+        # (f) The fp16 quantized-KV arm is approximate, so only completion,
+        # prompt preservation and the page_precision identifier are
+        # asserted -- never bitwise agreement with the fp32 arm.
+        backend = _gp_backend(T5_SEED + 80)
+        prompt = _gp_prompt(T5_SEED + 81)
+        config = _gp_config(page_precision="fp16")
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        assert _gp_in_vocab(result.sequences)
+        assert result.stats["page_precision"] == "fp16"
+
+
+class TestT005BaselineStatsContract:
+    def test_baseline_stats_follow_recompute_semantics(self):
+        # The baseline recomputes the full sequence every round and never
+        # touches a page store: computed_rows_total follows the
+        # rounds_j * (L_j + W) full-row formula, no KV rows are written,
+        # nothing is saved versus itself, and the key set matches generate.
+        seed = T5_SEED + 90
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config()
+
+        base_result = _t5_baseline(_t5_direct_model(seed), prompt, GP_GEN, config)
+
+        rounds = _gp_assert_stats_structure(base_result.stats)
+        assert base_result.stats["page_precision"] == "fp32"
+        assert base_result.stats["kv_write_rows_total"] == 0
+        assert base_result.stats["rows_saved_vs_baseline"] == 0
+        expected_rows = sum(
+            rounds_j * (GP_PROMPT + j * GP_WIDTH + GP_WIDTH) for j, rounds_j in enumerate(rounds)
+        )
+        assert base_result.stats["computed_rows_total"] == expected_rows
+
+
+class TestT005BaselineFailFast:
+    def test_prompt_with_mask_token_raises(self):
+        model = _t5_direct_model(T5_SEED + 100)
+        prompt = _gp_prompt(T5_SEED + 101)
+        prompt[0, 2] = 0  # == config.mask_token_id
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, GP_GEN, _gp_config())
+
+    def test_prompt_plus_gen_len_over_max_seq_len_raises(self):
+        model = _t5_direct_model(T5_SEED + 102)
+        prompt = _gp_prompt(T5_SEED + 103)
+        gen_len = 60  # 60 % W == 0 and P + 60 > max_seq_len
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, gen_len, _gp_config())
+
+    def test_gen_len_not_multiple_of_block_size_raises(self):
+        model = _t5_direct_model(T5_SEED + 104)
+        prompt = _gp_prompt(T5_SEED + 105)
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, 6, _gp_config())  # 6 % 4 != 0
+
+    def test_prompt_1d_raises(self):
+        model = _t5_direct_model(T5_SEED + 106)
+        prompt = _gp_prompt(T5_SEED + 107)[0]  # [P]: not 2-D
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, GP_GEN, _gp_config())
+
+    def test_prompt_float_dtype_raises(self):
+        model = _t5_direct_model(T5_SEED + 108)
+        gen = torch.Generator().manual_seed(T5_SEED + 109)
+        prompt = torch.rand(GP_BATCH, GP_PROMPT, generator=gen)
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, GP_GEN, _gp_config())
