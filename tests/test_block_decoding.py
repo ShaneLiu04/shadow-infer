@@ -518,8 +518,12 @@ class TestAttentionMaskNoneRegression:
 class TestBlockCausalMaskForwardSemantics:
     def test_masked_prefix_rows_equal_prefix_only_forward(self):
         # Block-causal masking removes the block keys from every prefix
-        # row's softmax (exp(-inf) = 0 exactly), so prefix-row logits must
-        # be bitwise identical to an isolated prefix-only forward.
+        # row's softmax (exp(-inf) = 0 exactly), so prefix-row logits match
+        # an isolated prefix-only forward. The match is up to last-bit
+        # matmul noise: the linear layers run at M=FB_FULL vs M=FB_PREFIX,
+        # which reorders the reduction in the last bit (measured relL2
+        # ~1.4e-7), so this uses the repo's quantified tolerance instead of
+        # torch.equal (same rationale as the AR015 design 6.3(a) note).
         model = _fb_model()
         full_ids = _fb_ids(FB_SEED + 5, FB_BATCH, FB_FULL)
         prefix_ids = full_ids[:, :FB_PREFIX]
@@ -528,7 +532,9 @@ class TestBlockCausalMaskForwardSemantics:
         mask = _fb_block_causal_mask(FB_FULL, FB_PREFIX, torch.device("cpu"))
         full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
 
-        assert torch.equal(full_logits[:, :FB_PREFIX, :], prefix_logits)
+        prefix_window = full_logits[:, :FB_PREFIX, :]
+        rel_l2 = (prefix_window - prefix_logits).norm() / prefix_logits.norm()
+        assert rel_l2.item() <= 1e-6
 
     def test_two_mask_shapes_broadcast_identically(self):
         # [S, S] and [1, 1, S, S] additive masks must be interchangeable.
