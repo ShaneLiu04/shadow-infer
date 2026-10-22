@@ -16,7 +16,7 @@
 | T003 | 后端 `generate` 管线（FR16.3）：预填充 append / 逐块循环 / 封存 append / 轮间零页写 / fp32-fp16-int8 精度平面 / fail-fast 校验 | T002 | passing | 2026-10-22 完成 |
 | T004 | 生成统计（FR16.4）：总量/逐块/派生键恒存在且解析一致 | T003 | passing | 2026-10-22 完成 |
 | T005 | e2e 精确性（FR16.3/3.5 前置）：fp32 臂 vs baseline 环路 token 序列逐位一致 + 逐步 relL2<=1e-6 + 页写行为核验 | T003 | passing | 2026-10-22 完成（含 design 4.5 erratum） |
-| T006 | 基准（FR16.5）：校准探针 -> 预注册登记 -> 四臂全量实跑 -> bench-results.md 逐 seed 落档 | T005 | pending | FR16.5 |
+| T006 | 基准（FR16.5）：校准探针 -> 预注册登记 -> 四臂全量实跑 -> bench-results.md 逐 seed 落档 | T005 | passing | 2026-10-22 完成（A6 判据 v1→v3 两轮修订，见 bench-results §2.1） |
 | T007 | s11 GPU yaml + server-experiment.md + README 四检查点 + 版本 3.18.0 四处同步 | T006 | pending | FR16.6 + NFR |
 | T008 | 五件套质量门禁全绿：black/isort/flake8/mypy/pytest；总用例 >= 1016；覆盖率 >= 84.25% | T007 | pending | NFR |
 
@@ -71,6 +71,15 @@
 - 修正后实测：两臂**全轮 logits relL2 = 0.000e+00（逐位一致）**，优于 1e-6 容差预期；两规模点 (P=6,G=8) / (P=10,G=16) + max_rounds=1 保底路径 sequences 逐位一致；capture 无副作用；baseline 确定性；fp16 臂完成；baseline fail-fast 五类
 - 修改文件：`shadowinfer/execution/block_decoding.py`（baseline + segment_causal_mask + validate_generate_inputs 共享校验）；`shadowinfer/core/backends/pytorch_backend.py`（generate 增 capture_block_logits + 复用共享校验）；`shadowinfer/execution/__init__.py`（导出掩码）；`tests/test_block_decoding.py`（T005 分区 13 用例，Red 子代理产出）；`specs/changes/AR016-blockwise-parallel-decoding/design.md`（§4.1/§4.2.2/§4.3 掩码口径 + §4.5 erratum）
 - 测试：本文件 108 passed（95 + 13）；新增接口备注：blockwise_generate_baseline 与 generate 共享调度/校验/保底语义，stats 键集一致（computed_rows_total=Σ r_j×(L_j+W)、kv_write_rows_total=0、rows_saved_vs_baseline=0）
+
+### 2026-10-22 会话记录（T006）
+
+- 完成任务：T006 基准（FR16.5）：`ar016_bench.py`（注册化四臂基准脚本，断言内置）+ `bench-results.md`（校准叙事/注册表/判据修订记录/逐 seed 落档）
+- **预注册修订（跑前登记）**：设计 §6.5 原定 threshold=0.9 在玩具模型上机制退化（softmax-max 置信度实际分布 0.004-0.010，0.9 下全部轮次 top-1 兜底、并行解掩零触发）→ 校准为 0.005（并行解掩 ~10-15% 轮次）+ 仅报告的阈值敏感性扫描 0.9/0.005/0.003
+- **A6 判据两轮修订（全部落档 bench-results §2.1）**：v1「bitwise tokens ⟹ 对齐」被 run 1 证伪（调度置换可终态重收敛）；v2「位置级对齐」实现有 bug（baseline 漏列表 append → 空 zip 空洞真，run 2 的 A6 判定无效）且逻辑不完备（同位置 token 翻转同样破坏上下文）；v3 终版「逐轮解掩位置相等 ∧ 终态 tokens 逐位一致 ⟹ 轨迹相同」。诊断（临时脚本）定位完整机制：int8 噪声置换阈值边缘解掩顺序（同集合不同顺序），互换行自身 embedding 错位致行 relL2≈0.98、其余行 ~0.1-0.2%；轨迹对齐轮 int8 真实 logits relL2 2.0-3.6e-4（逐块剖面证实）；int8 K/V 直接往返 relL2 5.9e-3（utils/quantization.py per-channel 实现无缺陷）
+- 第三次全量实跑（判据 v3）：**全部注册断言 PASS**——fp32 2.29x/3.68x/7.08x（S=256/512/1024 中位，tokens+逐轮 logits 全逐位）；fp16 relL2 ≤1.26e-5 全逐位；int8 一致率 [0.9961,1.0]、对齐点 relL2 3.6e-4；行缩减 4.9/8.4/15.4x；kv_writes 27/27 == P+G；G=192 诚实低于 3x（固定开销占比）
+- 附带代码改动：generate/baseline 统计新增 `block_time_ms`（逐块耗时）与 `unmask_positions_per_round`（逐轮解掩位置日志，FR16.4「至少包含」增量键）；108 UT 回归零破坏
+- 三跑交叉核对：fp32/fp16 指标一致，speedup 中位波动 <3.5%，int8 一致率区间稳定
 
 ## 阶段门控记录
 

@@ -831,9 +831,12 @@ class PyTorchModelBackend(ModelBackend):
         fallback_per_round: List[List[bool]] = []
         mean_confidence_per_round: List[List[float]] = []
         block_logits_per_round: List[List[torch.Tensor]] = []
+        unmask_positions_per_round: List[List[torch.Tensor]] = []
+        block_time_ms: List[float] = []
         start_time = time.perf_counter()
         prefix_len = prompt_len
         for _ in range(num_blocks):
+            block_start = time.perf_counter()
             block_tokens = sequences[:, prefix_len : prefix_len + width]
             masked = torch.ones(batch, width, dtype=torch.bool)
             rounds = 0
@@ -842,6 +845,7 @@ class PyTorchModelBackend(ModelBackend):
             block_fallback: List[bool] = []
             block_confidence: List[float] = []
             captured_rounds: List[torch.Tensor] = []
+            block_positions: List[torch.Tensor] = []
             while bool(masked.any()) and rounds < config.max_rounds:
                 prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
                 logits, _ = model.forward_block(
@@ -856,6 +860,7 @@ class PyTorchModelBackend(ModelBackend):
                 block_confidence.append(float(round_confidence[decision.unmask].mean()))
                 if capture_block_logits:
                     captured_rounds.append(logits.detach().clone())
+                block_positions.append(decision.unmask.detach().clone())
                 rounds += 1
             if bool(masked.any()):
                 remaining = logits.argmax(dim=-1) if logits is not None else None
@@ -874,8 +879,10 @@ class PyTorchModelBackend(ModelBackend):
             unmasked_per_round.append(block_unmasked)
             fallback_per_round.append(block_fallback)
             mean_confidence_per_round.append(block_confidence)
+            unmask_positions_per_round.append(block_positions)
             if capture_block_logits:
                 block_logits_per_round.append(captured_rounds)
+            block_time_ms.append((time.perf_counter() - block_start) * 1000.0)
             prefix_len += width
         total_time_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -897,6 +904,8 @@ class PyTorchModelBackend(ModelBackend):
             "fallback_per_round": fallback_per_round,
             "mean_confidence_per_round": mean_confidence_per_round,
             "rows_saved_vs_baseline": rows_saved_vs_baseline,
+            "unmask_positions_per_round": unmask_positions_per_round,
+            "block_time_ms": block_time_ms,
         }
         if capture_block_logits:
             stats["block_logits_per_round"] = block_logits_per_round
