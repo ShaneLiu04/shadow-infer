@@ -1315,7 +1315,7 @@ pytest
 - **生成管线**：`PyTorchModelBackend.generate`（预填充 append -> 逐块轮循环 -> 保底完成 -> sealing 前向固化 KV -> append；每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，轮间零页写，fail-fast 六类校验无副作用，`capture_block_logits` 可观测，`last_generate_stores` 页驻留取证）；`blockwise_generate_baseline` 全量重算参考环路（同调度/校验/保底语义，golden）。
 - **生成统计**：14 键恒存在（blocks / total_rounds / computed_rows_total / kv_write_rows_total / forced_completions / total_time_ms / page_precision / rounds_per_block / unmasked_per_round / fallback_per_round / mean_confidence_per_round / rows_saved_vs_baseline / block_time_ms / unmask_positions_per_round），解析一致性与页账本交叉验证由 UT 证明。
 - **实测（CPU，四臂 × 3 规模 × 3 seeds，注册断言全过）**：fp32 臂 **2.29x / 3.68x / 7.08x**（S=256/512/1024 中位）与全量重算参考环路 token 序列 + 全轮 logits 逐位一致（relL2 <= 3.25e-7）；计算行缩减 4.9/8.4/15.4x；KV 行恰写一次（== P+G，27/27）；fp16 relL2 <= 1.26e-5 全逐位；int8 一致率 >= 0.996（对齐点 relL2 3.6e-4；调度置换伪影机理与 A6 判据三轮修订落档）；S=256 低于 3x 与全并行态比率收敛 ~1.18x 均如实标注；阈值 0.9 -> 0.005 校准史落档。
-- **复现资产**：`specs/archive/AR016-blockwise-parallel-decoding/`（srs/design/tasks/bench-results/server-experiment/serve_arm），`configs/experiments/s11_blockwise_decoding_gpu.yaml`；1128 passed / 1 skipped，覆盖率 84.56%。
+- **复现资产**：`specs/archive/AR016-blockwise-parallel-decoding/`（srs/design/st-cases/ar016_bench/bench-results/server-experiment/serve_arm），`configs/experiments/s11_blockwise_decoding_gpu.yaml`；1128 passed / 1 skipped，覆盖率 84.56%。
 
 ### v3.17.0（2026-10）
 
@@ -1324,7 +1324,7 @@ pytest
 - **行级页覆写**：`PagedKVStore.rewrite_tokens` 校验全先于变异（失败原子性）、驱逐行拒写、跨页自动拆分、未覆写行 payload 逐位不变；`rewritten_tokens`/`rewritten_pages` 记账。
 - **后端分派与降级**：`configure_execution` 六新参（`mode_control_enabled` 等，paged+replace 显式 opt-in，与 step reuse 互斥 ValueError）；写回三态分派（SKIP 零页写、DELTA 活跃行、REFRESH 整块；全 REFRESH 走 clear+append 快路径，页布局逐位相同）；模型调用或写回失败自动降级 dense 重算并 reset；shape 突变清空模式状态；执行统计新增八键恒存在；默认关闭逐位回归。
 - **实测（CPU，双轨迹 × 四臂 × 3 规模 × 3 seeds）**：f2 保险臂全步 relL2 <= 2.649%、末半程冻结率 0.667（终版预注册断言全过）；**端到端无加速收益（0.64-1.04x）如实报告**，f-扫描证明 >=2x 与 <=2% 在玩具负载不可同时达成，机制交付物为正确性、误差有界语义、漂移门自愈与 SKIP 零页写；三轮预注册历史完整落档。
-- **复现资产**：`specs/archive/AR015-macro-block-mode-control/`（srs/design/tasks/st-cases/bench/server-experiment），`configs/experiments/s10_mode_control_gpu.yaml`；1016 passed / 1 skipped，覆盖率 84.25%。
+- **复现资产**：`specs/archive/AR015-macro-block-mode-control/`（srs/design/st-cases/ar015_bench/bench-results/server-experiment），`configs/experiments/s10_mode_control_gpu.yaml`；1016 passed / 1 skipped，覆盖率 84.25%。
 
 ### v3.16.0（2026-10）
 
