@@ -886,6 +886,15 @@ class TestGenerateFailFast:
             backend.generate(prompt, GP_GEN, _gp_config())
         assert backend.last_generate_stores is None
 
+    @pytest.mark.parametrize("bad_mask_token_id", [GP_VOCAB, -1])
+    def test_mask_token_id_out_of_vocab_raises(self, bad_mask_token_id):
+        backend = _gp_backend(GP_SEED + 52)
+        prompt = _gp_prompt(GP_SEED + 53)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config(mask_token_id=bad_mask_token_id))
+        assert backend.last_generate_stores is None
+
     def test_unloaded_backend_raises_runtime_error(self):
         from shadowinfer.core.backends.pytorch_backend import PyTorchModelBackend
 
@@ -1364,3 +1373,11 @@ class TestT005BaselineFailFast:
 
         with pytest.raises(ValueError):
             _t5_baseline(model, prompt, GP_GEN, _gp_config())
+
+    @pytest.mark.parametrize("bad_mask_token_id", [GP_VOCAB, -1])
+    def test_mask_token_id_out_of_vocab_raises(self, bad_mask_token_id):
+        model = _t5_direct_model(T5_SEED + 110)
+        prompt = _gp_prompt(T5_SEED + 111)
+
+        with pytest.raises(ValueError):
+            _t5_baseline(model, prompt, GP_GEN, _gp_config(mask_token_id=bad_mask_token_id))

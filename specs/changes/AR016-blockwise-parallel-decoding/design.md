@@ -96,7 +96,7 @@ repeat
 repeat while (masked 非空 且 rounds < max_rounds?) is (yes)
 -> no;
 if (masked 仍有残余?) then (yes)
-  :保底完成：残余位 argmax 全解掩\nforced_completions += 残余数;
+  :保底完成：残余位 argmax 全解掩\nforced_completions += 1（按块计数，见 4.6 erratum）;
 else (no)
 endif
 :sealing pass：forward_block(终态块 tokens);\n得最终块 K/V;
@@ -225,6 +225,12 @@ configs/experiments/s11_blockwise_decoding_gpu.yaml
 **缺陷：** 原掩码公式 `mask[i,j] = -inf iff (i < L) and (j >= L)`（L 为当前前缀长）在**多块**场景下与方案 A 自身前提矛盾：block j 轮次时 L = P + jW，prompt 行（i < P < L）可见列 j' < L——**包含已封存的块 0..j-1**；而 generate 臂的 prompt KV 在预填充时仅见过 prompt。即前缀行感受野随前缀增长而变化，前缀 KV 并非时间不变，bitwise 复用前提被破坏。T005 实测证据：两臂 block-0 轮 logits 逐位一致（relL2=0），block-1 轮 logits relL2 恒定 5.2e-3；逐层定位：layer-0 K 逐位一致（投影行独立于 attention），layer-1 prompt K 最大差 0.1（layer-0 attention 上下文不同：prompt-only vs prompt+block0）。
 
 **修正（与方案 A 意图一致，唯一自洽解）：** 引入段因果掩码 `segment_causal_mask(seq_len, prefix_len, block_size)`：`seg(i) = 0 if i < P else 1 + (i - P) // W`，`mask[i,j] = -inf iff seg(i) < seg(j)`。每行感受野封存后时间不变（prompt 行恒见 prompt；块 j 行恒见 prompt+块 0..j），baseline 在上下文内重算的前缀行 KV 与 generate 臂封存值 bitwise 一致。单尾块情形（S = P + W）与原公式逐位一致，故 `block_causal_mask` 保留原语义（T002 单块 UT 不变），baseline 环路改用 `segment_causal_mask`。T002 掩码语义测试（前缀行 == 前缀-only 前向）在段因果下依然成立（单块即段因果的特例）。
+
+## 4.6 Erratum：forced_completions 计数单位（2026-10-22，Review 阶段发现）
+
+**偏离：** 原 §4.2.1 流程图规定「保底完成时 `forced_completions += 残余数`」（按残余掩码位计数）；实现（`blockwise_generate_baseline` 与 backend `generate`）按**发生保底完成的块数**计数（每块 `+= 1`）。两臂口径一致，SRS（FR16.4）未定义单位，UT 断言 `>= 1`，bench-results.md §3 注册数据亦按「强制收尾块数」口径使用，故不构成精确性缺陷；但该偏离此前未按纪律落档（Review D4 发现）。
+
+**处置：** 维持实现口径（块数），§4.2.1 流程图已同步修订为 `forced_completions += 1（按块计数）`。语义说明：`forced_completions` = 触发 max_rounds 保底完成的生成块数，用于衡量调度退化频率（与 `rounds_per_block` 互补），取值范围 [0, 块数]。
 
 # 6 测试设计
 

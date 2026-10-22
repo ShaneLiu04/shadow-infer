@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.18.0 | 1124 passed / 1 skipped | 84.56% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.18.0 | 1128 passed / 1 skipped | 84.56% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -1315,7 +1315,7 @@ pytest
 - **生成管线**：`PyTorchModelBackend.generate`（预填充 append -> 逐块轮循环 -> 保底完成 -> sealing 前向固化 KV -> append；每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，轮间零页写，fail-fast 六类校验无副作用，`capture_block_logits` 可观测，`last_generate_stores` 页驻留取证）；`blockwise_generate_baseline` 全量重算参考环路（同调度/校验/保底语义，golden）。
 - **生成统计**：14 键恒存在（blocks / total_rounds / computed_rows_total / kv_write_rows_total / forced_completions / total_time_ms / page_precision / rounds_per_block / unmasked_per_round / fallback_per_round / mean_confidence_per_round / rows_saved_vs_baseline / block_time_ms / unmask_positions_per_round），解析一致性与页账本交叉验证由 UT 证明。
 - **实测（CPU，四臂 × 3 规模 × 3 seeds，注册断言全过）**：fp32 臂 **2.29x / 3.68x / 7.08x**（S=256/512/1024 中位）与全量重算参考环路 token 序列 + 全轮 logits 逐位一致（relL2 <= 3.25e-7）；计算行缩减 4.9/8.4/15.4x；KV 行恰写一次（== P+G，27/27）；fp16 relL2 <= 1.26e-5 全逐位；int8 一致率 >= 0.996（对齐点 relL2 3.6e-4；调度置换伪影机理与 A6 判据三轮修订落档）；S=256 低于 3x 与全并行态比率收敛 ~1.18x 均如实标注；阈值 0.9 -> 0.005 校准史落档。
-- **复现资产**：`specs/archive/AR016-blockwise-parallel-decoding/`（srs/design/tasks/bench-results/server-experiment/serve_arm），`configs/experiments/s11_blockwise_decoding_gpu.yaml`；1124 passed / 1 skipped，覆盖率 84.56%。
+- **复现资产**：`specs/archive/AR016-blockwise-parallel-decoding/`（srs/design/tasks/bench-results/server-experiment/serve_arm），`configs/experiments/s11_blockwise_decoding_gpu.yaml`；1128 passed / 1 skipped，覆盖率 84.56%。
 
 ### v3.17.0（2026-10）
 

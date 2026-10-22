@@ -90,6 +90,18 @@
 - T008 实测（全量）：**1124 passed / 1 skipped / 84.56%**（srs 门槛 ≥1016/≥84.25% 达标；v3.17.0 基线 1016/84.25% 零回退，净增 108 用例）；black/isort/flake8/mypy 全绿
 - 修复记录：README 特性表编辑时曾误将 v3.18.0 行替换 v3.6.0 行，当场发现并恢复（v3.6.0 行完整保留）
 
+### 2026-10-22 会话记录（Review 阶段）
+
+- 审查方式：独立子代理（general）S/D/C 三维度审查，基线 base_sha=e264a7a，输入仅路径不含内容；mypy/black/isort/flake8 按任务声明采信 + 附加抽查
+- 首轮结论：**FAIL**（2 项发现）：
+  1. [Medium, S1/D2] `mask_token_id` 词表内校验缺失——srs.md FR16.1「mask_token_id 在词表内」与 design.md §4.2.2(7) fail-fast 清单均要求，但 `validate_generate_inputs` 未实现、无 UT（非法值将延迟至 embed 层 IndexError 晚爆）
+  2. [Low, D2/D4] `forced_completions` 按块计数与 design §4.2.1 流程图「+= 残余数」不符且偏离未落档（两臂口径一致、SRS 未定义单位、注册数据按块口径使用，非精确性缺陷）
+- 修复 1：`validate_generate_inputs` 新增区间校验 `0 <= mask_token_id < vocab_size → ValueError`（复审中按「在词表内」语义补齐负值下界）；两臂（generate / blockwise_generate_baseline）共享校验自动同步生效；新增 UT 2 例参数化（上界 GP_VOCAB / 下界 -1 × 两臂，generate 臂断言 `last_generate_stores is None` 无副作用）
+- 修复 2：维持实现口径（块数），design.md §4.2.1 流程图修订为 `forced_completions += 1（按块计数）`，新增 §4.6 erratum 落档（偏离描述 + 处置 + 语义说明）
+- 复审结论：**PASS**（独立子代理验证两项修复，证据齐全；附带非阻塞观察「负值未拦截」已在修复 1 中一并收口）
+- 门禁复跑（修复后全量）：**1128 passed / 1 skipped / 84.56%**；black/isort/flake8/mypy 全绿；README 测试口径两处同步 1124→1128
+- 审查其余维度：S2-S5 / D1 / D3 / C1-C3 全 YES（108 用例收数核实、影响面 18 文件核对、零 emoji、token 零入库、AGENTS.md 未跟踪）
+
 ## 阶段门控记录
 
 > 由 sdd-phase-gate skill 在阶段门控审查后追加。

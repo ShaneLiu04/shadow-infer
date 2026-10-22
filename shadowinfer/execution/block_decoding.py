@@ -250,6 +250,11 @@ def validate_generate_inputs(
             f"prompt_len + gen_len ({prompt_len} + {gen_len}) exceeds model "
             f"max_seq_len ({model.max_seq_len})"
         )
+    if not 0 <= config.mask_token_id < model.vocab_size:
+        raise ValueError(
+            f"mask_token_id ({config.mask_token_id}) must be within the model "
+            f"vocabulary [0, vocab_size={model.vocab_size})"
+        )
     if bool((prompt_ids == config.mask_token_id).any()):
         raise ValueError(f"prompt_ids must not contain mask_token_id ({config.mask_token_id})")
     if gen_len % config.block_size != 0:
