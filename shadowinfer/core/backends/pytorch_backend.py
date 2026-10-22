@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -827,12 +828,20 @@ class PyTorchModelBackend(ModelBackend):
         )
 
         forced_completions = 0
+        rounds_per_block: List[int] = []
+        unmasked_per_round: List[List[int]] = []
+        fallback_per_round: List[List[bool]] = []
+        mean_confidence_per_round: List[List[float]] = []
+        start_time = time.perf_counter()
         prefix_len = prompt_len
         for _ in range(num_blocks):
             block_tokens = sequences[:, prefix_len : prefix_len + width]
             masked = torch.ones(batch, width, dtype=torch.bool)
             rounds = 0
             logits: Optional[torch.Tensor] = None
+            block_unmasked: List[int] = []
+            block_fallback: List[bool] = []
+            block_confidence: List[float] = []
             while bool(masked.any()) and rounds < config.max_rounds:
                 prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
                 logits, _ = model.forward_block(
@@ -841,6 +850,10 @@ class PyTorchModelBackend(ModelBackend):
                 decision = schedule_round(logits, masked, config)
                 block_tokens[decision.unmask] = decision.tokens[decision.unmask]
                 masked &= ~decision.unmask
+                block_unmasked.append(int(decision.unmask.sum()))
+                block_fallback.append(bool(decision.progress_fallback.any()))
+                round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
+                block_confidence.append(float(round_confidence[decision.unmask].mean()))
                 rounds += 1
             if bool(masked.any()):
                 remaining = logits.argmax(dim=-1) if logits is not None else None
@@ -855,12 +868,31 @@ class PyTorchModelBackend(ModelBackend):
             for layer_id in range(num_layers):
                 k, v = block_kv[layer_id]
                 stores[layer_id].append(k, v, config.page_precision)
+            rounds_per_block.append(rounds)
+            unmasked_per_round.append(block_unmasked)
+            fallback_per_round.append(block_fallback)
+            mean_confidence_per_round.append(block_confidence)
             prefix_len += width
+        total_time_ms = (time.perf_counter() - start_time) * 1000.0
 
+        computed_rows_total = sum(width * (rounds + 1) for rounds in rounds_per_block)
+        rows_saved_vs_baseline = sum(
+            rounds * (prompt_len + block_index * width + width) - width * (rounds + 1)
+            for block_index, rounds in enumerate(rounds_per_block)
+        )
         stats: Dict[str, object] = {
             "blocks": num_blocks,
+            "total_rounds": sum(rounds_per_block),
+            "computed_rows_total": computed_rows_total,
+            "kv_write_rows_total": prompt_len + gen_len,
             "forced_completions": forced_completions,
+            "total_time_ms": float(total_time_ms),
             "page_precision": config.page_precision,
+            "rounds_per_block": rounds_per_block,
+            "unmasked_per_round": unmasked_per_round,
+            "fallback_per_round": fallback_per_round,
+            "mean_confidence_per_round": mean_confidence_per_round,
+            "rows_saved_vs_baseline": rows_saved_vs_baseline,
         }
         self._last_generate_stores = stores
         return GenerateResult(sequences=sequences, stats=stats)

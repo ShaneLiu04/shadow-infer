@@ -895,3 +895,210 @@ class TestGenerateFailFast:
         with pytest.raises(RuntimeError):
             backend.generate(prompt, GP_GEN, _gp_config())
         assert backend.last_generate_stores is None
+
+
+# ---------------------------------------------------------------------------
+# T004: generation statistics
+# ---------------------------------------------------------------------------
+
+GP_STATS_TOTAL_KEYS = (
+    "blocks",
+    "total_rounds",
+    "computed_rows_total",
+    "kv_write_rows_total",
+    "forced_completions",
+    "total_time_ms",
+    "page_precision",
+)
+GP_STATS_PER_BLOCK_KEYS = (
+    "rounds_per_block",
+    "unmasked_per_round",
+    "fallback_per_round",
+    "mean_confidence_per_round",
+)
+GP_STATS_DERIVED_KEYS = ("rows_saved_vs_baseline",)
+GP_STATS_ALL_KEYS = GP_STATS_TOTAL_KEYS + GP_STATS_PER_BLOCK_KEYS + GP_STATS_DERIVED_KEYS
+
+
+def _gp_is_int(value):
+    """True ints only: bool is an int subclass but never a valid counter."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _gp_generate(seed, gen_len=GP_GEN, **overrides):
+    """One real generate call on a fresh seeded backend; returns (backend,
+    result) so callers can cross-check stats against the page ledgers."""
+    backend = _gp_backend(seed)
+    prompt = _gp_prompt(seed + 1)
+    result = backend.generate(prompt, gen_len, _gp_config(**overrides))
+    return backend, result
+
+
+def _gp_assert_stats_structure(stats, gen_len=GP_GEN):
+    """FR16.4 key-presence / type / shape contract (srs 3.4, design 6.1).
+
+    Every scalar key exists with the right type, and every per-block key is
+    a list of per-round lists whose inner lengths match rounds_per_block.
+    Returns rounds_per_block for the caller's consistency checks.
+    """
+    for key in GP_STATS_ALL_KEYS:
+        assert key in stats, f"stats is missing required key {key!r}"
+    blocks = gen_len // GP_WIDTH
+    assert _gp_is_int(stats["blocks"]) and stats["blocks"] == blocks
+    assert _gp_is_int(stats["total_rounds"])
+    assert _gp_is_int(stats["computed_rows_total"])
+    assert _gp_is_int(stats["kv_write_rows_total"])
+    assert _gp_is_int(stats["forced_completions"])
+    assert stats["forced_completions"] >= 0
+    assert _gp_is_int(stats["rows_saved_vs_baseline"])
+    assert isinstance(stats["total_time_ms"], float)
+    assert isinstance(stats["page_precision"], str)
+    rounds = stats["rounds_per_block"]
+    assert isinstance(rounds, list) and len(rounds) == blocks
+    for rounds_j in rounds:
+        assert _gp_is_int(rounds_j) and rounds_j >= 1
+    for key in GP_STATS_PER_BLOCK_KEYS[1:]:
+        per_block = stats[key]
+        assert isinstance(per_block, list) and len(per_block) == blocks
+        for j, per_round in enumerate(per_block):
+            assert isinstance(per_round, list)
+            assert len(per_round) == rounds[j]
+    for per_round in stats["unmasked_per_round"]:
+        for count in per_round:
+            assert _gp_is_int(count) and count >= 0
+    for per_round in stats["fallback_per_round"]:
+        for flag in per_round:
+            assert isinstance(flag, bool)
+    for per_round in stats["mean_confidence_per_round"]:
+        for confidence in per_round:
+            assert isinstance(confidence, float)
+            assert math.isfinite(confidence)
+            assert 0.0 < confidence <= 1.0
+    return rounds
+
+
+def _gp_expected_rows_saved(rounds_per_block):
+    """Closed-form rows_saved derived from stats' own rounds plus the known
+    P/W constants (baseline rows per round: L_j + W; actual: W per round
+    plus one W-row sealing pass per block)."""
+    saved = 0
+    for j, rounds_j in enumerate(rounds_per_block):
+        prefix_len = GP_PROMPT + j * GP_WIDTH
+        baseline_rows = rounds_j * (prefix_len + GP_WIDTH)
+        actual_rows = GP_WIDTH * (rounds_j + 1)
+        saved += baseline_rows - actual_rows
+    return saved
+
+
+class TestGenerateStatsContract:
+    def test_stats_contain_full_key_set_with_correct_types(self):
+        # (a) Key presence: the full eight-key set always exists with the
+        # documented scalar types and per-block list isomorphism.
+        _, result = _gp_generate(GP_SEED + 60)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["page_precision"] == "fp32"
+
+
+class TestGenerateStatsConsistency:
+    def test_total_rounds_equals_sum_of_rounds_per_block(self):
+        # (b) total_rounds parses back to the per-block round counts.
+        _, result = _gp_generate(GP_SEED + 61)
+        rounds = _gp_assert_stats_structure(result.stats)
+        assert result.stats["total_rounds"] == sum(rounds)
+
+    def test_computed_rows_total_follows_rounds_formula(self):
+        # (b) Each round computes W active rows and the sealing pass adds W
+        # more rows per block; no batch factor. Derived purely from stats.
+        _, result = _gp_generate(GP_SEED + 62)
+        rounds = _gp_assert_stats_structure(result.stats)
+        expected = sum(GP_WIDTH * (rounds_j + 1) for rounds_j in rounds)
+        assert result.stats["computed_rows_total"] == expected
+
+    def test_kv_write_rows_total_matches_prompt_plus_gen_and_page_ledger(self):
+        # (b) Prefill appends P rows and each block's sealing pass appends W
+        # rows (G total); cross-checked against the store append ledger.
+        backend, result = _gp_generate(GP_SEED + 63)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["kv_write_rows_total"] == GP_PROMPT + GP_GEN
+        assert result.stats["kv_write_rows_total"] == (
+            backend.last_generate_stores[0].appended_tokens
+        )
+
+    def test_unmasked_counts_fill_every_block_without_forced_completion(self):
+        # (b) With max_rounds=8 > W=4 the guaranteed-progress fallback
+        # finishes every block inside the round loop, so nothing is
+        # force-filled and each block's unmask counts sum to exactly B*W.
+        _, result = _gp_generate(GP_SEED + 64)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["forced_completions"] == 0
+        for per_round in result.stats["unmasked_per_round"]:
+            assert sum(per_round) == GP_BATCH * GP_WIDTH
+
+    def test_rows_saved_vs_baseline_matches_closed_form(self):
+        # (b) rows_saved parses back to the closed form computed from
+        # stats' own rounds_per_block and the known P/W constants.
+        _, result = _gp_generate(GP_SEED + 65)
+        rounds = _gp_assert_stats_structure(result.stats)
+        assert result.stats["rows_saved_vs_baseline"] == _gp_expected_rows_saved(rounds)
+
+
+class TestGenerateStatsRowsSavedScale:
+    def test_rows_saved_positive_at_default_scale(self):
+        # (c) Each block contributes rounds_j * L_j - W >= L_j - W
+        # = P - W + j*W = 2 + 4j > 0 saved rows, so the total is positive.
+        _, result = _gp_generate(GP_SEED + 66)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["rows_saved_vs_baseline"] > 0
+
+    def test_rows_saved_does_not_decrease_with_more_blocks(self):
+        # (c) Same backend/prompt seeds make the first two blocks'
+        # trajectories identical across both runs, and every extra block
+        # adds a positive contribution (>= L_j - W = P + j*W - W > 0), so
+        # G=16 saves at least as many rows as G=8.
+        backend = _gp_backend(GP_SEED + 67)
+        prompt = _gp_prompt(GP_SEED + 68)
+        result_g8 = backend.generate(prompt, GP_GEN, _gp_config())
+        result_g16 = backend.generate(prompt, 2 * GP_GEN, _gp_config())
+        saved_g8 = result_g8.stats["rows_saved_vs_baseline"]
+        saved_g16 = result_g16.stats["rows_saved_vs_baseline"]
+        assert saved_g8 > 0
+        assert saved_g16 > 0
+        assert saved_g16 >= saved_g8
+
+
+class TestGenerateStatsForcedCompletionAccounting:
+    def test_max_rounds_one_accounts_for_forced_path(self):
+        # (d) max_rounds=1: every block runs exactly one scheduling round
+        # and the still-masked positions are force-filled, so per-block
+        # unmask totals may fall below B*W (the gap is the forced fill)
+        # but stay >= 1 (the top-1 fallback unmasks at least one element
+        # per round). forced_completions is only asserted >= 1 and the
+        # fallback flags stay structurally isomorphic: a block whose
+        # single round unmasks everything above threshold never triggers
+        # forced completion, so tighter claims would over-constrain.
+        _, result = _gp_generate(GP_SEED + 69, max_rounds=1)
+        rounds = _gp_assert_stats_structure(result.stats)
+        assert rounds == [1] * (GP_GEN // GP_WIDTH)
+        assert result.stats["forced_completions"] >= 1
+        for per_round in result.stats["unmasked_per_round"]:
+            block_total = sum(per_round)
+            assert 1 <= block_total <= GP_BATCH * GP_WIDTH
+
+
+class TestGenerateStatsTiming:
+    def test_total_time_ms_is_nonnegative_float(self):
+        # (e) Wall-clock accounting: a finite float, never negative; no
+        # upper bound is imposed.
+        _, result = _gp_generate(GP_SEED + 70)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["total_time_ms"] >= 0.0
+
+
+class TestGenerateStatsPrecisionPlanes:
+    @pytest.mark.parametrize("precision", ["fp16", "int8"])
+    def test_all_precisions_report_full_stats(self, precision):
+        # (f) Both reduced-precision page planes still surface the full
+        # key set and the correct page_precision identifier.
+        _, result = _gp_generate(GP_SEED + 71, page_precision=precision)
+        _gp_assert_stats_structure(result.stats)
+        assert result.stats["page_precision"] == precision
