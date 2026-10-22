@@ -61,6 +61,7 @@ class DiffusionTransformerBlock(nn.Module):
         step_id: int = 0,
         mode_state: Optional[MacroModeState] = None,
         mode_config: Optional[MacroModeConfig] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Forward one block.
 
@@ -74,12 +75,21 @@ class DiffusionTransformerBlock(nn.Module):
             step_id: Current denoising step (warmup gate).
             mode_state: Optional macro-block mode control state (AR015).
             mode_config: Optional macro-block mode control policy (AR015).
+            attention_mask: Optional additive attention mask of shape
+                [seq_len, seq_len] or [1, 1, seq_len, seq_len] (AR016);
+                None keeps the unmasked behavior bit-for-bit.
 
         Returns:
             A tuple of (updated hidden, new (k, v), attention weights).
         """
         batch, seq_len, _ = hidden.shape
         block_input = hidden
+
+        if attention_mask is not None and (mode_state is not None or reuse_state is not None):
+            raise ValueError(
+                "attention_mask is not supported together with step-reuse "
+                "or mode-control execution paths"
+            )
 
         if mode_state is not None and mode_config is not None:
             return self._forward_mode_control(
@@ -100,7 +110,7 @@ class DiffusionTransformerBlock(nn.Module):
                     attn = torch.empty(())
                 return reused, (entry.k, entry.v), attn
 
-        hidden, _, _, k, v, attn_weights = self._compute_block(hidden, kv_cache)
+        hidden, _, _, k, v, attn_weights = self._compute_block(hidden, kv_cache, attention_mask)
 
         if reuse_state is not None:
             reuse_state.record(layer_id, block_input, hidden, k, v)
@@ -113,14 +123,29 @@ class DiffusionTransformerBlock(nn.Module):
         self,
         hidden: torch.Tensor,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dense attention + FFN over the full sequence.
 
         Returns ``(hidden_out, k_new, v_new, k_full, v_full, attn_weights)``
         where ``k_new``/``v_new`` are this block's own projections and
         ``k_full``/``v_full`` additionally include the past cache.
+
+        ``attention_mask`` is an additive mask (e.g. block-causal, AR016)
+        of shape [seq_len, seq_len] or [1, 1, seq_len, seq_len]; None keeps
+        the unmasked behavior bit-for-bit.
         """
         batch, seq_len, _ = hidden.shape
+
+        if attention_mask is not None:
+            if kv_cache is not None:
+                raise ValueError("attention_mask is not supported together with kv_cache")
+            mask_shape = tuple(attention_mask.shape)
+            if mask_shape not in ((seq_len, seq_len), (1, 1, seq_len, seq_len)):
+                raise ValueError(
+                    f"attention_mask must be [S, S] or [1, 1, S, S] with "
+                    f"S={seq_len}, got shape {mask_shape}"
+                )
 
         normed = self.ln1(hidden)
         q = self.q_proj(normed).view(batch, seq_len, self.num_heads, self.head_dim)
@@ -138,6 +163,8 @@ class DiffusionTransformerBlock(nn.Module):
             v_full = torch.cat([past_v, v], dim=2)
 
         scores = torch.matmul(q, k_full.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            scores = scores + attention_mask
         attn_weights = F.softmax(scores, dim=-1)
         attn_out = torch.matmul(attn_weights, v_full)
 
@@ -364,6 +391,7 @@ class SimpleDiffusionLLM(nn.Module):
         reuse_config: Optional[StepReuseConfig] = None,
         mode_state: Optional[MacroModeState] = None,
         mode_config: Optional[MacroModeConfig] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         """Run one denoising step.
 
@@ -377,6 +405,9 @@ class SimpleDiffusionLLM(nn.Module):
             reuse_config: Optional reuse policy (AR013).
             mode_state: Optional macro-block mode control state (AR015).
             mode_config: Optional macro-block mode control policy (AR015).
+            attention_mask: Optional additive attention mask of shape
+                [seq_len, seq_len] or [1, 1, seq_len, seq_len] (AR016);
+                None keeps the unmasked behavior bit-for-bit.
 
         Returns:
             A tuple of (logits, updated kv_cache, attention_scores).
@@ -419,6 +450,7 @@ class SimpleDiffusionLLM(nn.Module):
                 step_id=step_t,
                 mode_state=mode_state,
                 mode_config=mode_config,
+                attention_mask=attention_mask,
             )
             updated_kv[layer_id] = new_kv
             attention_scores = attn
@@ -426,6 +458,105 @@ class SimpleDiffusionLLM(nn.Module):
         hidden = self.out_norm(hidden)
         logits = self.output_proj(hidden)
         return logits, updated_kv, attention_scores
+
+    def forward_block(
+        self,
+        x_block: torch.Tensor,
+        prefix_kv: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        prefix_len: int = 0,
+        step_t: int = 0,
+        total_steps: int = 0,
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward only the trailing active block of W rows (AR016, FR16.2).
+
+        Computes the full transformer stack for the W active rows only,
+        conditioning every layer's attention on the frozen prefix K/V
+        supplied by the caller. Active rows attend to prefix + own rows
+        (block-causal by construction: prefix K/V never changes).
+
+        Args:
+            x_block: [B, W] integer token ids or [B, W, hidden_dim] hidden
+                states for the active block rows.
+            prefix_kv: Per-layer (k, v) prefix tensors of shape
+                [B, num_heads, prefix_len, head_dim]; may be None only when
+                ``prefix_len == 0``.
+            prefix_len: Number of frozen prefix rows L (>= 0). Positions for
+                the active rows are [L, L+W).
+            step_t: Current denoising step index (0-based).
+            total_steps: Total denoising steps; the generation protocol
+                fixes 0 (no time embedding), matching the baseline arm.
+
+        Returns:
+            A tuple of (logits [B, W, vocab_size], block_kv mapping each
+            layer to its active-row (k, v) new projections
+            [B, num_heads, W, head_dim]).
+
+        Raises:
+            ValueError: If ``x_block`` is not 2-D/3-D, its hidden dim does
+                not match the model, ``prefix_len`` is negative,
+                ``prefix_kv`` layer set is incomplete, or any prefix k/v
+                shape deviates from [B, num_heads, prefix_len, head_dim].
+        """
+        if prefix_len < 0:
+            raise ValueError(f"prefix_len must be >= 0, got {prefix_len}")
+        if x_block.dim() == 2:
+            if x_block.dtype not in (torch.long, torch.int):
+                raise ValueError(
+                    "2-D x_block must be integer token ids [B, W]; float "
+                    "hidden states must be 3-D [B, W, hidden_dim]"
+                )
+            hidden = self.embed(x_block.long())
+        elif x_block.dim() == 3:
+            hidden = x_block.to(dtype=self._dtype)
+        else:
+            raise ValueError(
+                f"x_block must be [B, W] token ids or [B, W, hidden_dim] "
+                f"hidden states, got dim={x_block.dim()}"
+            )
+
+        batch, width, hidden_dim = hidden.shape
+        if hidden_dim != self.hidden_dim:
+            raise ValueError(
+                f"Input hidden_dim ({hidden_dim}) does not match model hidden_dim "
+                f"({self.hidden_dim})"
+            )
+
+        if prefix_kv is None:
+            if prefix_len != 0:
+                raise ValueError(f"prefix_kv is required when prefix_len={prefix_len} > 0")
+        else:
+            expected_layers = set(range(self.num_layers))
+            if set(prefix_kv.keys()) != expected_layers:
+                raise ValueError(
+                    f"prefix_kv must cover exactly layers {sorted(expected_layers)}, "
+                    f"got {sorted(prefix_kv.keys())}"
+                )
+            expected_shape = (batch, self.num_heads, prefix_len, self.head_dim)
+            for layer_id, (past_k, past_v) in prefix_kv.items():
+                if tuple(past_k.shape) != expected_shape or tuple(past_v.shape) != expected_shape:
+                    raise ValueError(
+                        f"prefix_kv[{layer_id}] must have shape {expected_shape}, "
+                        f"got k={tuple(past_k.shape)}, v={tuple(past_v.shape)}"
+                    )
+
+        positions = torch.arange(
+            prefix_len, prefix_len + width, device=hidden.device, dtype=torch.long
+        )
+        hidden = hidden + self.pos_embed(positions).unsqueeze(0)
+
+        if total_steps > 0:
+            ratio = torch.tensor([[step_t / total_steps]], device=hidden.device, dtype=hidden.dtype)
+            hidden = hidden + self.time_embed(ratio).unsqueeze(1)
+
+        block_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer_id, block in enumerate(self.blocks):
+            past = prefix_kv.get(layer_id) if prefix_kv is not None else None
+            hidden, k_new, v_new, _, _, _ = block._compute_block(hidden, past)
+            block_kv[layer_id] = (k_new, v_new)
+
+        hidden = self.out_norm(hidden)
+        logits = self.output_proj(hidden)
+        return logits, block_kv
 
     def enable_int8_ffn(self, keep_fp32_reference: bool = False) -> Dict[str, object]:
         """Replace every FFN up/down projection with an executable INT8 linear.

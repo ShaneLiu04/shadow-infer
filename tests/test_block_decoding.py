@@ -379,3 +379,299 @@ class TestScheduleRoundRandomReference:
         still = masked & ~unmasked
         if still.any():
             assert torch.allclose(decision.confidences[still], conf[still], atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# T002: forward_block + block-causal attention mask
+# ---------------------------------------------------------------------------
+
+FB_SEED = 2101
+FB_LAYERS = 2
+FB_HEADS = 2
+FB_HEAD_DIM = 16
+FB_HIDDEN = 32
+FB_VOCAB = 64
+FB_MAX_SEQ = 64
+FB_BATCH = 2
+FB_PREFIX = 6  # L
+FB_WIDTH = 4  # W
+FB_FULL = FB_PREFIX + FB_WIDTH  # S = L + W
+FB_TOL = 1e-6
+
+
+def _fb_model():
+    """Deterministic tiny two-layer model (CPU, fp32)."""
+    from shadowinfer.models.simple_diffusion_llm import SimpleDiffusionLLM
+
+    torch.manual_seed(FB_SEED)
+    return SimpleDiffusionLLM(
+        num_layers=FB_LAYERS,
+        num_heads=FB_HEADS,
+        head_dim=FB_HEAD_DIM,
+        hidden_dim=FB_HIDDEN,
+        vocab_size=FB_VOCAB,
+        max_seq_len=FB_MAX_SEQ,
+    )
+
+
+def _fb_ids(seed, batch, seq):
+    """Random token ids in [0, vocab), fixed per-call generator seed."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(0, FB_VOCAB, (batch, seq), generator=gen)
+
+
+def _fb_block_causal_mask(seq_len, prefix_len, device):
+    from shadowinfer.execution.block_decoding import block_causal_mask
+
+    return block_causal_mask(seq_len, prefix_len, device)
+
+
+def _rel_l2(a, b):
+    """Relative L2 distance: ||a - b|| / clamp_min(||b||, 1e-12)."""
+    return float((a - b).norm() / b.norm().clamp_min(1e-12))
+
+
+def _fb_prefix_kv(model, seed=FB_SEED + 1):
+    """Per-layer prefix KV from a prefix-only forward_step (total_steps=0)."""
+    prefix_ids = _fb_ids(seed, FB_BATCH, FB_PREFIX)
+    _, prefix_kv, _ = model.forward_step(prefix_ids, 0, 0)
+    return prefix_kv
+
+
+class TestForwardBlockMatchesMaskedForwardStep:
+    def test_block_rows_match_masked_full_forward(self):
+        # Prefix rows of the masked full forward see only the prefix (block
+        # keys are -inf-masked), block rows see everything -- the exact
+        # receptive field of forward_block's W active rows.
+        model = _fb_model()
+        full_ids = _fb_ids(FB_SEED + 1, FB_BATCH, FB_FULL)
+        prefix_ids = full_ids[:, :FB_PREFIX]
+        block_ids = full_ids[:, FB_PREFIX:]
+
+        _, prefix_kv, _ = model.forward_step(prefix_ids, 0, 0)
+        mask = _fb_block_causal_mask(FB_FULL, FB_PREFIX, torch.device("cpu"))
+        full_logits, full_kv, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+        block_logits, block_kv = model.forward_block(
+            block_ids, prefix_kv, FB_PREFIX, step_t=0, total_steps=0
+        )
+
+        assert block_logits.shape == (FB_BATCH, FB_WIDTH, FB_VOCAB)
+        # Attention matmul reduction-order noise only; not bitwise.
+        assert _rel_l2(full_logits[:, FB_PREFIX:, :], block_logits) <= FB_TOL
+        # K/V projections are row-local and attention-independent: bitwise.
+        for layer_id in range(FB_LAYERS):
+            full_k, full_v = full_kv[layer_id]
+            block_k, block_v = block_kv[layer_id]
+            assert full_k.shape == (FB_BATCH, FB_HEADS, FB_FULL, FB_HEAD_DIM)
+            assert block_k.shape == (FB_BATCH, FB_HEADS, FB_WIDTH, FB_HEAD_DIM)
+            assert torch.equal(full_k[:, :, FB_PREFIX:, :], block_k)
+            assert torch.equal(full_v[:, :, FB_PREFIX:, :], block_v)
+
+    def test_prefix_len_zero_matches_unmasked_forward_step(self):
+        # No prefix and no mask: forward_block degenerates to a plain
+        # full-sequence forward_step over W rows.
+        model = _fb_model()
+        ids = _fb_ids(FB_SEED + 2, FB_BATCH, FB_WIDTH)
+
+        ref_logits, ref_kv, _ = model.forward_step(ids, 0, 0)
+        blk_logits, blk_kv = model.forward_block(ids, None, 0, step_t=0, total_steps=0)
+
+        assert _rel_l2(ref_logits, blk_logits) <= FB_TOL
+        for layer_id in range(FB_LAYERS):
+            ref_k, ref_v = ref_kv[layer_id]
+            blk_k, blk_v = blk_kv[layer_id]
+            assert torch.equal(ref_k, blk_k)
+            assert torch.equal(ref_v, blk_v)
+
+
+class TestAttentionMaskNoneRegression:
+    def test_none_mask_bitwise_same_without_cache(self):
+        model = _fb_model()
+        ids = _fb_ids(FB_SEED + 3, FB_BATCH, FB_FULL)
+
+        ref_logits, ref_kv, _ = model.forward_step(ids, 0, 0)
+        got_logits, got_kv, _ = model.forward_step(ids, 0, 0, attention_mask=None)
+
+        assert torch.equal(got_logits, ref_logits)
+        for layer_id in range(FB_LAYERS):
+            assert torch.equal(got_kv[layer_id][0], ref_kv[layer_id][0])
+            assert torch.equal(got_kv[layer_id][1], ref_kv[layer_id][1])
+
+    def test_none_mask_bitwise_same_with_cache(self):
+        model = _fb_model()
+        full_ids = _fb_ids(FB_SEED + 4, FB_BATCH, FB_FULL)
+        prefix_ids = full_ids[:, :FB_PREFIX]
+        block_ids = full_ids[:, FB_PREFIX:]
+        _, prefix_kv, _ = model.forward_step(prefix_ids, 0, 0)
+
+        ref_logits, ref_kv, _ = model.forward_step(block_ids, 0, 0, kv_cache=prefix_kv)
+        got_logits, got_kv, _ = model.forward_step(
+            block_ids, 0, 0, kv_cache=prefix_kv, attention_mask=None
+        )
+
+        assert torch.equal(got_logits, ref_logits)
+        for layer_id in range(FB_LAYERS):
+            assert torch.equal(got_kv[layer_id][0], ref_kv[layer_id][0])
+            assert torch.equal(got_kv[layer_id][1], ref_kv[layer_id][1])
+
+
+class TestBlockCausalMaskForwardSemantics:
+    def test_masked_prefix_rows_equal_prefix_only_forward(self):
+        # Block-causal masking removes the block keys from every prefix
+        # row's softmax (exp(-inf) = 0 exactly), so prefix-row logits must
+        # be bitwise identical to an isolated prefix-only forward.
+        model = _fb_model()
+        full_ids = _fb_ids(FB_SEED + 5, FB_BATCH, FB_FULL)
+        prefix_ids = full_ids[:, :FB_PREFIX]
+
+        prefix_logits, _, _ = model.forward_step(prefix_ids, 0, 0)
+        mask = _fb_block_causal_mask(FB_FULL, FB_PREFIX, torch.device("cpu"))
+        full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+
+        assert torch.equal(full_logits[:, :FB_PREFIX, :], prefix_logits)
+
+    def test_two_mask_shapes_broadcast_identically(self):
+        # [S, S] and [1, 1, S, S] additive masks must be interchangeable.
+        model = _fb_model()
+        ids = _fb_ids(FB_SEED + 6, FB_BATCH, FB_FULL)
+        mask2d = _fb_block_causal_mask(FB_FULL, FB_PREFIX, torch.device("cpu"))
+        mask4d = mask2d.unsqueeze(0).unsqueeze(0)
+
+        logits2d, _, _ = model.forward_step(ids, 0, 0, attention_mask=mask2d)
+        logits4d, _, _ = model.forward_step(ids, 0, 0, attention_mask=mask4d)
+
+        assert torch.equal(logits2d, logits4d)
+
+
+class TestBlockCausalMaskValues:
+    def test_small_scale_pattern(self):
+        seq_len, prefix_len = 5, 2
+        device = torch.device("cpu")
+        mask = _fb_block_causal_mask(seq_len, prefix_len, device)
+
+        assert mask.shape == (seq_len, seq_len)
+        assert mask.dtype.is_floating_point
+        assert mask.device == device
+        expected = torch.zeros(seq_len, seq_len)
+        for i in range(seq_len):
+            for j in range(seq_len):
+                if i < prefix_len and j >= prefix_len:
+                    expected[i, j] = float("-inf")
+        assert torch.equal(mask, expected)
+
+    @pytest.mark.parametrize("prefix_len", [0, 5])
+    def test_degenerate_boundaries_are_all_zero(self, prefix_len):
+        # L=0: no prefix rows; L=S: no block columns; neither yields -inf.
+        mask = _fb_block_causal_mask(5, prefix_len, torch.device("cpu"))
+        assert torch.equal(mask, torch.zeros(5, 5))
+
+    @pytest.mark.parametrize(
+        "seq_len,prefix_len",
+        [
+            (0, 0),
+            (-1, 0),
+            (5, -1),
+            (5, 6),
+        ],
+    )
+    def test_invalid_args_raise_value_error(self, seq_len, prefix_len):
+        with pytest.raises(ValueError):
+            _fb_block_causal_mask(seq_len, prefix_len, torch.device("cpu"))
+
+
+class TestForwardBlockInputForms:
+    def test_token_ids_and_prembedded_hidden_bitwise_identical(self):
+        model = _fb_model()
+        full_ids = _fb_ids(FB_SEED + 7, FB_BATCH, FB_FULL)
+        prefix_ids = full_ids[:, :FB_PREFIX]
+        block_ids = full_ids[:, FB_PREFIX:]
+        _, prefix_kv, _ = model.forward_step(prefix_ids, 0, 0)
+
+        logits_ids, kv_ids = model.forward_block(
+            block_ids, prefix_kv, FB_PREFIX, step_t=0, total_steps=0
+        )
+        hidden_block = model.embed(block_ids.long())
+        logits_hidden, kv_hidden = model.forward_block(
+            hidden_block, prefix_kv, FB_PREFIX, step_t=0, total_steps=0
+        )
+
+        assert torch.equal(logits_hidden, logits_ids)
+        for layer_id in range(FB_LAYERS):
+            assert torch.equal(kv_hidden[layer_id][0], kv_ids[layer_id][0])
+            assert torch.equal(kv_hidden[layer_id][1], kv_ids[layer_id][1])
+
+
+class TestForwardBlockValidation:
+    def test_reject_x_block_not_2d_or_3d(self):
+        model = _fb_model()
+        prefix_kv = _fb_prefix_kv(model)
+        with pytest.raises(ValueError):
+            model.forward_block(torch.randn(FB_WIDTH, FB_HIDDEN), prefix_kv, FB_PREFIX)
+        with pytest.raises(ValueError):
+            model.forward_block(torch.randn(1, FB_BATCH, FB_WIDTH, FB_HIDDEN), prefix_kv, FB_PREFIX)
+
+    def test_reject_hidden_dim_mismatch(self):
+        model = _fb_model()
+        prefix_kv = _fb_prefix_kv(model)
+        bad_hidden = torch.randn(FB_BATCH, FB_WIDTH, FB_HIDDEN - 1)
+        with pytest.raises(ValueError):
+            model.forward_block(bad_hidden, prefix_kv, FB_PREFIX)
+
+    def test_reject_negative_prefix_len(self):
+        model = _fb_model()
+        prefix_kv = _fb_prefix_kv(model)
+        block_ids = _fb_ids(FB_SEED + 8, FB_BATCH, FB_WIDTH)
+        with pytest.raises(ValueError):
+            model.forward_block(block_ids, prefix_kv, -1)
+
+    def test_reject_prefix_kv_layer_set_mismatch(self):
+        model = _fb_model()
+        prefix_kv = _fb_prefix_kv(model)
+        block_ids = _fb_ids(FB_SEED + 9, FB_BATCH, FB_WIDTH)
+
+        missing = {layer_id: prefix_kv[layer_id] for layer_id in range(1, FB_LAYERS)}
+        with pytest.raises(ValueError):
+            model.forward_block(block_ids, missing, FB_PREFIX)
+
+        extra = dict(prefix_kv)
+        extra[FB_LAYERS] = prefix_kv[0]
+        with pytest.raises(ValueError):
+            model.forward_block(block_ids, extra, FB_PREFIX)
+
+    @pytest.mark.parametrize(
+        "batch,heads,length,head_dim",
+        [
+            (FB_BATCH + 1, FB_HEADS, FB_PREFIX, FB_HEAD_DIM),
+            (FB_BATCH, FB_HEADS + 1, FB_PREFIX, FB_HEAD_DIM),
+            (FB_BATCH, FB_HEADS, FB_PREFIX, FB_HEAD_DIM - 1),
+            (FB_BATCH, FB_HEADS, FB_PREFIX + 1, FB_HEAD_DIM),
+        ],
+    )
+    def test_reject_prefix_kv_shape_mismatch(self, batch, heads, length, head_dim):
+        model = _fb_model()
+        block_ids = _fb_ids(FB_SEED + 10, FB_BATCH, FB_WIDTH)
+        gen = torch.Generator().manual_seed(FB_SEED + 11)
+        k = torch.randn(batch, heads, length, head_dim, generator=gen)
+        v = torch.randn(batch, heads, length, head_dim, generator=gen)
+        bad_kv = {layer_id: (k, v) for layer_id in range(FB_LAYERS)}
+        with pytest.raises(ValueError):
+            model.forward_block(block_ids, bad_kv, FB_PREFIX)
+
+
+class TestForwardStepMaskValidation:
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (FB_FULL, FB_FULL + 1),
+            (1, FB_FULL),
+            (FB_FULL, FB_FULL, FB_FULL),
+            (),
+        ],
+    )
+    def test_bad_mask_shape_raises_value_error(self, shape):
+        # Neither [S, S] nor [1, 1, S, S]: must be rejected up front.
+        model = _fb_model()
+        ids = _fb_ids(FB_SEED + 12, FB_BATCH, FB_FULL)
+        mask = torch.zeros(shape)
+        with pytest.raises(ValueError):
+            model.forward_step(ids, 0, 0, attention_mask=mask)

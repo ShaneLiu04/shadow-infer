@@ -119,3 +119,40 @@ def schedule_round(
         confidences=retained_confidences,
         progress_fallback=needs_fallback,
     )
+
+
+def block_causal_mask(
+    seq_len: int,
+    prefix_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the block-causal additive attention mask (AR016, plan A).
+
+    Rows before ``prefix_len`` (frozen prefix rows) may only attend to the
+    prefix itself: ``mask[i, j] = -inf`` iff ``i < prefix_len`` and
+    ``j >= prefix_len``; every other entry is 0. Active block rows attend
+    to the full sequence.
+
+    Args:
+        seq_len: Total sequence length S (prefix + active block), >= 1.
+        prefix_len: Number of frozen prefix rows L, 0 <= L <= S.
+        device: Device to place the mask on.
+
+    Returns:
+        [S, S] float additive mask.
+
+    Raises:
+        ValueError: If ``seq_len < 1``, ``prefix_len < 0`` or
+            ``prefix_len > seq_len``.
+    """
+    if seq_len < 1:
+        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+    if prefix_len < 0:
+        raise ValueError(f"prefix_len must be >= 0, got {prefix_len}")
+    if prefix_len > seq_len:
+        raise ValueError(f"prefix_len ({prefix_len}) must not exceed seq_len ({seq_len})")
+
+    mask = torch.zeros(seq_len, seq_len, device=device)
+    if prefix_len > 0:
+        mask[:prefix_len, prefix_len:] = float("-inf")
+    return mask
