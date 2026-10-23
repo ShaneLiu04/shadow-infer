@@ -395,6 +395,9 @@ def blockwise_generate_baseline(
     block_logits_per_round: list = []
     unmask_positions_per_round: list = []
     block_time_ms: list = []
+    draft_accepted_positions = 0
+    rounds_to_fixpoint: list = []
+    changed_per_round: list = []
     start_time = time.perf_counter()
     prefix_len = prompt_len
     for _ in range(num_blocks):
@@ -408,6 +411,8 @@ def blockwise_generate_baseline(
         captured_rounds: list = []
         block_positions: list = []
         if config.draft_mode:
+            block_changed: list = []
+            draft_snapshot: torch.Tensor = torch.empty(0)
             while True:
                 full_ids = sequences[:, : prefix_len + width]
                 mask = segment_causal_mask(prefix_len + width, prompt_len, width, sequences.device)
@@ -419,8 +424,10 @@ def blockwise_generate_baseline(
                 if rounds == 1:
                     round_tokens, round_conf = draft_round(logits)
                     block_tokens.copy_(round_tokens)
+                    draft_snapshot = block_tokens.detach().clone()
                     round_unmasked = int(batch * width)
                     round_positions = torch.ones(batch, width, dtype=torch.bool)
+                    round_changed = int(batch * width)
                     fixpoint = False
                 else:
                     changed, round_tokens, round_conf = verify_round(logits, block_tokens)
@@ -429,15 +436,20 @@ def blockwise_generate_baseline(
                         block_tokens[changed] = round_tokens[changed]
                     round_unmasked = 0
                     round_positions = torch.zeros(batch, width, dtype=torch.bool)
+                    round_changed = int(changed.sum())
                 block_unmasked.append(round_unmasked)
                 block_fallback.append(False)
                 block_confidence.append(float(round_conf.mean()))
                 block_positions.append(round_positions)
+                block_changed.append(round_changed)
                 if fixpoint:
                     break
                 if rounds >= config.max_rounds:
                     forced_completions += 1
                     break
+            draft_accepted_positions += int((block_tokens == draft_snapshot).sum())
+            rounds_to_fixpoint.append(rounds if fixpoint else -1)
+            changed_per_round.append(block_changed)
         else:
             masked = torch.ones(batch, width, dtype=torch.bool)
             while bool(masked.any()) and rounds < config.max_rounds:
@@ -490,6 +502,13 @@ def blockwise_generate_baseline(
         "rows_saved_vs_baseline": 0,
         "unmask_positions_per_round": unmask_positions_per_round,
         "block_time_ms": block_time_ms,
+        "draft_acceptance_rate": (
+            draft_accepted_positions / float(batch * width * num_blocks)
+            if config.draft_mode
+            else None
+        ),
+        "rounds_to_fixpoint": rounds_to_fixpoint if config.draft_mode else None,
+        "changed_per_round": changed_per_round if config.draft_mode else None,
     }
     if capture_block_logits:
         stats["block_logits_per_round"] = block_logits_per_round

@@ -172,7 +172,7 @@ def verify_round(
 |---|---|---|
 | draft_acceptance_rate | None（不适用） | float ∈ [0,1]：各块 round-0 草稿 token 被最终封存保留的位比例（batch×blocks 总均值） |
 | rounds_to_fixpoint | None | List[int] 逐块：定点确认时的调度前向总数（草拟+验证）；forced 块记 -1 |
-| changed_per_round | None | List[List[int]] 逐块逐轮替换位数；round 0 恒 W（草拟填充） |
+| changed_per_round | None | List[List[int]] 逐块逐轮替换位数（batch 聚合，与 unmasked_per_round 口径一致）；round 0 恒 B×W（草拟整块填充） |
 | forced_completions | 沿 AR016（单位=块） | 同口径：达 max_rounds 未定点的块数 |
 | computed_rows_total | Σ W×(rounds+1) | Σ W×(调度前向数 + 封存前向数)：定点块封存前向=0，forced 块=1 |
 

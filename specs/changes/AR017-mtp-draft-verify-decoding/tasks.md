@@ -13,7 +13,7 @@
 |----|---------|------|------|------|
 | T001 | DraftVerify 调度原语：草拟轮全位填充 + 验证轮自一致替换 + 不动点检测 + 收尾；BlockDecodingConfig 增 `draft_mode` 字段与校验（FR17.1） | - | passing | 2026-10-23 完成；30 UT |
 | T002 | backend `generate` draft_mode 分支 + `blockwise_generate_baseline` draft_mode 分支（决策等价参考臂）：页驻留协同（轮间零页写、封存一次 append / 定点 KV 复用零封存前向）、进度保证、fail-fast 共存、默认路径逐位回归锚点（FR17.2） | T001 | passing | 2026-10-23 完成；29 UT；seal_rounds 记账统一两模式 computed_rows 公式 |
-| T003 | 统计扩展：draft_acceptance_rate / changed_per_round / rounds_to_fixpoint；两模式 17 键集一致 + 闭式回代（FR17.3） | T002 | pending | |
+| T003 | 统计扩展：draft_acceptance_rate / changed_per_round / rounds_to_fixpoint；两模式 17 键集一致 + 闭式回代（FR17.3） | T002 | passing | 2026-10-23 完成；18 UT；changed 口径 batch 聚合（design 4.3 已同步修订） |
 | T004 | e2e 行为测试：draft-verify 正常完成（多块/多规模/B=2）、页驻留取证、batch 独立收敛、退化输入（FR17.1/17.2 验收） | T002 | pending | |
 | T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | pending | 探针不入库；断言跑前登记 bench-results.md |
 | T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | pending | >= 1.5x / >= 2x / >= 90% 预注册口径；未达标如实报告 |
@@ -45,6 +45,14 @@
 - 关键实现：draft-verify 定点确认轮的 block_kv 直接用于封存 append（零额外封存前向）；forced 块（max_rounds 耗尽）补一次封存前向；`computed_rows_total`/`rows_saved_vs_baseline` 统一为 `W×(rounds+seal)` 公式（mask-init seal 恒 1，与 v3.18.0 公式等价）
 - 验证：合跑 171 passed（draft_verify 59 + block_decoding 112 零回归）；divergence 锚点转绿（分支接线证明）；mask-init 回归锚点保持（draft_mode=False vs 默认路径逐位一致）；black/isort/flake8/mypy 全绿
 - Red 证据：实现前 2 failed（draft_mode=True 被静默忽略、与 mask-init 输出相同）— 分支未接线的精准锚点
+
+### 2026-10-23 会话记录（T003）
+
+- 完成任务：T003 统计扩展（Red 子代理 18 用例 → Green 主代理实现）
+- 修改文件：`shadowinfer/core/backends/pytorch_backend.py`（generate 三新键 + draft_snapshot 记账）、`shadowinfer/execution/block_decoding.py`（baseline 三新键）、`tests/test_draft_verify_decoding.py`（+18 用例四分区 + 共享断言助手）、`design.md`（4.3 表 changed_per_round 口径精化为 batch 聚合 B×W，与 unmasked_per_round 一致）
+- 语义：draft_acceptance_rate = 终态 == 草稿的位比例（batch×blocks 均值）；rounds_to_fixpoint 定点块 = 确认轮调度前向数（>=2）、forced 块 = -1；changed_per_round 首项 B×W、后续 = 各验证轮替换总数；mask-init 三键恒 None；17 键契约两模式两臂一致
+- 验证：合跑 189 passed（draft_verify 77 + block_decoding 112 零回归）；max_rounds=1 锚点（acceptance==1.0/全 -1/[[B×W]]×blocks/computed_rows==2·W·blocks）实测通过；black/isort/flake8/mypy 全绿
+- Red 证据：实现前 18 failed（8 键集缺失 AssertionError + 10 KeyError 三新键），既有 59 用例全过
 
 ## 阶段门控记录
 

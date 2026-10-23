@@ -20,6 +20,16 @@ forced degeneration, forced-completions accounting bounds, mask-init
 regression anchors for draft_mode=False, and the fail-fast contract
 shared by both draft_mode values.
 
+The T003 partition appended below pins the draft-verify statistics
+contract (FR17.3): one shared 17-key stats set across both modes and
+both arms -- the fourteen v3.18.0 keys plus three new draft-verify keys
+(draft_acceptance_rate, rounds_to_fixpoint, changed_per_round) -- the
+closed-form accounting that parses computed_rows_total, total_rounds,
+forced_completions and kv_write_rows_total back from the per-block
+round-and-fixpoint ledgers, the max_rounds=1 / max_rounds=2 structural
+anchors, the mask-init None-pinning of the new keys, and the baseline
+arm's recompute-semantics variants of the same contract.
+
 All tests use real tensors; nothing is mocked.
 """
 
@@ -38,6 +48,8 @@ from tests.test_block_decoding import (
     GP_WIDTH,
     _gp_backend,
     _gp_config,
+    _gp_generate,
+    _gp_is_int,
     _gp_model_config,
     _gp_prompt,
     _t5_direct_model,
@@ -596,3 +608,348 @@ class TestDraftModeFailFast:
         with pytest.raises(RuntimeError):
             backend.generate(prompt, GP_GEN, _gp_config(draft_mode=draft_mode))
         assert backend.last_generate_stores is None
+
+
+# ---------------------------------------------------------------------------
+# T003: draft-verify statistics contract (FR17.3)
+# ---------------------------------------------------------------------------
+
+DV_STATS_SEED = 2701
+
+# The fourteen v3.18.0 statistics keys every generate call reports.
+DV_STATS_EXISTING_KEYS = (
+    "blocks",
+    "total_rounds",
+    "computed_rows_total",
+    "kv_write_rows_total",
+    "forced_completions",
+    "total_time_ms",
+    "page_precision",
+    "rounds_per_block",
+    "unmasked_per_round",
+    "fallback_per_round",
+    "mean_confidence_per_round",
+    "rows_saved_vs_baseline",
+    "unmask_positions_per_round",
+    "block_time_ms",
+)
+# The three AR017 draft-verify keys joining the contract.
+DV_STATS_NEW_KEYS = (
+    "draft_acceptance_rate",
+    "rounds_to_fixpoint",
+    "changed_per_round",
+)
+DV_STATS_ALL_KEYS = DV_STATS_EXISTING_KEYS + DV_STATS_NEW_KEYS
+
+DV_STATS_SCALES = (
+    (GP_PROMPT, GP_GEN),  # (P=6, G=8): two blocks
+    (10, 16),  # (P=10, G=16): four blocks
+)
+
+
+def _dv_generate(seed, gen_len=GP_GEN, prompt_len=GP_PROMPT, **overrides):
+    """One real draft-verify generate call on a fresh seeded backend."""
+    backend = _gp_backend(seed)
+    prompt = _gp_prompt(seed + 1, length=prompt_len)
+    result = backend.generate(prompt, gen_len, _gp_config(draft_mode=True, **overrides))
+    return backend, result
+
+
+def _dv_assert_keyset(stats, label):
+    """The 17-key contract set is present exactly: the fourteen v3.18.0
+    statistics keys plus the three AR017 draft-verify keys and nothing
+    else (``block_logits_per_round`` is not a contract key; it only
+    appears under ``capture_block_logits``)."""
+    expected = set(DV_STATS_ALL_KEYS)
+    actual = set(stats.keys())
+    assert actual == expected, (
+        f"{label}: stats key set mismatch: "
+        f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    )
+
+
+def _dv_assert_new_key_structure(stats, max_rounds, label):
+    """Structural contract of the three draft-verify statistics keys.
+
+    ``draft_acceptance_rate`` is a float in [0, 1];
+    ``rounds_to_fixpoint`` is a per-block list holding -1 for forced
+    blocks (whose round count must then equal max_rounds) or the
+    fixpoint-confirming scheduled-forward count in [2, max_rounds] equal
+    to that block's ``rounds_per_block`` entry; ``changed_per_round`` is
+    a per-block list isomorphic to ``rounds_per_block`` whose first item
+    is the B*W draft fill and whose remaining items are per-verify-round
+    replaced position counts within [0, B*W].
+
+    Returns (rounds_to_fixpoint, changed_per_round) for closed-form
+    cross-checks by the caller.
+    """
+    rate = stats["draft_acceptance_rate"]
+    assert isinstance(
+        rate, float
+    ), f"{label}: draft_acceptance_rate must be a float, got {type(rate).__name__}"
+    assert 0.0 <= rate <= 1.0, f"{label}: draft_acceptance_rate {rate} outside [0, 1]"
+
+    blocks = stats["blocks"]
+    rounds = stats["rounds_per_block"]
+    positions = GP_BATCH * GP_WIDTH
+
+    to_fixpoint = stats["rounds_to_fixpoint"]
+    assert isinstance(to_fixpoint, list), f"{label}: rounds_to_fixpoint must be a list"
+    assert (
+        len(to_fixpoint) == blocks
+    ), f"{label}: rounds_to_fixpoint length {len(to_fixpoint)} != blocks {blocks}"
+    for b, value in enumerate(to_fixpoint):
+        assert _gp_is_int(value), f"{label}: rounds_to_fixpoint[{b}] must be an int, got {value!r}"
+        if value == -1:
+            assert rounds[b] == max_rounds, (
+                f"{label}: forced block {b} ran {rounds[b]} rounds " f"!= max_rounds {max_rounds}"
+            )
+        else:
+            assert 2 <= value <= max_rounds, (
+                f"{label}: rounds_to_fixpoint[{b}]={value} outside " f"[2, max_rounds={max_rounds}]"
+            )
+            assert value == rounds[b], (
+                f"{label}: fixpoint block {b} confirms at round {value} "
+                f"but ran {rounds[b]} rounds"
+            )
+
+    changed = stats["changed_per_round"]
+    assert isinstance(changed, list), f"{label}: changed_per_round must be a list"
+    assert (
+        len(changed) == blocks
+    ), f"{label}: changed_per_round length {len(changed)} != blocks {blocks}"
+    for b, per_round in enumerate(changed):
+        assert isinstance(per_round, list), f"{label}: changed_per_round[{b}] must be a list"
+        assert len(per_round) == rounds[b], (
+            f"{label}: changed_per_round[{b}] length {len(per_round)} "
+            f"!= rounds_per_block[{b}]={rounds[b]}"
+        )
+        assert per_round[0] == positions, (
+            f"{label}: changed_per_round[{b}][0] must be the B*W draft "
+            f"fill {positions}, got {per_round[0]}"
+        )
+        for r, count in enumerate(per_round[1:], start=1):
+            assert _gp_is_int(count) and 0 <= count <= positions, (
+                f"{label}: changed_per_round[{b}][{r}]={count} " f"outside [0, {positions}]"
+            )
+    return to_fixpoint, changed
+
+
+class TestDraftVerifyStatsContract:
+    def test_draft_verify_stats_key_set_is_seventeen_keys(self):
+        # FR17.3(a): the draft-verify generate arm always surfaces exactly
+        # the shared 17-key contract set -- the fourteen v3.18.0 keys plus
+        # draft_acceptance_rate / rounds_to_fixpoint / changed_per_round;
+        # without capture_block_logits no extra key may appear.
+        _, result = _dv_generate(DV_STATS_SEED)
+        _dv_assert_keyset(result.stats, "generate-draft-verify")
+
+    def test_mask_init_stats_key_set_matches_draft_verify(self):
+        # FR17.3(a): the mask-init arm carries the very same 17-key set
+        # (its three new keys are pinned to None), so the two modes can
+        # never drift apart in reported stats keys.
+        backend = _gp_backend(DV_STATS_SEED + 2)
+        prompt = _gp_prompt(DV_STATS_SEED + 3)
+
+        result_dv = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=True))
+        result_mi = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=False))
+
+        _dv_assert_keyset(result_dv.stats, "generate-draft-verify")
+        _dv_assert_keyset(result_mi.stats, "generate-mask-init")
+        assert set(result_dv.stats.keys()) == set(result_mi.stats.keys())
+
+    def test_generate_and_baseline_draft_verify_key_sets_match(self):
+        # FR17.3(a): the store-backed generate arm and the full-recompute
+        # baseline arm share one draft-verify statistics contract.
+        seed = DV_STATS_SEED + 4
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(draft_mode=True)
+
+        gen_result = backend.generate(prompt, GP_GEN, config)
+        base_result = _dv_baseline(_t5_direct_model(seed), prompt, GP_GEN, config)
+
+        _dv_assert_keyset(gen_result.stats, "generate-draft-verify")
+        _dv_assert_keyset(base_result.stats, "baseline-draft-verify")
+        assert set(gen_result.stats.keys()) == set(base_result.stats.keys())
+
+    @pytest.mark.parametrize("max_rounds", [1, 2, 8])
+    def test_new_keys_structure_across_round_budgets(self, max_rounds):
+        # FR17.3(a): the three new keys keep their structural contract at
+        # every round budget -- the draft-only degeneration (max_rounds=1),
+        # the single-verify budget (max_rounds=2) and the default budget
+        # (max_rounds=8). Toy-model convergence is not predictable, so
+        # only structure, value domains and cross-key relations are
+        # asserted, never concrete round counts.
+        _, result = _dv_generate(DV_STATS_SEED + 6, max_rounds=max_rounds)
+        _dv_assert_new_key_structure(result.stats, max_rounds, "generate-draft-verify")
+
+    def test_capture_block_logits_appends_only_the_capture_key(self):
+        # FR17.3(a): capture_block_logits is observation-only on the stats
+        # contract too: the 17 contract keys stay unchanged and the capture
+        # key appears on top of them.
+        backend = _gp_backend(DV_STATS_SEED + 8)
+        prompt = _gp_prompt(DV_STATS_SEED + 9)
+
+        result = backend.generate(
+            prompt, GP_GEN, _gp_config(draft_mode=True), capture_block_logits=True
+        )
+
+        expected = set(DV_STATS_ALL_KEYS) | {"block_logits_per_round"}
+        assert set(result.stats.keys()) == expected
+
+
+class TestDraftVerifyStatsClosedForm:
+    def test_computed_rows_total_matches_seal_closed_form(self):
+        # FR17.3(b): computed_rows_total parses back from the per-block
+        # round counts and the fixpoint ledger: a fixpoint block
+        # (rounds_to_fixpoint != -1) seals with the KV of its confirming
+        # verify forward (seal 0 extra rows); a forced block
+        # (rounds_to_fixpoint == -1) pays one extra W-row sealing forward.
+        _, result = _dv_generate(DV_STATS_SEED + 10)
+        stats = result.stats
+        to_fixpoint, _ = _dv_assert_new_key_structure(stats, 8, "generate-draft-verify")
+        expected = sum(
+            GP_WIDTH * (rounds + (1 if to_fixpoint[b] == -1 else 0))
+            for b, rounds in enumerate(stats["rounds_per_block"])
+        )
+        assert stats["computed_rows_total"] == expected
+
+    def test_total_rounds_and_forced_completions_parse_back(self):
+        # FR17.3(b): total_rounds is the sum of the per-block round counts,
+        # and forced_completions counts exactly the blocks whose
+        # rounds_to_fixpoint entry is -1.
+        _, result = _dv_generate(DV_STATS_SEED + 12)
+        stats = result.stats
+        to_fixpoint, _ = _dv_assert_new_key_structure(stats, 8, "generate-draft-verify")
+        assert stats["total_rounds"] == sum(stats["rounds_per_block"])
+        assert stats["forced_completions"] == sum(1 for value in to_fixpoint if value == -1)
+
+    def test_kv_write_rows_total_is_prompt_plus_gen(self):
+        # FR17.3(b): draft-verify writes pages only at prefill (P rows)
+        # and at each block's sealing pass (W rows per block, G in total);
+        # draft and verify rounds only gather. Cross-checked against the
+        # page store append ledger.
+        backend, result = _dv_generate(DV_STATS_SEED + 14)
+        _dv_assert_new_key_structure(result.stats, 8, "generate-draft-verify")
+        assert result.stats["kv_write_rows_total"] == GP_PROMPT + GP_GEN
+        assert (
+            result.stats["kv_write_rows_total"] == backend.last_generate_stores[0].appended_tokens
+        )
+
+    def test_max_rounds_one_draft_only_anchor(self):
+        # FR17.3(b) structural anchor: with max_rounds=1 only the draft
+        # round exists, so every block is forced (rounds_to_fixpoint all
+        # -1), the final block equals its draft (nothing can replace it),
+        # the acceptance rate is exactly 1.0, each block's changed ledger
+        # is the single B*W draft fill, and every block pays one forced
+        # sealing forward (computed_rows == 2 * W * blocks).
+        _, result = _dv_generate(DV_STATS_SEED + 16, max_rounds=1)
+        stats = result.stats
+        blocks = stats["blocks"]
+        _dv_assert_new_key_structure(stats, 1, "generate-draft-verify")
+
+        assert stats["rounds_to_fixpoint"] == [-1] * blocks
+        assert stats["changed_per_round"] == [[GP_BATCH * GP_WIDTH]] * blocks
+        assert stats["draft_acceptance_rate"] == 1.0
+        assert stats["forced_completions"] == blocks
+        assert stats["total_rounds"] == blocks
+        assert stats["computed_rows_total"] == 2 * GP_WIDTH * blocks
+
+    @pytest.mark.parametrize("prompt_len,gen_len", DV_STATS_SCALES)
+    def test_max_rounds_two_acceptance_closed_form(self, prompt_len, gen_len):
+        # FR17.3(b) structural anchor: with max_rounds=2 every block runs
+        # draft + exactly one verify round, so the final block equals the
+        # draft except at the verify-replaced positions and
+        # acceptance == 1 - sum(changed_per_round[b][1]) / (B*W*blocks).
+        # A zero-replacement verify confirms the fixpoint
+        # (rounds_to_fixpoint == 2); any replacement leaves the block
+        # forced (-1). Toy-model convergence is not predicted: whichever
+        # branch each block takes, the relations must hold.
+        seed = DV_STATS_SEED + 18 + prompt_len
+        _, result = _dv_generate(seed, gen_len=gen_len, prompt_len=prompt_len, max_rounds=2)
+        stats = result.stats
+        blocks = stats["blocks"]
+        to_fixpoint, changed = _dv_assert_new_key_structure(stats, 2, "generate-draft-verify")
+
+        assert stats["rounds_per_block"] == [2] * blocks
+        total_positions = GP_BATCH * GP_WIDTH * blocks
+        expected_rate = 1.0 - sum(per_round[1] for per_round in changed) / total_positions
+        assert abs(stats["draft_acceptance_rate"] - expected_rate) <= 1e-9
+        for b in range(blocks):
+            if changed[b][1] == 0:
+                assert to_fixpoint[b] == 2
+            else:
+                assert to_fixpoint[b] == -1
+
+
+class TestMaskInitStatsNewKeysNone:
+    def test_mask_init_new_keys_present_and_none(self):
+        # FR17.3(c): the mask-init arm keeps the 17-key contract with the
+        # three draft-verify keys pinned to None -- threshold-gated
+        # scheduling has no draft, no verify round and no fixpoint notion.
+        _, result = _gp_generate(DV_STATS_SEED + 20)
+        _dv_assert_keyset(result.stats, "generate-mask-init")
+        for key in DV_STATS_NEW_KEYS:
+            assert (
+                result.stats[key] is None
+            ), f"generate-mask-init: stats[{key!r}] must be None in mask-init mode"
+
+    def test_mask_init_computed_rows_keeps_v318_closed_form(self):
+        # FR17.3(c): adding the three keys leaves the existing mask-init
+        # accounting untouched: every block still seals with one extra
+        # W-row forward, so computed_rows_total == sum(W * (rounds + 1)).
+        _, result = _gp_generate(DV_STATS_SEED + 22)
+        _dv_assert_keyset(result.stats, "generate-mask-init")
+        rounds = result.stats["rounds_per_block"]
+        expected = sum(GP_WIDTH * (rounds_j + 1) for rounds_j in rounds)
+        assert result.stats["computed_rows_total"] == expected
+
+
+class TestBaselineDraftVerifyStats:
+    def test_baseline_draft_verify_key_set_and_new_key_structure(self):
+        # FR17.3(d): the baseline arm shares the draft-verify statistics
+        # contract: the 17-key set with the three new keys populated and
+        # structurally identical to the generate arm's.
+        seed = DV_STATS_SEED + 24
+        prompt = _gp_prompt(seed + 1)
+        base_result = _dv_baseline(
+            _t5_direct_model(seed), prompt, GP_GEN, _gp_config(draft_mode=True)
+        )
+
+        _dv_assert_keyset(base_result.stats, "baseline-draft-verify")
+        _dv_assert_new_key_structure(base_result.stats, 8, "baseline-draft-verify")
+
+    def test_baseline_draft_verify_computed_rows_follow_recompute_formula(self):
+        # FR17.3(d): the recompute loop has no sealing concept: every round
+        # pays the full L_j + W rows, and no page store exists, so
+        # kv_write_rows_total stays 0 even in draft-verify mode.
+        seed = DV_STATS_SEED + 26
+        prompt = _gp_prompt(seed + 1)
+        base_result = _dv_baseline(
+            _t5_direct_model(seed), prompt, GP_GEN, _gp_config(draft_mode=True)
+        )
+        stats = base_result.stats
+        _dv_assert_new_key_structure(stats, 8, "baseline-draft-verify")
+
+        assert stats["kv_write_rows_total"] == 0
+        expected = sum(
+            rounds * (GP_PROMPT + b * GP_WIDTH + GP_WIDTH)
+            for b, rounds in enumerate(stats["rounds_per_block"])
+        )
+        assert stats["computed_rows_total"] == expected
+
+    def test_baseline_mask_init_new_keys_none(self):
+        # FR17.3(d): the baseline mask-init arm pins the three new keys to
+        # None exactly like the generate mask-init arm.
+        seed = DV_STATS_SEED + 28
+        prompt = _gp_prompt(seed + 1)
+        base_result = _dv_baseline(
+            _t5_direct_model(seed), prompt, GP_GEN, _gp_config(draft_mode=False)
+        )
+
+        _dv_assert_keyset(base_result.stats, "baseline-mask-init")
+        for key in DV_STATS_NEW_KEYS:
+            assert (
+                base_result.stats[key] is None
+            ), f"baseline-mask-init: stats[{key!r}] must be None in mask-init mode"

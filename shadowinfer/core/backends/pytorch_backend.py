@@ -836,6 +836,12 @@ class PyTorchModelBackend(ModelBackend):
         block_logits_per_round: List[List[torch.Tensor]] = []
         unmask_positions_per_round: List[List[torch.Tensor]] = []
         block_time_ms: List[float] = []
+        draft_accepted_positions = 0
+        rounds_to_fixpoint: Optional[List[int]] = None
+        changed_per_round: Optional[List[List[int]]] = None
+        if config.draft_mode:
+            rounds_to_fixpoint = []
+            changed_per_round = []
         start_time = time.perf_counter()
         prefix_len = prompt_len
         for _ in range(num_blocks):
@@ -850,6 +856,8 @@ class PyTorchModelBackend(ModelBackend):
             block_positions: List[torch.Tensor] = []
             seal_kv: Optional[List] = None
             if config.draft_mode:
+                block_changed: List[int] = []
+                draft_snapshot: Optional[torch.Tensor] = None
                 while True:
                     prefix_kv = {
                         layer_id: stores[layer_id].gather() for layer_id in range(num_layers)
@@ -863,8 +871,10 @@ class PyTorchModelBackend(ModelBackend):
                     if rounds == 1:
                         round_tokens, round_conf = draft_round(logits)
                         block_tokens.copy_(round_tokens)
+                        draft_snapshot = block_tokens.detach().clone()
                         round_unmasked = int(batch * width)
                         round_positions = torch.ones(batch, width, dtype=torch.bool)
+                        round_changed = int(batch * width)
                         fixpoint = False
                     else:
                         changed, round_tokens, round_conf = verify_round(logits, block_tokens)
@@ -873,10 +883,12 @@ class PyTorchModelBackend(ModelBackend):
                             block_tokens[changed] = round_tokens[changed]
                         round_unmasked = 0
                         round_positions = torch.zeros(batch, width, dtype=torch.bool)
+                        round_changed = int(changed.sum())
                     block_unmasked.append(round_unmasked)
                     block_fallback.append(False)
                     block_confidence.append(float(round_conf.mean()))
                     block_positions.append(round_positions)
+                    block_changed.append(round_changed)
                     if fixpoint:
                         seal_kv = kv
                         break
@@ -894,6 +906,9 @@ class PyTorchModelBackend(ModelBackend):
                 else:
                     seal_rounds.append(0)
                 block_kv = seal_kv
+                draft_accepted_positions += int((block_tokens == draft_snapshot).sum())
+                rounds_to_fixpoint.append(rounds if fixpoint else -1)
+                changed_per_round.append(block_changed)
             else:
                 masked = torch.ones(batch, width, dtype=torch.bool)
                 while bool(masked.any()) and rounds < config.max_rounds:
@@ -961,6 +976,13 @@ class PyTorchModelBackend(ModelBackend):
             "rows_saved_vs_baseline": rows_saved_vs_baseline,
             "unmask_positions_per_round": unmask_positions_per_round,
             "block_time_ms": block_time_ms,
+            "draft_acceptance_rate": (
+                draft_accepted_positions / float(batch * width * num_blocks)
+                if config.draft_mode
+                else None
+            ),
+            "rounds_to_fixpoint": rounds_to_fixpoint,
+            "changed_per_round": changed_per_round,
         }
         if capture_block_logits:
             stats["block_logits_per_round"] = block_logits_per_round
