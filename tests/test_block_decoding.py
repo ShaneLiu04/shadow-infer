@@ -458,14 +458,17 @@ class TestForwardBlockMatchesMaskedForwardStep:
         assert block_logits.shape == (FB_BATCH, FB_WIDTH, FB_VOCAB)
         # Attention matmul reduction-order noise only; not bitwise.
         assert _rel_l2(full_logits[:, FB_PREFIX:, :], block_logits) <= FB_TOL
-        # K/V projections are row-local and attention-independent: bitwise.
+        # K/V projections are row-local and attention-independent, but the
+        # projection matmul runs at M=FB_FULL vs M=FB_WIDTH, which can
+        # reorder the reduction in the last bit; compare them with the same
+        # quantified tolerance used for the logits above.
         for layer_id in range(FB_LAYERS):
             full_k, full_v = full_kv[layer_id]
             block_k, block_v = block_kv[layer_id]
             assert full_k.shape == (FB_BATCH, FB_HEADS, FB_FULL, FB_HEAD_DIM)
             assert block_k.shape == (FB_BATCH, FB_HEADS, FB_WIDTH, FB_HEAD_DIM)
-            assert torch.equal(full_k[:, :, FB_PREFIX:, :], block_k)
-            assert torch.equal(full_v[:, :, FB_PREFIX:, :], block_v)
+            assert _rel_l2(full_k[:, :, FB_PREFIX:, :], block_k) <= FB_TOL
+            assert _rel_l2(full_v[:, :, FB_PREFIX:, :], block_v) <= FB_TOL
 
     def test_prefix_len_zero_matches_unmasked_forward_step(self):
         # No prefix and no mask: forward_block degenerates to a plain
