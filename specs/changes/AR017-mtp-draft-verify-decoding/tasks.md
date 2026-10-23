@@ -18,7 +18,7 @@
 | T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | passing | 2026-10-23 完成；探针证要纯 Jacobi 不收敛 → 预注册 v1→v2 修订（用户确认，诚实口径）；四臂（+baseline-dv 锚点臂）；断言已跑前登记 bench-results.md §2 |
 | T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | passing | 2026-10-23 完成；四臂全量实跑，注册断言 v2 全 PASS（A1-A5 各 9/9）；玩具持平如实落档，性能主张转 s12 GPU |
 | T007 | s12 yaml + server-experiment.md + serve_arm.py `--mode` 扩展 + README 四检查点 + 版本 3.19.0 四处同步（FR17.5/17.6） | T006 | passing | 2026-10-23 完成；s12 前向兼容 AR018（model_weights 配置位预留）；1214 passed / 84.71% 实测数入 README |
-| T008 | 五件套质量门禁全量实跑（black/isort/flake8/mypy/pytest） | T007 | pending | 门槛：>= 1128 用例、>= 84.25%、1128 基线零回退 |
+| T008 | 五件套质量门禁全量实跑（black/isort/flake8/mypy/pytest） | T007 | passing | 2026-10-23 完成；1214 passed / 1 skipped / 84.71%（门槛 >= 1128 用例、>= 84.25% 均超）；1128 基线零回退 |
 
 ## 状态说明
 
@@ -87,6 +87,12 @@
 - README 四检查点：特性表 v3.19.0 行（机制 + 实测 + 诚实负结果 + GPU 协议主张口径）；基准节新增 v3.19.0 实测表（四臂，dv/mask 比中位 0.997-1.039x）+ 复现命令行；版本历史 v3.19.0 条目；TOC 零改动（无新增二级标题）
 - 版本 3.19.0 四处同步：pyproject.toml / `__init__.py` / `__main__.py` / `test_ffn_hotpath.py::test_ut17_version_strings_consistent`（单测通过）
 - 全量实跑（T008 前置取证）：1214 passed / 1 skipped / 84.71%（1128 基线 + 86 新增零回退，覆盖率 84.56% -> 84.71%）；black/isort/flake8/mypy 全绿
+
+### 2026-10-23 会话记录（T008）
+
+- 完成任务：T008 五件套质量门禁全量实跑（版本 3.19.0 同步后正式记录）
+- 实跑结果（全绿）：pytest **1214 passed / 1 skipped / 84.71%**（门槛 >= 1128 用例、>= 84.25% 覆盖率均超；1128 基线零回退 + 86 新增；耗时 7:44）；black 139 files unchanged；isort 通过（Skipped 22）；flake8 零告警；mypy Success（75 files）
+- 修改文件：无代码变更（门禁记录任务）
 
 ## 阶段门控记录
 
