@@ -30,6 +30,17 @@ round-and-fixpoint ledgers, the max_rounds=1 / max_rounds=2 structural
 anchors, the mask-init None-pinning of the new keys, and the baseline
 arm's recompute-semantics variants of the same contract.
 
+The T004 partition appended below pins the end-to-end draft-verify
+behavior (design 6.1 T004, FR17.1/17.2 acceptance): the fp32
+causal-time-invariance anchor -- the store-backed generate arm and the
+full-recompute baseline arm produce bit-identical sequences with
+identical per-block scheduling ledgers at two scales -- the convergence
+dichotomy of real forwards (every block either confirms a fixpoint with
+a zero-replacement final round or is force-sealed at the round budget
+with replacements still happening), the mixed-prompt batch completion
+with structural-only statistics, and the capture_block_logits round
+isomorphism in draft-verify mode.
+
 All tests use real tensors; nothing is mocked.
 """
 
@@ -49,9 +60,11 @@ from tests.test_block_decoding import (
     _gp_backend,
     _gp_config,
     _gp_generate,
+    _gp_in_vocab,
     _gp_is_int,
     _gp_model_config,
     _gp_prompt,
+    _t5_assert_bitwise_equal,
     _t5_direct_model,
 )
 
@@ -953,3 +966,193 @@ class TestBaselineDraftVerifyStats:
             assert (
                 base_result.stats[key] is None
             ), f"baseline-mask-init: stats[{key!r}] must be None in mask-init mode"
+
+
+# ---------------------------------------------------------------------------
+# T004: end-to-end draft-verify behavior (design 6.1 T004, FR17.1/17.2)
+# ---------------------------------------------------------------------------
+
+DV_E2E_SEED = 2801
+
+DV_E2E_SCALES = (
+    (DV_E2E_SEED, GP_PROMPT, GP_GEN),  # (P=6, G=8): two blocks
+    (DV_E2E_SEED + 6, 10, 16),  # (P=10, G=16): four blocks
+)
+
+
+class TestDraftVerifyTwoArmBitwiseAnchor:
+    @pytest.mark.parametrize("seed,prompt_len,gen_len", DV_E2E_SCALES)
+    def test_draft_verify_two_arm_bitwise_and_scheduling_anchor(self, seed, prompt_len, gen_len):
+        # Core FR17.1/17.2 acceptance: on the fp32 plane the store-backed
+        # generate arm and the full-recompute baseline arm are the same
+        # causal computation carried through different time layouts --
+        # same seeded model (_t5_direct_model mirrors backend.load), same
+        # prompt, draft_mode=True -- so the sequences must agree
+        # bit-for-bit and every scheduling decision (fixpoint round,
+        # per-round replacements, forced seal, round count) must be
+        # identical block by block.
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+        config = _gp_config(draft_mode=True)
+
+        gen_result = backend.generate(prompt, gen_len, config)
+        base_result = _dv_baseline(_t5_direct_model(seed), prompt, gen_len, config)
+
+        assert gen_result.sequences.shape == (GP_BATCH, prompt_len + gen_len)
+        assert torch.equal(gen_result.sequences[:, :prompt_len], prompt)
+        _t5_assert_bitwise_equal(gen_result.sequences, base_result.sequences, "generate-dv")
+
+        gen_stats = gen_result.stats
+        base_stats = base_result.stats
+        blocks = gen_len // GP_WIDTH
+        assert gen_stats["blocks"] == blocks == base_stats["blocks"]
+
+        assert gen_stats["rounds_to_fixpoint"] == base_stats["rounds_to_fixpoint"]
+        assert gen_stats["changed_per_round"] == base_stats["changed_per_round"]
+        assert gen_stats["forced_completions"] == base_stats["forced_completions"]
+        assert gen_stats["rounds_per_block"] == base_stats["rounds_per_block"]
+        assert gen_stats["draft_acceptance_rate"] == base_stats["draft_acceptance_rate"], (
+            f"draft_acceptance_rate generate={gen_stats['draft_acceptance_rate']} "
+            f"vs baseline={base_stats['draft_acceptance_rate']}"
+        )
+
+        for b in range(blocks):
+            assert gen_stats["rounds_to_fixpoint"][b] == base_stats["rounds_to_fixpoint"][b], (
+                f"block {b}: rounds_to_fixpoint generate="
+                f"{gen_stats['rounds_to_fixpoint'][b]} vs baseline="
+                f"{base_stats['rounds_to_fixpoint'][b]}"
+            )
+            assert gen_stats["changed_per_round"][b] == base_stats["changed_per_round"][b], (
+                f"block {b}: changed_per_round generate="
+                f"{gen_stats['changed_per_round'][b]} vs baseline="
+                f"{base_stats['changed_per_round'][b]}"
+            )
+
+
+class TestDraftVerifyConvergenceDichotomy:
+    @pytest.mark.parametrize("max_rounds", [2, 3])
+    @pytest.mark.parametrize("seed,prompt_len,gen_len", DV_E2E_SCALES)
+    def test_real_forwards_convergence_dichotomy(self, seed, prompt_len, gen_len, max_rounds):
+        # FR17.1/17.2 on real multi-block forwards: every block lands on
+        # exactly one side of the dichotomy -- either it confirms a
+        # fixpoint (rounds_to_fixpoint in [2, max_rounds], the confirming
+        # round replaces nothing) or the round budget force-seals it
+        # (rounds_to_fixpoint == -1, the final round still replaced
+        # something, forced_completions counts it). No fabricated
+        # trajectories: the toy model's concrete convergence counts are
+        # never pinned, only the dichotomy relations.
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+        config = _gp_config(draft_mode=True, max_rounds=max_rounds)
+
+        result = backend.generate(prompt, gen_len, config)
+
+        stats = result.stats
+        blocks = gen_len // GP_WIDTH
+        assert stats["blocks"] == blocks
+        to_fixpoint, changed = _dv_assert_new_key_structure(
+            stats, max_rounds, "generate-draft-verify"
+        )
+        rounds = stats["rounds_per_block"]
+        assert stats["forced_completions"] == sum(1 for value in to_fixpoint if value == -1)
+
+        for b in range(blocks):
+            assert (
+                rounds[b] <= max_rounds
+            ), f"block {b}: rounds_per_block {rounds[b]} exceeds budget {max_rounds}"
+            assert len(changed[b]) == rounds[b]
+            if to_fixpoint[b] != -1:
+                assert changed[b][-1] == 0, (
+                    f"block {b}: fixpoint confirmed at round {to_fixpoint[b]} "
+                    f"but the confirming round replaced {changed[b][-1]} positions"
+                )
+            else:
+                assert changed[b][-1] > 0, (
+                    f"block {b}: force-sealed at budget {max_rounds} but the "
+                    f"final round replaced {changed[b][-1]} positions"
+                )
+
+        generated = result.sequences[:, prompt_len:]
+        assert bool(((generated >= 0) & (generated < GP_VOCAB)).all())
+        assert not bool((generated == config.mask_token_id).any())
+
+    def test_default_budget_structure_only(self):
+        # max_rounds=8 default budget: only the structural invariants are
+        # asserted (rounds_to_fixpoint value domain, changed ledger
+        # lengths, mask-free generated region) -- never the toy model's
+        # concrete convergence round counts.
+        seed = DV_E2E_SEED + 10
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=10)
+        config = _gp_config(draft_mode=True)
+
+        result = backend.generate(prompt, 16, config)
+
+        stats = result.stats
+        assert stats["blocks"] == 16 // GP_WIDTH
+        to_fixpoint, changed = _dv_assert_new_key_structure(stats, 8, "generate-draft-verify")
+        rounds = stats["rounds_per_block"]
+        for b in range(stats["blocks"]):
+            assert to_fixpoint[b] == -1 or 2 <= to_fixpoint[b] <= 8
+            assert len(changed[b]) == rounds[b]
+        generated = result.sequences[:, 10:]
+        assert bool(((generated >= 0) & (generated < GP_VOCAB)).all())
+        assert not bool((generated == config.mask_token_id).any())
+
+
+class TestDraftVerifyBatchMixedPrompts:
+    def test_mixed_prompt_batch_completes_with_structural_stats(self):
+        # B=2 with two independently seeded prompt rows (clearly different
+        # content): draft-verify completes the whole batch with both rows
+        # in vocabulary and no mask residue. Batch-aggregated round counts
+        # are block-synchronized across elements, so per-element
+        # convergence trajectories are deliberately not asserted -- only
+        # the structural statistics contract.
+        seed = DV_E2E_SEED + 50
+        backend = _gp_backend(seed)
+        row_a = _gp_prompt(seed + 1, batch=1)
+        row_b = _gp_prompt(seed + 81, batch=1)
+        prompt = torch.cat([row_a, row_b], dim=0)
+        assert not torch.equal(prompt[0], prompt[1])
+        config = _gp_config(draft_mode=True)
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        assert _gp_in_vocab(result.sequences)
+        assert not bool((result.sequences[:, GP_PROMPT:] == config.mask_token_id).any())
+
+        stats = result.stats
+        _dv_assert_new_key_structure(stats, 8, "generate-draft-verify")
+        assert 0.0 <= stats["draft_acceptance_rate"] <= 1.0
+
+
+class TestDraftVerifyCaptureRounds:
+    def test_capture_block_logits_round_isomorphism(self):
+        # capture_block_logits in draft-verify mode: one [B, W, V] logits
+        # tensor per scheduled round per block, isomorphic to
+        # rounds_per_block (draft + verify rounds; the forced sealing
+        # forward is not a scheduled round and must not appear).
+        seed = DV_E2E_SEED + 60
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(draft_mode=True)
+
+        result = backend.generate(prompt, GP_GEN, config, capture_block_logits=True)
+
+        stats = result.stats
+        blocks = stats["blocks"]
+        rounds = stats["rounds_per_block"]
+        captured = stats["block_logits_per_round"]
+        assert isinstance(captured, list)
+        assert len(captured) == blocks
+        for b in range(blocks):
+            assert isinstance(captured[b], list)
+            assert len(captured[b]) == rounds[b], (
+                f"block {b}: captured {len(captured[b])} logits tensors "
+                f"for {rounds[b]} scheduled rounds"
+            )
+            for logits in captured[b]:
+                assert isinstance(logits, torch.Tensor)
+                assert logits.shape == (GP_BATCH, GP_WIDTH, GP_VOCAB)
