@@ -15,7 +15,7 @@
 | T002 | backend `generate` draft_mode 分支 + `blockwise_generate_baseline` draft_mode 分支（决策等价参考臂）：页驻留协同（轮间零页写、封存一次 append / 定点 KV 复用零封存前向）、进度保证、fail-fast 共存、默认路径逐位回归锚点（FR17.2） | T001 | passing | 2026-10-23 完成；29 UT；seal_rounds 记账统一两模式 computed_rows 公式 |
 | T003 | 统计扩展：draft_acceptance_rate / changed_per_round / rounds_to_fixpoint；两模式 17 键集一致 + 闭式回代（FR17.3） | T002 | passing | 2026-10-23 完成；18 UT；changed 口径 batch 聚合（design 4.3 已同步修订） |
 | T004 | e2e 行为测试：draft-verify 正常完成（多块/多规模/B=2）、页驻留取证、batch 独立收敛、退化输入（FR17.1/17.2 验收） | T002 | passing | 2026-10-23 完成；9 UT；两臂 bitwise 锚点实测成立 |
-| T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | pending | 探针不入库；断言跑前登记 bench-results.md |
+| T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | passing | 2026-10-23 完成；探针证要纯 Jacobi 不收敛 → 预注册 v1→v2 修订（用户确认，诚实口径）；四臂（+baseline-dv 锚点臂）；断言已跑前登记 bench-results.md §2 |
 | T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | pending | >= 1.5x / >= 2x / >= 90% 预注册口径；未达标如实报告 |
 | T007 | s12 yaml + server-experiment.md + serve_arm.py `--mode` 扩展 + README 四检查点 + 版本 3.19.0 四处同步（FR17.5/17.6） | T006 | pending | s12 前向兼容 AR018（model_weights 配置位预留） |
 | T008 | 五件套质量门禁全量实跑（black/isort/flake8/mypy/pytest） | T007 | pending | 门槛：>= 1128 用例、>= 84.25%、1128 基线零回退 |
@@ -62,6 +62,14 @@
 - 收敛二分性（真实前向）：max_rounds∈{2,3} 每块 rtf∈{-1}∪[2,max]；定点块末轮 changed==0、forced 块末轮 changed>0、forced_completions == -1 块数；capture 逐块同构（len == rounds_per_block，形状 [B,W,V]）
 - 夹具陷阱记录：mask_token_id=0 兼作词表 token 0——「生成区无 mask_token_id」断言在草拟可合法产出 token 0 时种子依赖（P=10 规模 seed 2803/2841 触发）；测试种子已固化干净值（2807/2811）。「无 MASK 残留」的真正结构保证是 draft_round 的 copy_ 全填充，非 token 值观测
 - 验证：全文件 86 passed；black/isort/flake8 全绿（既有 77 用例零改动）
+
+### 2026-10-23 会话记录（T005）
+
+- 完成任务：T005 基准脚本 + 校准探针 + 预注册修订与断言登记（主代理直做，探针为校准性质）
+- 校准探针（临时脚本，不入库）：probe1 实测 threshold=0.9 下 mask-init 与 draft-verify 均 8 轮+1 封存=9 前向/块持平，draft-verify 全块 forced 不定点，acceptance 0.039-0.086（cap=8/16）；probe2 实测 changed 逐轮轨迹呈 62-97% 震荡平台、不衰减、块宽不敏感（W∈{8,16,32} 全 forced）——随机权重模型无稳定 argmax 不动点，纯 Jacobi 收益 contingent 于真实预训练权重（Fast-dLLM/Jacobi 文献证据全部来自预训练模型）
+- **预注册修订 v1→v2（用户 2026-10-23 确认诚实口径）**：v1 门槛（1.5x/2x/90%）机理不可达；v2 注册 A1 两臂 bitwise / A2 调度整表一致 / A3 零回退界 <=1.2x / A4 坏草稿拒收 acceptance <=0.25 / A5 闭式记账（rows/forced/kv）；性能主张转入 s12 GPU 协议（服务器场地断言，需 AR018 真实权重）。修订史落档 bench-results.md §1.3 + design.md §6.5 erratum + srs.md §3.4 修订记录
+- 修改文件：`ar017_bench.py`（四臂：baseline / baseline-dv / mask-init paged / draft-verify paged；probe 模式 + 注册断言 v2 内置；阈值敏感性 0.005 report-only）、`bench-results.md`（新建：探针数据 + 修订史 + 断言跑前登记）、`design.md`（§6.5 erratum）、`srs.md`（§3.4 修订记录）
+- 探针冒烟（G=192 seed=0，未注册）：A1/A2 锚点成立（bitwise_vs_base-dv=True, schedule_match=True）；ratio_vs_mask=0.895x；accept=0.0651；A5 闭式全 True（kv=256=P+G）；plateau=(0.734, 1.0)；agree_vs_mask=0.3027（随机水平，report-only）
 
 ## 阶段门控记录
 

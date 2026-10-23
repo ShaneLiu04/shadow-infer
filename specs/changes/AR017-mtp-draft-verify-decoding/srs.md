@@ -130,6 +130,7 @@
 - 指标：端到端时间、每块轮数（`rounds_per_block`/`rounds_to_fixpoint`）、`draft_acceptance_rate`、draft-verify vs mask-init token 一致率、vs baseline 一致率、computed_rows、kv_write_rows；
 - **校准先行**（AR015/016 纪律）：正式断言登记前跑校准探针（不入库），按实测固化阈值（裕量 >= 20%），断言集跑前登记于 bench-results.md；
 - 预注册门槛（用户确认口径，探针后修订需落档）：draft-verify vs mask-init 端到端 **>= 1.5x**（threshold=0.9）、每块轮数削减 **>= 2x**、token 一致率 **>= 90%**；未达标如实报告（三轮预注册历史模式沿用）。
+- **修订记录（2026-10-23，v1 → v2，用户确认）**：校准探针证实随机权重玩具模型上纯 Jacobi 不收敛（震荡平台 62-97% 不衰减、块宽不敏感），v1 三门槛机理不可达；注册断言修订为诚实口径（精确性锚点 + 零回退界 <= 1.2x + 坏草稿拒收 + 结构记账），性能主张转入 s12 GPU 协议（服务器场地断言，需 AR018 真实权重）。完整修订史见 bench-results.md §1.3/§2 与 design.md §6.5 erratum。
 
 **验收标准：**
 - Given 三臂全量实跑，When 按登记口径判定，Then 全部注册断言按登记阈值判定并逐 seed 落档（未达标如实标注不构成隐藏）；

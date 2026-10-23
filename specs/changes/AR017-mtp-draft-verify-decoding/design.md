@@ -242,3 +242,15 @@ configs/experiments/
 - 指标：三臂端到端时间、mask-init vs draft-verify 每块轮数（rounds_per_block / rounds_to_fixpoint）、draft_acceptance_rate、draft-verify vs mask-init token 一致率、draft-verify vs baseline 一致率、computed_rows、kv_write_rows；
 - **校准先行**（AR015/016 纪律）：正式断言登记前跑校准探针（不入库），按实测固化阈值（裕量 >= 20%），断言集跑前登记于 bench-results.md；
 - 预注册门槛（srs 用户确认口径，探针后修订需落档）：draft-verify vs mask-init 端到端 >= 1.5x（threshold=0.9）、每块轮数削减 >= 2x、token 一致率 >= 90%；未达标如实报告（三轮预注册历史模式沿用）。
+
+**§6.5 erratum（2026-10-23，预注册修订 v1 → v2）**：校准探针（probe1/probe2）证实
+随机权重玩具模型上纯 Jacobi draft-verify 不收敛——changed 逐轮轨迹呈 62-97% 震荡
+平台、不衰减、块宽不敏感（W∈{8,16,32} 全 forced），mask-init 与 draft-verify 均
+9 前向/块持平，v1 三门槛（1.5x / 2x / 90%）机理不可达；MTP 轮数收益 contingent
+于真实预训练模型草稿质量（Fast-dLLM/Jacobi 文献证据全部来自预训练模型）。经用户
+确认转向诚实口径：注册断言修订为**精确性锚点（两臂 bitwise + 调度整表一致）+
+零回退界（<= 1.2x）+ 坏草稿拒收（acceptance <= 0.25）+ 结构记账闭式**四类；
+性能主张（1.5x/2x/90%）**转入 s12 GPU 协议作为服务器场地断言**（需 AR018 真实
+dLLM 权重）。完整修订史与注册断言表见 bench-results.md §1.3/§2；基准臂由三臂
+细化为四臂（+baseline-dv 决策等价参考臂，为 A1/A2 锚点服务，FR17.2 已定义该
+分支）。
