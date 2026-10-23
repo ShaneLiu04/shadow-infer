@@ -16,7 +16,7 @@
 | T003 | 统计扩展：draft_acceptance_rate / changed_per_round / rounds_to_fixpoint；两模式 17 键集一致 + 闭式回代（FR17.3） | T002 | passing | 2026-10-23 完成；18 UT；changed 口径 batch 聚合（design 4.3 已同步修订） |
 | T004 | e2e 行为测试：draft-verify 正常完成（多块/多规模/B=2）、页驻留取证、batch 独立收敛、退化输入（FR17.1/17.2 验收） | T002 | passing | 2026-10-23 完成；9 UT；两臂 bitwise 锚点实测成立 |
 | T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | passing | 2026-10-23 完成；探针证要纯 Jacobi 不收敛 → 预注册 v1→v2 修订（用户确认，诚实口径）；四臂（+baseline-dv 锚点臂）；断言已跑前登记 bench-results.md §2 |
-| T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | pending | >= 1.5x / >= 2x / >= 90% 预注册口径；未达标如实报告 |
+| T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | passing | 2026-10-23 完成；四臂全量实跑，注册断言 v2 全 PASS（A1-A5 各 9/9）；玩具持平如实落档，性能主张转 s12 GPU |
 | T007 | s12 yaml + server-experiment.md + serve_arm.py `--mode` 扩展 + README 四检查点 + 版本 3.19.0 四处同步（FR17.5/17.6） | T006 | pending | s12 前向兼容 AR018（model_weights 配置位预留） |
 | T008 | 五件套质量门禁全量实跑（black/isort/flake8/mypy/pytest） | T007 | pending | 门槛：>= 1128 用例、>= 84.25%、1128 基线零回退 |
 
@@ -70,6 +70,13 @@
 - **预注册修订 v1→v2（用户 2026-10-23 确认诚实口径）**：v1 门槛（1.5x/2x/90%）机理不可达；v2 注册 A1 两臂 bitwise / A2 调度整表一致 / A3 零回退界 <=1.2x / A4 坏草稿拒收 acceptance <=0.25 / A5 闭式记账（rows/forced/kv）；性能主张转入 s12 GPU 协议（服务器场地断言，需 AR018 真实权重）。修订史落档 bench-results.md §1.3 + design.md §6.5 erratum + srs.md §3.4 修订记录
 - 修改文件：`ar017_bench.py`（四臂：baseline / baseline-dv / mask-init paged / draft-verify paged；probe 模式 + 注册断言 v2 内置；阈值敏感性 0.005 report-only）、`bench-results.md`（新建：探针数据 + 修订史 + 断言跑前登记）、`design.md`（§6.5 erratum）、`srs.md`（§3.4 修订记录）
 - 探针冒烟（G=192 seed=0，未注册）：A1/A2 锚点成立（bitwise_vs_base-dv=True, schedule_match=True）；ratio_vs_mask=0.895x；accept=0.0651；A5 闭式全 True（kv=256=P+G）；plateau=(0.734, 1.0)；agree_vs_mask=0.3027（随机水平，report-only）
+
+### 2026-10-23 会话记录（T006）
+
+- 完成任务：T006 四臂全量实跑 + 逐 seed 落档 + 判定（主代理直做）
+- 实跑结果：**注册断言 v2 全部 PASS（45/45 检查，A1-A5 各 9/9）**——A1 两臂 bitwise 9/9、A2 调度整表一致 9/9、A3 零回退界（区间 0.921-1.169x，中位 ~1.0x）9/9、A4 坏草稿拒收（acceptance 0.0424-0.0651）9/9、A5 闭式记账（rows/forced/kv）27/27
+- 诚实结论落档 bench-results.md §3：玩具上 draft-verify 与 mask-init 端到端持平（结构预测 9=9 前向/块实测成立）、轮数无削减；根因 = 随机权重无稳定 argmax 不动点；性能主张（1.5x/2x/90%）转 s12 GPU 协议服务器场地断言（需 AR018）；mask-init vs baseline bitwise 9/9 复核（AR016 锚点 0.9 口径）；threshold=0.005 敏感性点结构同型（结论阈值无关）
+- 修改文件：`bench-results.md`（§3 全量结果 + §3.5 诚实结论与 README 引用口径）
 
 ## 阶段门控记录
 

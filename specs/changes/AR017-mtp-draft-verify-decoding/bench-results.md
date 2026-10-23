@@ -79,6 +79,74 @@ B=2，W=32，P=64，max_rounds=8，page_size=32，(L,H,D)=(8,8,64)，vocab=1000�
 （玩具持平，无收益可注册）；轮数削减（同）；token 一致率 vs mask-init（玩具无
 语义，随机水平）。
 
-## 3. 全量实跑结果
+## 3. 全量实跑结果（v2 判据，3 seeds x 3 规模 x 4 臂，2026-10-23）
 
-（T006 实跑后落档）
+注册配置实跑（threshold=0.9），**全部注册断言 PASS**（A1-A5 各 9/9）。复现命令：
+`$env:PYTHONPATH='D:\ShadowInfer'; python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py`。
+
+### 3.1 逐 seed 原始数据（draft-verify paged 臂为主）
+
+| G | seed | baseline | baseline-dv | mask-init | draft-verify | dv/mask 比 | accept | bitwise vs base-dv | schedule 一致 |
+|---|---|---|---|---|---|---|---|---|---|
+| 192 | 0 | 15.135s | 13.593s | 5.414s | 5.624s | 1.039x | 0.0651 | True | True |
+| 192 | 1 | 13.674s | 13.622s | 5.780s | 5.688s | 0.984x | 0.0521 | True | True |
+| 192 | 2 | 14.903s | 14.421s | 5.800s | 6.411s | 1.105x | 0.0495 | True | True |
+| 448 | 0 | 56.930s | 59.363s | 14.473s | 13.846s | 0.957x | 0.0547 | True | True |
+| 448 | 1 | 41.569s | 39.097s | 13.123s | 15.336s | 1.169x | 0.0513 | True | True |
+| 448 | 2 | 61.714s | 59.990s | 15.181s | 15.133s | 0.997x | 0.0424 | True | True |
+| 960 | 0 | 286.618s | 288.163s | 36.725s | 36.852s | 1.003x | 0.0573 | True | True |
+| 960 | 1 | 288.702s | 247.865s | 30.945s | 36.009s | 1.164x | 0.0531 | True | True |
+| 960 | 2 | 308.880s | 322.599s | 44.646s | 41.116s | 0.921x | 0.0490 | True | True |
+
+结构统计（9 点全部一致，确定性）：每块 rounds=8、forced=块数（6/14/30）、
+computed_rows == W×9×blocks（1728/4032/8640，闭式回代 True）、
+kv_write_rows == P+G（256/512/1024）、forced == #{rtf==-1}（True）；
+mask-init paged 臂 bitwise vs baseline 9/9 True（AR016 锚点在 0.9 口径复核）。
+
+### 3.2 逐规模中位数（report-only）
+
+| 指标 | G=192 (S=256) | G=448 (S=512) | G=960 (S=1024) |
+|---|---|---|---|
+| baseline 中位耗时 | 14.903s | 56.930s | 288.702s |
+| baseline-dv 中位耗时 | 13.622s | 59.363s | 288.163s |
+| mask-init paged 中位 | 5.780s | 14.473s | 36.725s |
+| draft-verify paged 中位 | 5.688s | 15.133s | 36.852s |
+| dv/mask 比中位（区间） | 1.039x (0.984-1.105) | 0.997x (0.957-1.169) | 1.003x (0.921-1.164) |
+| acceptance 区间 | [0.0495, 0.0651] | [0.0424, 0.0547] | [0.0490, 0.0573] |
+
+### 3.3 断言判定汇总
+
+A1（两臂 bitwise）: 9/9 PASS；A2（调度整表一致）: 9/9 PASS（mismatched 恒空）；
+A3（零回退界 <= 1.2x）: 9/9 PASS（实测区间 0.921-1.169x，中位 ~1.0x 持平，
+符合探针结构性预测：两臂均 9 前向/块）；A4（坏草稿拒收 <= 0.25）: 9/9 PASS
+（实测 0.0424-0.0651，自一致校验持续替换低质草稿而非锁定）；A5（闭式记账）:
+27/27 逐点 PASS（rows/forced/kv 三式确定性成立）。
+
+### 3.4 震荡特征与一致率（A6，report-only）
+
+- changed 逐轮平台区间（验证轮，全部 9 点）：0.672 - 1.0（首验证轮恒 1.0，末轮
+  0.672-0.969）；forced 块占比 100%（54/54 块，纯 Jacobi 全不定点）；
+- draft-verify vs mask-init token 一致率：0.108-0.303（随机权重下两模式收敛到
+  不同终态，无语义可比性；v1 >= 90% 门槛撤回依据之一）；
+- threshold=0.005 敏感性点（G=192 seed 0）：结构与 0.9 完全同型（两臂 8 轮/块、
+  forced 6/6、accept 0.0651、bitwise/schedule/closed-form 全 True）——阈值不
+  影响 draft-verify（threshold 仅作用于 mask-init 调度），两臂持平结论阈值无关。
+
+### 3.5 诚实结论与 README 引用口径
+
+- **精确性**：draft-verify paged vs 全量重算参考臂 tokens 逐位一致 + 调度统计
+  整表相等（9/9 点，fp32，段因果时间不变性在草拟-验证调度下保持）；KV 行写
+  一次零重写（P+G 恰好）；闭式记账（rows/forced/kv）确定性成立
+- **玩具性能（如实）**：随机权重玩具上 draft-verify 与 mask-init 端到端持平
+  （中位比 1.00-1.04x，区间 0.92-1.17x），每块轮数无削减（均 8 轮 + 1 封存）；
+  根因 = 随机权重无稳定 argmax 不动点（震荡平台 0.67-1.0 不衰减，W∈{8,16,32}
+  与 cap∈{8,16} 均不定点），MTP 轮数削减收益 contingent 于真实预训练模型草稿
+  质量（Fast-dLLM/Jacobi 文献证据全部来自预训练模型）
+- **机制有效性证据**：自一致校验正确拒收低质草稿（acceptance 0.042-0.065，
+  持续替换而非错误锁定）；进度保证结构成立（草拟后块内恒无 MASK，封存必然
+  可完成）；定点 KV 复用路径经 UT 验证（定点块零封存前向）
+- **GPU 主张（s12 协议，服务器场地断言，需 AR018 真实权重）**：draft-verify vs
+  mask-init 端到端 >= 1.5x、每块轮数削减 >= 2x、token 一致率 >= 90%——本机
+  不宣称，README 以「机制说明 + 玩具实测持平（负结果如实标注）+ GPU 协议
+  主张」口径描述
+
