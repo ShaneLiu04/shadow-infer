@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import torch
 
@@ -34,6 +34,7 @@ class BlockDecodingConfig:
     mask_token_id: int = 0
     page_size: int = 32
     page_precision: str = "fp32"
+    draft_mode: bool = False
 
     def validate(self) -> None:
         if self.block_size < 1:
@@ -50,6 +51,8 @@ class BlockDecodingConfig:
             raise ValueError(
                 f"page_precision must be one of {PAGE_PRECISIONS}, got {self.page_precision}"
             )
+        if not isinstance(self.draft_mode, bool):
+            raise ValueError(f"draft_mode must be a bool, got {type(self.draft_mode).__name__}")
 
     def __post_init__(self) -> None:
         self.validate()
@@ -124,6 +127,81 @@ def schedule_round(
         confidences=retained_confidences,
         progress_fallback=needs_fallback,
     )
+
+
+def _validate_block_logits(logits_block: torch.Tensor, width: int) -> None:
+    """Shared shape/degenerate validation for draft/verify rounds (FR17.1)."""
+    if logits_block.dim() != 3:
+        raise ValueError(f"logits_block must be 3-D [B, W, V], got dim={logits_block.dim()}")
+    if width < 1:
+        raise ValueError(f"block width must be >= 1, got {width}")
+
+
+def draft_round(logits_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Draft every position of a block in parallel (AR017, FR17.1).
+
+    The round-0 forward runs on the all-MASK block; the draft fills the
+    whole block with the per-position argmax token in one shot, so no
+    mask token survives the draft (structural progress guarantee).
+
+    Args:
+        logits_block: [B, W, V] position-wise logits under MASK conditioning.
+
+    Returns:
+        (tokens, confidences): ``tokens`` is the [B, W] int64 argmax fill;
+        ``confidences`` is the [B, W] max softmax probability per position.
+
+    Raises:
+        ValueError: If ``logits_block`` is not 3-D or has zero width.
+    """
+    _validate_block_logits(logits_block, int(logits_block.shape[1]))
+    probs = torch.softmax(logits_block, dim=-1)
+    confidences, tokens = probs.max(dim=-1)
+    return tokens.long(), confidences
+
+
+def verify_round(
+    logits_block: torch.Tensor,
+    block_tokens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Verify self-consistency of the drafted block (AR017, FR17.1).
+
+    A position is self-consistent when the fresh argmax equals its current
+    token; inconsistent positions are flagged in ``changed`` and should be
+    replaced with the fresh argmax by the caller (monotone substitution,
+    no re-masking). Batch elements are judged independently.
+
+    Args:
+        logits_block: [B, W, V] position-wise logits under the current
+            (fully drafted) block state.
+        block_tokens: [B, W] integer current block tokens.
+
+    Returns:
+        (changed, tokens, confidences): ``changed`` is the [B, W] bool mask
+        marking positions whose argmax differs from the current token;
+        ``tokens`` is the [B, W] int64 argmax for every position (callers
+        consume only the ``changed`` entries); ``confidences`` is the
+        [B, W] max softmax probability per position.
+
+    Raises:
+        ValueError: If ``logits_block`` is not 3-D or has zero width,
+            ``block_tokens`` is not 2-D, its shape does not match the
+            logits leading shape, or its dtype is not integer.
+    """
+    _validate_block_logits(logits_block, int(logits_block.shape[1]))
+    if block_tokens.dim() != 2:
+        raise ValueError(f"block_tokens must be 2-D [B, W], got dim={block_tokens.dim()}")
+    if block_tokens.shape != logits_block.shape[:2]:
+        raise ValueError(
+            f"block_tokens must be [B, W] matching logits_block leading shape "
+            f"{tuple(logits_block.shape[:2])}, got {tuple(block_tokens.shape)}"
+        )
+    if block_tokens.dtype not in (torch.long, torch.int):
+        raise ValueError(f"block_tokens must be integer token ids, got dtype={block_tokens.dtype}")
+    probs = torch.softmax(logits_block, dim=-1)
+    confidences, tokens = probs.max(dim=-1)
+    changed = tokens != block_tokens
+    return changed, tokens.long(), confidences
 
 
 @dataclass
