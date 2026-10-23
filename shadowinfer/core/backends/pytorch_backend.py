@@ -14,8 +14,10 @@ from shadowinfer.core.structs import KVCacheEntry, StepConfig
 from shadowinfer.execution.block_decoding import (
     BlockDecodingConfig,
     GenerateResult,
+    draft_round,
     schedule_round,
     validate_generate_inputs,
+    verify_round,
 )
 from shadowinfer.execution.macro_mode import MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import StepReuseConfig, StepReuseState
@@ -827,6 +829,7 @@ class PyTorchModelBackend(ModelBackend):
 
         forced_completions = 0
         rounds_per_block: List[int] = []
+        seal_rounds: List[int] = []
         unmasked_per_round: List[List[int]] = []
         fallback_per_round: List[List[bool]] = []
         mean_confidence_per_round: List[List[float]] = []
@@ -838,7 +841,6 @@ class PyTorchModelBackend(ModelBackend):
         for _ in range(num_blocks):
             block_start = time.perf_counter()
             block_tokens = sequences[:, prefix_len : prefix_len + width]
-            masked = torch.ones(batch, width, dtype=torch.bool)
             rounds = 0
             logits: Optional[torch.Tensor] = None
             block_unmasked: List[int] = []
@@ -846,32 +848,83 @@ class PyTorchModelBackend(ModelBackend):
             block_confidence: List[float] = []
             captured_rounds: List[torch.Tensor] = []
             block_positions: List[torch.Tensor] = []
-            while bool(masked.any()) and rounds < config.max_rounds:
+            seal_kv: Optional[List] = None
+            if config.draft_mode:
+                while True:
+                    prefix_kv = {
+                        layer_id: stores[layer_id].gather() for layer_id in range(num_layers)
+                    }
+                    logits, kv = model.forward_block(
+                        block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
+                    )
+                    rounds += 1
+                    if capture_block_logits:
+                        captured_rounds.append(logits.detach().clone())
+                    if rounds == 1:
+                        round_tokens, round_conf = draft_round(logits)
+                        block_tokens.copy_(round_tokens)
+                        round_unmasked = int(batch * width)
+                        round_positions = torch.ones(batch, width, dtype=torch.bool)
+                        fixpoint = False
+                    else:
+                        changed, round_tokens, round_conf = verify_round(logits, block_tokens)
+                        fixpoint = int(changed.sum()) == 0
+                        if not fixpoint:
+                            block_tokens[changed] = round_tokens[changed]
+                        round_unmasked = 0
+                        round_positions = torch.zeros(batch, width, dtype=torch.bool)
+                    block_unmasked.append(round_unmasked)
+                    block_fallback.append(False)
+                    block_confidence.append(float(round_conf.mean()))
+                    block_positions.append(round_positions)
+                    if fixpoint:
+                        seal_kv = kv
+                        break
+                    if rounds >= config.max_rounds:
+                        break
+                if seal_kv is None:
+                    forced_completions += 1
+                    prefix_kv = {
+                        layer_id: stores[layer_id].gather() for layer_id in range(num_layers)
+                    }
+                    _, seal_kv = model.forward_block(
+                        block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
+                    )
+                    seal_rounds.append(1)
+                else:
+                    seal_rounds.append(0)
+                block_kv = seal_kv
+            else:
+                masked = torch.ones(batch, width, dtype=torch.bool)
+                while bool(masked.any()) and rounds < config.max_rounds:
+                    prefix_kv = {
+                        layer_id: stores[layer_id].gather() for layer_id in range(num_layers)
+                    }
+                    logits, _ = model.forward_block(
+                        block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
+                    )
+                    decision = schedule_round(logits, masked, config)
+                    block_tokens[decision.unmask] = decision.tokens[decision.unmask]
+                    masked &= ~decision.unmask
+                    block_unmasked.append(int(decision.unmask.sum()))
+                    block_fallback.append(bool(decision.progress_fallback.any()))
+                    round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
+                    block_confidence.append(float(round_confidence[decision.unmask].mean()))
+                    if capture_block_logits:
+                        captured_rounds.append(logits.detach().clone())
+                    block_positions.append(decision.unmask.detach().clone())
+                    rounds += 1
+                if bool(masked.any()):
+                    remaining = logits.argmax(dim=-1) if logits is not None else None
+                    if remaining is None:
+                        raise RuntimeError("forced completion requires computed logits")
+                    block_tokens[masked] = remaining[masked]
+                    forced_completions += 1
                 prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
-                logits, _ = model.forward_block(
+                _, block_kv = model.forward_block(
                     block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
                 )
-                decision = schedule_round(logits, masked, config)
-                block_tokens[decision.unmask] = decision.tokens[decision.unmask]
-                masked &= ~decision.unmask
-                block_unmasked.append(int(decision.unmask.sum()))
-                block_fallback.append(bool(decision.progress_fallback.any()))
-                round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
-                block_confidence.append(float(round_confidence[decision.unmask].mean()))
-                if capture_block_logits:
-                    captured_rounds.append(logits.detach().clone())
-                block_positions.append(decision.unmask.detach().clone())
-                rounds += 1
-            if bool(masked.any()):
-                remaining = logits.argmax(dim=-1) if logits is not None else None
-                if remaining is None:
-                    raise RuntimeError("forced completion requires computed logits")
-                block_tokens[masked] = remaining[masked]
-                forced_completions += 1
-            prefix_kv = {layer_id: stores[layer_id].gather() for layer_id in range(num_layers)}
-            _, block_kv = model.forward_block(
-                block_tokens, prefix_kv, prefix_len, step_t=0, total_steps=0
-            )
+                seal_rounds.append(1)
             for layer_id in range(num_layers):
                 k, v = block_kv[layer_id]
                 stores[layer_id].append(k, v, config.page_precision)
@@ -886,10 +939,12 @@ class PyTorchModelBackend(ModelBackend):
             prefix_len += width
         total_time_ms = (time.perf_counter() - start_time) * 1000.0
 
-        computed_rows_total = sum(width * (rounds + 1) for rounds in rounds_per_block)
+        computed_rows_total = sum(
+            width * (rounds + seal) for rounds, seal in zip(rounds_per_block, seal_rounds)
+        )
         rows_saved_vs_baseline = sum(
-            rounds * (prompt_len + block_index * width + width) - width * (rounds + 1)
-            for block_index, rounds in enumerate(rounds_per_block)
+            rounds * (prompt_len + block_index * width + width) - width * (rounds + seal)
+            for block_index, (rounds, seal) in enumerate(zip(rounds_per_block, seal_rounds))
         )
         stats: Dict[str, object] = {
             "blocks": num_blocks,

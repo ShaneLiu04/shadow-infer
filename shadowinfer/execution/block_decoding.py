@@ -400,7 +400,6 @@ def blockwise_generate_baseline(
     for _ in range(num_blocks):
         block_start = time.perf_counter()
         block_tokens = sequences[:, prefix_len : prefix_len + width]
-        masked = torch.ones(batch, width, dtype=torch.bool)
         rounds = 0
         logits: torch.Tensor = torch.empty(0)
         block_unmasked: list = []
@@ -408,26 +407,59 @@ def blockwise_generate_baseline(
         block_confidence: list = []
         captured_rounds: list = []
         block_positions: list = []
-        while bool(masked.any()) and rounds < config.max_rounds:
-            full_ids = sequences[:, : prefix_len + width]
-            mask = segment_causal_mask(prefix_len + width, prompt_len, width, sequences.device)
-            full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
-            logits = full_logits[:, prefix_len:]
-            decision = schedule_round(logits, masked, config)
-            block_tokens[decision.unmask] = decision.tokens[decision.unmask]
-            masked &= ~decision.unmask
-            block_unmasked.append(int(decision.unmask.sum()))
-            block_fallback.append(bool(decision.progress_fallback.any()))
-            round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
-            block_confidence.append(float(round_confidence[decision.unmask].mean()))
-            if capture_block_logits:
-                captured_rounds.append(logits.detach().clone())
-            block_positions.append(decision.unmask.detach().clone())
-            rounds += 1
-        if bool(masked.any()):
-            remaining = logits.argmax(dim=-1)
-            block_tokens[masked] = remaining[masked]
-            forced_completions += 1
+        if config.draft_mode:
+            while True:
+                full_ids = sequences[:, : prefix_len + width]
+                mask = segment_causal_mask(prefix_len + width, prompt_len, width, sequences.device)
+                full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+                logits = full_logits[:, prefix_len:]
+                rounds += 1
+                if capture_block_logits:
+                    captured_rounds.append(logits.detach().clone())
+                if rounds == 1:
+                    round_tokens, round_conf = draft_round(logits)
+                    block_tokens.copy_(round_tokens)
+                    round_unmasked = int(batch * width)
+                    round_positions = torch.ones(batch, width, dtype=torch.bool)
+                    fixpoint = False
+                else:
+                    changed, round_tokens, round_conf = verify_round(logits, block_tokens)
+                    fixpoint = int(changed.sum()) == 0
+                    if not fixpoint:
+                        block_tokens[changed] = round_tokens[changed]
+                    round_unmasked = 0
+                    round_positions = torch.zeros(batch, width, dtype=torch.bool)
+                block_unmasked.append(round_unmasked)
+                block_fallback.append(False)
+                block_confidence.append(float(round_conf.mean()))
+                block_positions.append(round_positions)
+                if fixpoint:
+                    break
+                if rounds >= config.max_rounds:
+                    forced_completions += 1
+                    break
+        else:
+            masked = torch.ones(batch, width, dtype=torch.bool)
+            while bool(masked.any()) and rounds < config.max_rounds:
+                full_ids = sequences[:, : prefix_len + width]
+                mask = segment_causal_mask(prefix_len + width, prompt_len, width, sequences.device)
+                full_logits, _, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+                logits = full_logits[:, prefix_len:]
+                decision = schedule_round(logits, masked, config)
+                block_tokens[decision.unmask] = decision.tokens[decision.unmask]
+                masked &= ~decision.unmask
+                block_unmasked.append(int(decision.unmask.sum()))
+                block_fallback.append(bool(decision.progress_fallback.any()))
+                round_confidence = torch.softmax(logits, dim=-1).max(dim=-1).values
+                block_confidence.append(float(round_confidence[decision.unmask].mean()))
+                if capture_block_logits:
+                    captured_rounds.append(logits.detach().clone())
+                block_positions.append(decision.unmask.detach().clone())
+                rounds += 1
+            if bool(masked.any()):
+                remaining = logits.argmax(dim=-1)
+                block_tokens[masked] = remaining[masked]
+                forced_completions += 1
         rounds_per_block.append(rounds)
         unmasked_per_round.append(block_unmasked)
         fallback_per_round.append(block_fallback)

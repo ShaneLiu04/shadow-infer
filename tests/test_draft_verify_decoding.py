@@ -12,6 +12,14 @@ elements are judged independently, and degenerate inputs (wrong rank,
 zero-width blocks, shape mismatch, non-integer tokens, non-bool
 draft_mode) are rejected with ``ValueError``.
 
+The T002 partition appended below exercises the draft_mode pipeline
+branch of ``PyTorchModelBackend.generate`` and
+``blockwise_generate_baseline`` (FR17.2): full draft-verify completion
+and page-residency ledgers at two scales, the max_rounds=1 draft-only
+forced degeneration, forced-completions accounting bounds, mask-init
+regression anchors for draft_mode=False, and the fail-fast contract
+shared by both draft_mode values.
+
 All tests use real tensors; nothing is mocked.
 """
 
@@ -21,6 +29,19 @@ import pytest
 import torch
 
 from shadowinfer.execution import BlockDecodingConfig, draft_round, verify_round
+from tests.test_block_decoding import (
+    GP_BATCH,
+    GP_GEN,
+    GP_LAYERS,
+    GP_PROMPT,
+    GP_VOCAB,
+    GP_WIDTH,
+    _gp_backend,
+    _gp_config,
+    _gp_model_config,
+    _gp_prompt,
+    _t5_direct_model,
+)
 
 DV_SEED = 2034
 DV_VOCAB = 8
@@ -307,3 +328,271 @@ class TestDraftModeConfig:
         config.validate()
         config_true = BlockDecodingConfig(draft_mode=True)
         config_true.validate()
+
+
+# ---------------------------------------------------------------------------
+# T002: generate / blockwise_generate_baseline draft_mode branch (FR17.2)
+# ---------------------------------------------------------------------------
+
+DV_PIPE_SEED = 2601
+DV_PIPE_SCALES = (
+    (DV_PIPE_SEED, GP_PROMPT, GP_GEN),  # (P=6, G=8): two blocks
+    (DV_PIPE_SEED + 2, 10, 16),  # (P=10, G=16): four blocks
+)
+
+
+def _dv_baseline(model, prompt, gen_len, config):
+    """Full-recompute reference loop (blockwise_generate_baseline)."""
+    from shadowinfer.execution.block_decoding import blockwise_generate_baseline
+
+    return blockwise_generate_baseline(model, prompt, gen_len, config)
+
+
+class TestGenerateDraftVerifyPipeline:
+    @pytest.mark.parametrize("seed,prompt_len,gen_len", DV_PIPE_SCALES)
+    def test_draft_mode_completes_with_no_mask_residue(self, seed, prompt_len, gen_len):
+        # FR17.2(a): draft-verify completes at both scales: [B, P + G]
+        # long sequences, prompt preserved bit-for-bit, every generated
+        # token in vocabulary, and no mask_token_id in the generated
+        # region -- the draft round fills the whole block in one shot, so
+        # no MASK position can survive into the returned sequences. The
+        # seeds are known (repo convention) to also keep legitimate
+        # argmax tokens off the mask id, which doubles as vocab token 0.
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+        config = _gp_config(draft_mode=True)
+
+        result = backend.generate(prompt, gen_len, config)
+
+        assert result.sequences.shape == (GP_BATCH, prompt_len + gen_len)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :prompt_len], prompt)
+        generated = result.sequences[:, prompt_len:]
+        assert bool(((generated >= 0) & (generated < GP_VOCAB)).all())
+        assert not bool((generated == config.mask_token_id).any())
+        assert result.stats["blocks"] == gen_len // GP_WIDTH
+
+    @pytest.mark.parametrize("seed,prompt_len,gen_len", DV_PIPE_SCALES)
+    def test_draft_mode_page_residency_ledger(self, seed, prompt_len, gen_len):
+        # FR17.2(b): prefill appends P rows once and each block's sealing
+        # pass appends W rows exactly once (G total); draft/verify rounds
+        # only gather from the pages, so the per-layer ledger must read
+        # appended == P + G with zero rewrites and zero evictions.
+        from shadowinfer.shadowkv.paged_kv_store import PagedKVStore
+
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+
+        backend.generate(prompt, gen_len, _gp_config(draft_mode=True))
+
+        stores = backend.last_generate_stores
+        assert stores is not None
+        assert set(stores.keys()) == set(range(GP_LAYERS))
+        for layer_id in range(GP_LAYERS):
+            store = stores[layer_id]
+            assert isinstance(store, PagedKVStore)
+            assert store.appended_tokens == prompt_len + gen_len
+            assert store.rewritten_tokens == 0
+            assert store.page_evictions == 0
+            assert store.max_seq == prompt_len + gen_len
+
+    def test_max_rounds_one_degrades_to_draft_only_completion(self):
+        # FR17.2(c): max_rounds=1 caps the block loop at the draft round
+        # (no verify round exists); every block still completes through
+        # the forced path with a fully filled, mask-free generated region.
+        seed = DV_PIPE_SEED + 4
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(draft_mode=True, max_rounds=1)
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert torch.equal(result.sequences[:, :GP_PROMPT], prompt)
+        generated = result.sequences[:, GP_PROMPT:]
+        assert not bool((generated == config.mask_token_id).any())
+        assert result.stats["blocks"] == GP_GEN // GP_WIDTH
+
+    def test_max_rounds_one_forces_every_block(self):
+        # FR17.2(d): with max_rounds=1 the single round is the draft, so
+        # no block reaches a verified fixpoint and every block is
+        # force-sealed: forced_completions == blocks exactly.
+        seed = DV_PIPE_SEED + 6
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(draft_mode=True, max_rounds=1)
+
+        result = backend.generate(prompt, GP_GEN, config)
+
+        assert result.stats["forced_completions"] == GP_GEN // GP_WIDTH
+
+    def test_default_max_rounds_forced_completions_bounded_by_blocks(self):
+        # FR17.2(d): with max_rounds=8 a block can be force-sealed at
+        # most once, so forced_completions stays within [0, blocks].
+        seed = DV_PIPE_SEED + 8
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+
+        result = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=True))
+
+        assert 0 <= result.stats["forced_completions"] <= GP_GEN // GP_WIDTH
+
+    def test_draft_mode_output_diverges_from_mask_init_path(self):
+        # FR17.2 Red anchor: draft-verify is a different decoding
+        # algorithm from threshold-gated mask-init scheduling -- the
+        # draft round fills the whole block from the all-MASK argmax in
+        # one shot, while mask-init unmasks gradually (top-1 fallback per
+        # round on this model), so the returned sequences cannot coincide
+        # bit-for-bit. Equality means the draft_mode branch is not wired
+        # into generate -- the pre-T002 state where draft_mode is
+        # silently ignored.
+        seed = DV_PIPE_SEED
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+
+        result_true = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=True))
+        result_false = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=False))
+
+        assert not torch.equal(result_true.sequences, result_false.sequences)
+
+    def test_baseline_draft_mode_completes_with_no_mask_residue(self):
+        # FR17.2: the baseline arm shares the draft-verify completion
+        # contract (shape, prompt preservation, mask-free generation);
+        # generate-vs-baseline bitwise equality is pinned by T004.
+        seed = DV_PIPE_SEED + 2
+        model = _t5_direct_model(seed)
+        prompt = _gp_prompt(seed + 1)
+        config = _gp_config(draft_mode=True)
+
+        base_result = _dv_baseline(model, prompt, GP_GEN, config)
+
+        assert base_result.sequences.shape == (GP_BATCH, GP_PROMPT + GP_GEN)
+        assert torch.equal(base_result.sequences[:, :GP_PROMPT], prompt)
+        generated = base_result.sequences[:, GP_PROMPT:]
+        assert not bool((generated == config.mask_token_id).any())
+
+    def test_baseline_draft_mode_diverges_from_mask_init_path(self):
+        # FR17.2 Red anchor (baseline arm): the same algorithm-level
+        # argument as the generate-arm anchor -- the baseline loop must
+        # not return identical sequences with draft_mode on and off,
+        # otherwise the draft branch is not wired into the baseline.
+        seed = DV_PIPE_SEED + 2
+        model = _t5_direct_model(seed)
+        prompt = _gp_prompt(seed + 1)
+
+        result_true = _dv_baseline(model, prompt, GP_GEN, _gp_config(draft_mode=True))
+        result_false = _dv_baseline(model, prompt, GP_GEN, _gp_config(draft_mode=False))
+
+        assert not torch.equal(result_true.sequences, result_false.sequences)
+
+
+class TestMaskInitRegressionAnchor:
+    def test_explicit_draft_mode_false_matches_default_path(self):
+        # FR17.2(6): draft_mode=False is the explicit default -- the same
+        # backend and prompt must produce bit-identical sequences and
+        # identical round accounting with the field omitted or explicitly
+        # False; adding the field must not perturb the mask-init path.
+        seed = DV_PIPE_SEED + 10
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1)
+
+        result_default = backend.generate(prompt, GP_GEN, _gp_config())
+        result_false = backend.generate(prompt, GP_GEN, _gp_config(draft_mode=False))
+
+        assert torch.equal(result_false.sequences, result_default.sequences)
+        assert result_false.stats["rounds_per_block"] == result_default.stats["rounds_per_block"]
+        assert result_false.stats["total_rounds"] == result_default.stats["total_rounds"]
+
+    @pytest.mark.parametrize("seed,prompt_len,gen_len", DV_PIPE_SCALES)
+    def test_draft_mode_false_generate_matches_baseline_bitwise(self, seed, prompt_len, gen_len):
+        # FR17.2(6): the AR016 exactness property survives the field
+        # addition -- with draft_mode=False the store-backed generate arm
+        # and the full-recompute baseline arm agree bit-for-bit.
+        backend = _gp_backend(seed)
+        prompt = _gp_prompt(seed + 1, length=prompt_len)
+        config = _gp_config(draft_mode=False)
+
+        gen_result = backend.generate(prompt, gen_len, config)
+        base_result = _dv_baseline(_t5_direct_model(seed), prompt, gen_len, config)
+
+        assert gen_result.sequences.shape == (GP_BATCH, prompt_len + gen_len)
+        assert torch.equal(gen_result.sequences[:, :prompt_len], prompt)
+        assert torch.equal(gen_result.sequences, base_result.sequences)
+
+
+class TestDraftModeFailFast:
+    """FR17.2(7): fail-fast validation is fully shared with the mask-init
+    path for both draft_mode values; a rejected call raises before any
+    page store is created (last_generate_stores stays None)."""
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_prompt_with_mask_token_raises(self, draft_mode):
+        backend = _gp_backend(DV_PIPE_SEED + 30)
+        prompt = _gp_prompt(DV_PIPE_SEED + 31)
+        prompt[0, 2] = 0  # == config.mask_token_id
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_prompt_plus_gen_len_over_max_seq_len_raises(self, draft_mode):
+        backend = _gp_backend(DV_PIPE_SEED + 32)
+        prompt = _gp_prompt(DV_PIPE_SEED + 33)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, 60, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_gen_len_not_multiple_of_block_size_raises(self, draft_mode):
+        backend = _gp_backend(DV_PIPE_SEED + 34)
+        prompt = _gp_prompt(DV_PIPE_SEED + 35)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, 6, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_prompt_1d_raises(self, draft_mode):
+        backend = _gp_backend(DV_PIPE_SEED + 36)
+        prompt = _gp_prompt(DV_PIPE_SEED + 37)[0]  # [P]: not 2-D
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_prompt_float_dtype_raises(self, draft_mode):
+        backend = _gp_backend(DV_PIPE_SEED + 38)
+        gen = torch.Generator().manual_seed(DV_PIPE_SEED + 39)
+        prompt = torch.rand(GP_BATCH, GP_PROMPT, generator=gen)
+
+        with pytest.raises(ValueError):
+            backend.generate(prompt, GP_GEN, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("bad_mask_token_id", [GP_VOCAB, -1])
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_mask_token_id_out_of_vocab_raises(self, draft_mode, bad_mask_token_id):
+        backend = _gp_backend(DV_PIPE_SEED + 40)
+        prompt = _gp_prompt(DV_PIPE_SEED + 41)
+
+        with pytest.raises(ValueError):
+            backend.generate(
+                prompt,
+                GP_GEN,
+                _gp_config(draft_mode=draft_mode, mask_token_id=bad_mask_token_id),
+            )
+        assert backend.last_generate_stores is None
+
+    @pytest.mark.parametrize("draft_mode", [False, True])
+    def test_unloaded_backend_raises_runtime_error(self, draft_mode):
+        from shadowinfer.core.backends.pytorch_backend import PyTorchModelBackend
+
+        backend = PyTorchModelBackend(model_config=_gp_model_config(), seed=DV_PIPE_SEED + 42)
+        prompt = _gp_prompt(DV_PIPE_SEED + 43)
+
+        with pytest.raises(RuntimeError):
+            backend.generate(prompt, GP_GEN, _gp_config(draft_mode=draft_mode))
+        assert backend.last_generate_stores is None
