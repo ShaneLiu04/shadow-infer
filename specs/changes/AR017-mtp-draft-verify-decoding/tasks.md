@@ -17,7 +17,7 @@
 | T004 | e2e 行为测试：draft-verify 正常完成（多块/多规模/B=2）、页驻留取证、batch 独立收敛、退化输入（FR17.1/17.2 验收） | T002 | passing | 2026-10-23 完成；9 UT；两臂 bitwise 锚点实测成立 |
 | T005 | ar017_bench.py 三臂脚本 + 校准探针（threshold 扫描）+ 预注册断言登记（FR17.4 前半） | T003, T004 | passing | 2026-10-23 完成；探针证要纯 Jacobi 不收敛 → 预注册 v1→v2 修订（用户确认，诚实口径）；四臂（+baseline-dv 锚点臂）；断言已跑前登记 bench-results.md §2 |
 | T006 | 三臂全量实跑 + bench-results.md 逐 seed 落档 + 判定（FR17.4 后半） | T005 | passing | 2026-10-23 完成；四臂全量实跑，注册断言 v2 全 PASS（A1-A5 各 9/9）；玩具持平如实落档，性能主张转 s12 GPU |
-| T007 | s12 yaml + server-experiment.md + serve_arm.py `--mode` 扩展 + README 四检查点 + 版本 3.19.0 四处同步（FR17.5/17.6） | T006 | pending | s12 前向兼容 AR018（model_weights 配置位预留） |
+| T007 | s12 yaml + server-experiment.md + serve_arm.py `--mode` 扩展 + README 四检查点 + 版本 3.19.0 四处同步（FR17.5/17.6） | T006 | passing | 2026-10-23 完成；s12 前向兼容 AR018（model_weights 配置位预留）；1214 passed / 84.71% 实测数入 README |
 | T008 | 五件套质量门禁全量实跑（black/isort/flake8/mypy/pytest） | T007 | pending | 门槛：>= 1128 用例、>= 84.25%、1128 基线零回退 |
 
 ## 状态说明
@@ -77,6 +77,16 @@
 - 实跑结果：**注册断言 v2 全部 PASS（45/45 检查，A1-A5 各 9/9）**——A1 两臂 bitwise 9/9、A2 调度整表一致 9/9、A3 零回退界（区间 0.921-1.169x，中位 ~1.0x）9/9、A4 坏草稿拒收（acceptance 0.0424-0.0651）9/9、A5 闭式记账（rows/forced/kv）27/27
 - 诚实结论落档 bench-results.md §3：玩具上 draft-verify 与 mask-init 端到端持平（结构预测 9=9 前向/块实测成立）、轮数无削减；根因 = 随机权重无稳定 argmax 不动点；性能主张（1.5x/2x/90%）转 s12 GPU 协议服务器场地断言（需 AR018）；mask-init vs baseline bitwise 9/9 复核（AR016 锚点 0.9 口径）；threshold=0.005 敏感性点结构同型（结论阈值无关）
 - 修改文件：`bench-results.md`（§3 全量结果 + §3.5 诚实结论与 README 引用口径）
+
+### 2026-10-23 会话记录（T007）
+
+- 完成任务：T007 s12 GPU 协议 + serve_arm 扩展 + README 四检查点 + 版本 3.19.0 四处同步（主代理直做）
+- 新增 `configs/experiments/s12_draft_verify_gpu.yaml`：四臂协议（baseline / baseline-dv / mask-init paged / draft-verify paged）；`model_weights: null` 配置位预留 AR018（本 AR 随机权重口径注明）；服务器场地断言 S1-S3（1.5x/2x/90%，仅真实权重判定，随机权重预期持平 report-only）+ S4 精确性锚点（权重无关）
+- 新增 `serve_arm.py`：`--arm {baseline,fp32,fp16,int8}` + `--mode {mask-init,draft-verify}`（映射 draft_mode）；stats.json 含 mode/draft_mode 与三新键；artifacts.pt 沿 AR016 结构
+- 新增 `server-experiment.md`：四臂命令、质量取证（S4 每次必查 + S1-S3 真实权重）、`rounds_to_fixpoint`/`draft_acceptance_rate`/`changed_per_round` 取证、显存与页统计、记录模板、结论落档纪律（随机权重负结果并列呈现）
+- README 四检查点：特性表 v3.19.0 行（机制 + 实测 + 诚实负结果 + GPU 协议主张口径）；基准节新增 v3.19.0 实测表（四臂，dv/mask 比中位 0.997-1.039x）+ 复现命令行；版本历史 v3.19.0 条目；TOC 零改动（无新增二级标题）
+- 版本 3.19.0 四处同步：pyproject.toml / `__init__.py` / `__main__.py` / `test_ffn_hotpath.py::test_ut17_version_strings_consistent`（单测通过）
+- 全量实跑（T008 前置取证）：1214 passed / 1 skipped / 84.71%（1128 基线 + 86 新增零回退，覆盖率 84.56% -> 84.71%）；black/isort/flake8/mypy 全绿
 
 ## 阶段门控记录
 

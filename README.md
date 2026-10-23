@@ -72,6 +72,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **分页增量 KV 驻留（v3.16.0）** | `PagedKVStore` 以 `[B,H,page_tokens,D]` 模型布局页存储 KV，append 仅量化/写入新 token 入页（向量化、零 Python 逐 token 循环），封存页 id 与数据指针不可变，读取走单遍 gather（零 permute/零 repack）；行级量化与 `PackedKVCache` 同元素逐位一致（fp32/fp16/int8/int4 golden `torch.equal`），支持按 token-head 驱逐（整页全驱逐真实释放字节、部分驱逐行置零、槽位空闲链复用、不复活）。`kv_execution="paged"`（`page_size` 可配，默认 32）消除 packed 路径每步全量 unpack+repack 与 precision_map 重建；执行统计新增 `paged`/`page_size`/`page_count`/`open_pages`/`appended_tokens_total`/`repack_tokens_saved`/`page_evictions` 等八键。KV 执行平面微基准（append 簿记，3 seed 中位，CPU）：加速 9.30x（S=512）/ 10.16x（S=2048），每步延迟斜率比为 packed 基线的 0.088-0.114，Python 堆瞬态峰值降约 51-57x；fp16 逐位等价、int8 驱逐前后逐位等价由 UT 证明。7B/GPU 长上下文按 `s9_paged_longctx_gpu.yaml` 在服务器复现。 |
 | **收敛感知宏块 KV 模式控制（v3.17.0）** | `MacroModeState` 将序列按宏块（`macro_block_size`，默认 32）分类为 SKIP / DELTA / REFRESH 三态：漂移低于 `skip_threshold` 的行冻结（残差回放），活跃比例超 `delta_min_active_ratio` 的块整块重算，warmup 与 `force_refresh_every` 强制全刷作精度保险；活跃行输出与全量前向 relL2 <= 1e-6（K/V 组装逐位相等），分类全程向量化。`PagedKVStore.rewrite_tokens` 提供行级覆写（校验全先于变异、驱逐行拒写、未覆写行逐位不变），SKIP 块零页写。模型侧行粒度分段前向 + 后端三态写回分派（全 REFRESH 走 clear+append 快路径），任一失败自动降级 dense 重算并 reset。`mode_control_enabled`（paged+replace 显式 opt-in，与 step reuse 互斥），执行统计新增 `mode_control`/`macro_block_size`/`skip_blocks`/`delta_blocks`/`refresh_blocks`/`skipped_rows`/`rewritten_rows`/`projected_rows` 键，默认关闭逐位回归。**诚实结论（CPU 玩具负载，机制说明口径）**：端到端无加速收益（f2 保险臂 0.64-1.04x，f0 默认臂 0.49-1.06x；行粒度重组开销 ~ 所省计算 35-60%，冻结行误差随陈旧深度线性累积），交付物为正确性（1016 UT）、误差有界语义（f2 保险臂全步 relL2 <= 2.65%）、漂移门自愈与 SKIP 零页写；三轮预注册历史（含两次断言失败与不可行性证明）完整落档，GPU/真实负载按 `s10_mode_control_gpu.yaml` 复现。 |
 | **置信度感知块式并行解码（v3.18.0）** | 新增 `shadowinfer/execution/block_decoding.py`：`BlockDecodingConfig`（冻结校验）+ `schedule_round` 向量化调度（置信度过阈位置并行解掩、无过阈时保底 top-1、argmax 并列取最小位、`max_rounds` 保底完成）；`SimpleDiffusionLLM.forward_block` 尾块活跃前向（仅算 W 个块行、prefix_kv 条件 attention、块内双向）+ `attention_mask` 三层透传；**段因果掩码 `segment_causal_mask`**（`seg(i)<seg(j) -> -inf`，保证前缀 KV 时间不变，多块场景替代会自相矛盾的块因果公式，开发期 erratum 落档）。`PyTorchModelBackend.generate` 生成管线：预填充 append -> 逐块「gather -> 活跃前向 -> 调度解掩」轮循环 -> 保底完成 -> sealing 前向固化块 KV -> append，**轮间零页写**（每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，fail-fast 校验无副作用）；`blockwise_generate_baseline` 全量重算参考环路（golden）；统计 14 键（含逐块耗时/逐轮解掩位置/兜底标记/置信度区间/`rows_saved_vs_baseline` 闭式）。**实测（CPU 玩具负载，B=2 单线程，3 seeds 中位）**：fp32 臂 vs 全量重算 **2.29x / 3.68x / 7.08x**（S=256/512/1024），token 序列与逐轮 logits 全逐位一致（relL2 <= 3.25e-7），计算行缩减 4.9/8.4/15.4x，KV 行恰写一次零重写零逐出（== P+G，27/27 点）；fp16 页 relL2 <= 1.26e-5 全逐位；int8 页 token 一致率 >= 0.996（轨迹对齐点 relL2 3.6e-4；阈值边缘调度置换/近并列翻转机理与 A6 判据三轮修订完整落档）；**S=256 加速 2.29x 低于 3x 如实标注**（gather 与 sealing 固定开销占比高）；阈值校准史（设计值 0.9 在玩具模型机制退化 -> 注册 0.005）与敏感性扫描落档。7B/GPU 按 `s11_blockwise_decoding_gpu.yaml` 在服务器复现。 |
+| **块级 MTP 草拟-验证并行解码（v3.19.0）** | `block_decoding.py` 新增 `draft_round`（round-0 全 MASK 条件前向全位 argmax 并行草拟，块内恒无 MASK 的结构性进度保证）/`verify_round`（逐位 `argmax==当前 token` 自一致校验，不匹配位原地单调替换，无重掩码）纯函数与 `BlockDecodingConfig.draft_mode`（默认 False）；`generate` 与 `blockwise_generate_baseline` 两臂 draft_mode 分支（Fast-dLLM MTP + Jacobi 式不动点迭代对标）；**定点 KV 复用**：定点确认轮前向的 block_kv 直接封存 append（零额外封存前向），forced 块（max_rounds 耗尽）补一次封存前向；统计扩至 17 键（+`draft_acceptance_rate`/`rounds_to_fixpoint`/`changed_per_round`，两模式键集一致，mask-init 新键 None）。**实测（CPU 玩具负载，四臂 x 3 规模 x 3 seeds，注册断言 v2 全过）**：draft-verify paged vs 全量重算参考臂 token 序列**逐位一致 + 调度统计整表相等（9/9 点）**，KV 行恰写一次（== P+G，27/27 项），`computed_rows == Σ W×(调度前向+封存前向)` 闭式确定性成立；**诚实负结果**：随机权重玩具上 draft-verify 与 mask-init 端到端持平（中位比 0.997-1.039x，轮数无削减）——纯 Jacobi 无稳定 argmax 不动点（changed 震荡平台 0.672-1.0 不衰减，W/cap 扫描均不定点），自一致校验正确拒收低质草稿（acceptance 0.042-0.065）；预注册 v1（1.5x/2x/90%）→ v2 修订史落档，**性能主张转 s12 GPU 协议服务器场地断言**（需 AR018 真实 dLLM 权重）。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -737,7 +738,41 @@ python specs/archive/AR015-macro-block-mode-control/ar015_bench.py
 
 # 块式并行解码基准（四臂 × 3 规模 × 3 seeds + 阈值敏感性，内置注册断言）
 python specs/archive/AR016-blockwise-parallel-decoding/ar016_bench.py
+
+# 块级 MTP 草拟-验证基准（四臂 × 3 规模 × 3 seeds + 阈值敏感性，内置注册断言 v2）
+python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py
 ```
+
+### 实测数据（v3.19.0，2026-10-23，Windows / CPU）
+
+块级 MTP 草拟-验证四臂基准：真实 `SimpleDiffusionLLM`（8 层 / 8 头 / 64 head_dim，
+vocab 1000），P=64、W=32、B=2、`max_rounds=8`、单线程，threshold=0.9（多轮主口径），
+3 seeds（`specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py`，注册断言
+v2 全过 45/45）：
+
+| 规模 S=P+G | dv/mask 端到端比中位（区间） | acceptance 区间 | 两臂 bitwise / 调度整表 | 闭式记账 |
+|---|---|---|---|---|
+| 256 | 1.039x (0.98-1.11) | [0.050, 0.065] | 逐位一致 / 相等（9/9 点） | 全过 |
+| 512 | 0.997x (0.96-1.17) | [0.042, 0.055] | 逐位一致 / 相等 | 全过 |
+| 1024 | 1.003x (0.92-1.16) | [0.049, 0.057] | 逐位一致 / 相等 | 全过 |
+
+- **精确性锚点（权重无关）**：draft-verify paged vs 全量重算 draft-verify 参考臂
+  token 序列逐位一致 + 调度统计整表相等（fp32 段因果时间不变性在草拟-验证调度下
+  保持）；KV 行恰写一次（`kv_write_rows == P+G`，27/27 项）；
+  `computed_rows == Σ W×(调度前向+封存前向)` 与 `forced == #{rtf==-1}` 闭式确定性
+  成立；mask-init paged vs baseline 逐位在 0.9 口径复核 9/9。
+- **诚实负结果（玩具持平）**：随机权重玩具上 draft-verify 与 mask-init 端到端持平
+  （每块均 8 轮 + 1 封存 = 9 前向，结构预测与实测一致），轮数无削减；根因 = 随机
+  权重无稳定 argmax 不动点（changed 逐轮震荡平台 0.672-1.0 不衰减，W∈{8,16,32}
+  与 max_rounds∈{8,16} 扫描均全块 forced 不定点）——MTP 轮数削减收益 contingent 于
+  真实预训练模型草稿质量（Fast-dLLM/Jacobi 文献证据全部来自预训练模型）。
+- **机制有效性证据**：自一致校验正确拒收低质草稿（acceptance 0.042-0.065，持续
+  替换而非错误锁定）；草拟后块内恒无 MASK（封存必然可完成的结构性保证）；定点 KV
+  复用路径由 UT 验证（定点块零封存前向）。
+- **预注册修订史**：v1 三门槛（>= 1.5x / >= 2x / >= 90%）经校准探针证实机理不可达
+  （用户确认转向诚实口径）→ v2 注册精确性锚点 + 零回退界（<= 1.2x，实测 0.92-1.17x）
+  + 坏草稿拒收（<= 0.25）+ 闭式记账；**性能主张（1.5x/2x/90%）转 s12 GPU 协议
+  服务器场地断言**（需 AR018 真实 dLLM 权重；随机权重下预期持平，如实报告）。
 
 ### 实测数据（v3.18.0，2026-10-22，Windows / CPU）
 
@@ -1306,6 +1341,14 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.19.0（2026-10）
+
+- **草拟-验证调度原语**：`block_decoding.py` 新增 `draft_round`（round-0 全 MASK 条件前向全位 argmax 并行草拟，整块一次填充、块内恒无 MASK 的结构性进度保证）与 `verify_round`（逐位 `argmax == 当前 token` 自一致校验，不匹配位以新 argmax 原地单调替换，无重掩码；并列取最小位）；`BlockDecodingConfig.draft_mode: bool = False`（bool 校验，默认路径逐位回归 v3.18.0）。
+- **两臂管线集成**：`PyTorchModelBackend.generate` 与 `blockwise_generate_baseline` 块内循环 draft_mode 分支（Fast-dLLM MTP + Jacobi 式不动点迭代对标）；**定点 KV 复用**——定点确认轮前向的 block_kv 直接封存 append（零额外封存前向），forced 块（max_rounds 耗尽）补一次封存前向；`max_rounds` 语义 = 块内调度前向总数（1 草拟 + 最多 max_rounds-1 验证）；页驻留不变量保持（轮间零页写、append 恰 P+G 各一次）；fail-fast 清单两模式共享。
+- **生成统计 17 键**：新增 `draft_acceptance_rate`（各块 round-0 草稿被最终封存保留的位比例，batch×blocks 均值）、`rounds_to_fixpoint`（逐块，定点 = 确认轮调度前向数 >= 2，forced = -1）、`changed_per_round`（逐块逐轮替换位数，batch 聚合，round 0 恒 B×W）；两模式两臂键集一致，mask-init 新键 None；`computed_rows == Σ W×(调度前向+封存前向)` 统一公式（mask-init 封存恒 1，与 v3.18.0 等价）。
+- **实测（CPU，四臂 × 3 规模 × 3 seeds，注册断言 v2 全过 45/45）**：draft-verify paged vs 全量重算参考臂 **token 逐位一致 + 调度整表相等（9/9 点）**；KV 行恰写一次（== P+G，27/27 项）；闭式记账确定性成立；**随机权重玩具上与 mask-init 端到端持平（中位比 0.997-1.039x，轮数无削减）如实报告**——纯 Jacobi 无稳定 argmax 不动点（震荡平台 0.672-1.0 不衰减，W/cap 扫描均不定点），自一致校验正确拒收低质草稿（acceptance 0.042-0.065）；预注册 v1（1.5x/2x/90% 机理不可达）→ v2 修订史与校准探针数据落档 bench-results.md；**性能主张转 s12 GPU 协议服务器场地断言**（需 AR018 真实 dLLM 权重）。
+- **复现资产**：`specs/changes/AR017-mtp-draft-verify-decoding/`（srs/design/ar017_bench/bench-results/server-experiment/serve_arm），`configs/experiments/s12_draft_verify_gpu.yaml`（model_weights 位预留 AR018）；1214 passed / 1 skipped，覆盖率 84.71%。
 
 ### v3.18.0（2026-10）
 
