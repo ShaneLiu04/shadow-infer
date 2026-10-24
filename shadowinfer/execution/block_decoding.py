@@ -47,8 +47,7 @@ if TYPE_CHECKING:
             attention_mask: Optional[torch.Tensor] = None,
         ) -> Tuple[
             torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]
-        ]:
-            ...  # noqa: E501
+        ]: ...  # noqa: E501
 
         def forward_block(
             self,
@@ -57,8 +56,7 @@ if TYPE_CHECKING:
             prefix_len: int = 0,
             step_t: int = 0,
             total_steps: int = 0,
-        ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
-            ...
+        ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]: ...
 
 
 PAGE_PRECISIONS = ("fp32", "fp16", "int8")
