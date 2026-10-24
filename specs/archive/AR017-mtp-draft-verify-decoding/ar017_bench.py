@@ -57,7 +57,7 @@ characterization (A6: changed fraction plateau per seed), threshold
 sensitivity sweep at 0.005 (G=192, seed 0).
 
 Run (full, registered): $env:PYTHONPATH='D:\ShadowInfer';
-  python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py
+  python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py
 Run (probe, unregistered): same command plus `` --probe [--threshold T]
   [--gen 192,448] [--seed 0] [--max-rounds R]``
 """

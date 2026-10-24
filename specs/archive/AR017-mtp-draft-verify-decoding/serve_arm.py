@@ -16,7 +16,7 @@ draft-verify vs mask-init end-to-end >= 1.5x, per-block round reduction
 >= 2x, token agreement >= 90%.
 
 Usage (server, CUDA):
-  python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+  python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
     --config configs/experiments/s12_draft_verify_gpu.yaml \
     --model-config configs/experiments/model_7b_longctx.yaml \
     --arm fp32 --mode draft-verify --seed 0 --device cuda \

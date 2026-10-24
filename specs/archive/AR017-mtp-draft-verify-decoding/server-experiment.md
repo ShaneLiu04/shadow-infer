@@ -59,28 +59,28 @@ bench-results.md §1。
 
 ```bash
 # 0) baseline（mask-init 全量重算，golden）
-python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
   --config configs/experiments/s12_draft_verify_gpu.yaml \
   --model-config configs/experiments/model_7b_longctx.yaml \
   --arm baseline --mode mask-init --seed 0 --device cuda \
   --out results/ar017_s12_baseline_seed0
 
 # 1) baseline-dv（draft-verify 全量重算，精确性参考臂）
-python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
   --config configs/experiments/s12_draft_verify_gpu.yaml \
   --model-config configs/experiments/model_7b_longctx.yaml \
   --arm baseline --mode draft-verify --seed 0 --device cuda \
   --out results/ar017_s12_baseline_dv_seed0
 
 # 2) mask-init paged（比较臂）
-python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
   --config configs/experiments/s12_draft_verify_gpu.yaml \
   --model-config configs/experiments/model_7b_longctx.yaml \
   --arm fp32 --mode mask-init --seed 0 --device cuda \
   --out results/ar017_s12_maskinit_seed0
 
 # 3) draft-verify paged（被测臂）
-python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
   --config configs/experiments/s12_draft_verify_gpu.yaml \
   --model-config configs/experiments/model_7b_longctx.yaml \
   --arm fp32 --mode draft-verify --seed 0 --device cuda \

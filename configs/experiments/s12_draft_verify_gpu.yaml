@@ -18,7 +18,7 @@ model_weights: null
 # Arms (one run per seed 0/1/2, 3 repeats each; run via
 # PyTorchModelBackend.generate / blockwise_generate_baseline with
 # --mode {mask-init,draft-verify}, see
-# specs/changes/AR017-mtp-draft-verify-decoding/server-experiment.md):
+# specs/archive/AR017-mtp-draft-verify-decoding/server-experiment.md):
 #   0) baseline (mask-init):     blockwise_generate_baseline, full
 #                                recompute per round (AR016 golden)
 #   1) baseline-dv:              blockwise_generate_baseline with
@@ -43,15 +43,15 @@ model_weights: null
 # rounds, rounds_to_fixpoint distribution, changed_per_round trajectories,
 # draft_acceptance_rate, computed_rows_total, kv_write_rows_total
 # (== P+G expected). CPU-side evidence and honesty notes:
-#   specs/changes/AR017-mtp-draft-verify-decoding/bench-results.md
+#   specs/archive/AR017-mtp-draft-verify-decoding/bench-results.md
 # (CPU random-weight toy: draft-verify == mask-init parity, median ratio
 # 0.997-1.039x; two-arm bitwise + schedule equality 9/9; acceptance
 # 0.042-0.065 as bad-draft rejection evidence.)
 # Full protocol:
-#   specs/changes/AR017-mtp-draft-verify-decoding/server-experiment.md
+#   specs/archive/AR017-mtp-draft-verify-decoding/server-experiment.md
 #
 # Usage (see server-experiment.md section 4 for the full four-arm runner):
-#   python specs/changes/AR017-mtp-draft-verify-decoding/serve_arm.py \
+#   python specs/archive/AR017-mtp-draft-verify-decoding/serve_arm.py \
 #     --config configs/experiments/s12_draft_verify_gpu.yaml \
 #     --model-config configs/experiments/model_7b_longctx.yaml \
 #     --arm fp32 --mode draft-verify --seed 0 \

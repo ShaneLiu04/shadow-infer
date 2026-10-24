@@ -2,7 +2,7 @@
 
 - 设备：CPU（本机 Windows，单线程 `torch.set_num_threads(1)`），Python 3.11.9，torch 2.5.1
 - 口径：真实 SimpleDiffusionLLM 前向，真实随机 prompt（generator seed 2026+seed），无 mock
-- 脚本：`ar017_bench.py`（本目录）；复现：`$env:PYTHONPATH='D:\ShadowInfer'; python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py`
+- 脚本：`ar017_bench.py`（本目录）；复现：`$env:PYTHONPATH='D:\ShadowInfer'; python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py`
 - 纪律：沿 AR015/016 惯例——校准探针先行（不入库断言）、实测固化注册断言、跑前登记、全量实跑、逐 seed 落档
 
 ## 1. 校准探针（跑前，单 seed，未注册）
@@ -82,7 +82,7 @@ B=2，W=32，P=64，max_rounds=8，page_size=32，(L,H,D)=(8,8,64)，vocab=1000�
 ## 3. 全量实跑结果（v2 判据，3 seeds x 3 规模 x 4 臂，2026-10-23）
 
 注册配置实跑（threshold=0.9），**全部注册断言 PASS**（A1-A5 各 9/9）。复现命令：
-`$env:PYTHONPATH='D:\ShadowInfer'; python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py`。
+`$env:PYTHONPATH='D:\ShadowInfer'; python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py`。
 
 ### 3.1 逐 seed 原始数据（draft-verify paged 臂为主）
 

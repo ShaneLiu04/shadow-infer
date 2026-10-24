@@ -740,14 +740,14 @@ python specs/archive/AR015-macro-block-mode-control/ar015_bench.py
 python specs/archive/AR016-blockwise-parallel-decoding/ar016_bench.py
 
 # 块级 MTP 草拟-验证基准（四臂 × 3 规模 × 3 seeds + 阈值敏感性，内置注册断言 v2）
-python specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py
+python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py
 ```
 
 ### 实测数据（v3.19.0，2026-10-23，Windows / CPU）
 
 块级 MTP 草拟-验证四臂基准：真实 `SimpleDiffusionLLM`（8 层 / 8 头 / 64 head_dim，
 vocab 1000），P=64、W=32、B=2、`max_rounds=8`、单线程，threshold=0.9（多轮主口径），
-3 seeds（`specs/changes/AR017-mtp-draft-verify-decoding/ar017_bench.py`，注册断言
+3 seeds（`specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py`，注册断言
 v2 全过 45/45）：
 
 | 规模 S=P+G | dv/mask 端到端比中位（区间） | acceptance 区间 | 两臂 bitwise / 调度整表 | 闭式记账 |
@@ -1348,7 +1348,7 @@ pytest
 - **两臂管线集成**：`PyTorchModelBackend.generate` 与 `blockwise_generate_baseline` 块内循环 draft_mode 分支（Fast-dLLM MTP + Jacobi 式不动点迭代对标）；**定点 KV 复用**——定点确认轮前向的 block_kv 直接封存 append（零额外封存前向），forced 块（max_rounds 耗尽）补一次封存前向；`max_rounds` 语义 = 块内调度前向总数（1 草拟 + 最多 max_rounds-1 验证）；页驻留不变量保持（轮间零页写、append 恰 P+G 各一次）；fail-fast 清单两模式共享。
 - **生成统计 17 键**：新增 `draft_acceptance_rate`（各块 round-0 草稿被最终封存保留的位比例，batch×blocks 均值）、`rounds_to_fixpoint`（逐块，定点 = 确认轮调度前向数 >= 2，forced = -1）、`changed_per_round`（逐块逐轮替换位数，batch 聚合，round 0 恒 B×W）；两模式两臂键集一致，mask-init 新键 None；`computed_rows == Σ W×(调度前向+封存前向)` 统一公式（mask-init 封存恒 1，与 v3.18.0 等价）。
 - **实测（CPU，四臂 × 3 规模 × 3 seeds，注册断言 v2 全过 45/45）**：draft-verify paged vs 全量重算参考臂 **token 逐位一致 + 调度整表相等（9/9 点）**；KV 行恰写一次（== P+G，27/27 项）；闭式记账确定性成立；**随机权重玩具上与 mask-init 端到端持平（中位比 0.997-1.039x，轮数无削减）如实报告**——纯 Jacobi 无稳定 argmax 不动点（震荡平台 0.672-1.0 不衰减，W/cap 扫描均不定点），自一致校验正确拒收低质草稿（acceptance 0.042-0.065）；预注册 v1（1.5x/2x/90% 机理不可达）→ v2 修订史与校准探针数据落档 bench-results.md；**性能主张转 s12 GPU 协议服务器场地断言**（需 AR018 真实 dLLM 权重）。
-- **复现资产**：`specs/changes/AR017-mtp-draft-verify-decoding/`（srs/design/ar017_bench/bench-results/server-experiment/serve_arm），`configs/experiments/s12_draft_verify_gpu.yaml`（model_weights 位预留 AR018）；1214 passed / 1 skipped，覆盖率 84.71%。
+- **复现资产**：`specs/archive/AR017-mtp-draft-verify-decoding/`（srs/design/ar017_bench/bench-results/server-experiment/serve_arm），`configs/experiments/s12_draft_verify_gpu.yaml`（model_weights 位预留 AR018）；1214 passed / 1 skipped，覆盖率 84.71%。
 
 ### v3.18.0（2026-10）
 
