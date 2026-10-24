@@ -5,7 +5,7 @@ Red-phase contract tests for ``shadowinfer/models/diffusion_llama.py``
 the P5 fixture/preset partition (FR18.5 test surface).
 
 Zero-mock discipline: every checkpoint is a real HF-format directory on
-disk produced by ``specs/changes/AR018-real-dllm-weights/fixture_gen.py``
+disk produced by ``specs/archive/AR018-real-dllm-weights/fixture_gen.py``
 (single-file and sharded-with-index layouts), and every fault is injected
 through real file IO (delete file / rewrite json / rewrite safetensors).
 No production module exists yet; this file is expected to fail collection
@@ -38,7 +38,7 @@ from shadowinfer.models.diffusion_llama import (
 _FIXTURE_GEN_PATH = (
     Path(__file__).resolve().parents[1]
     / "specs"
-    / "changes"
+    / "archive"
     / "AR018-real-dllm-weights"
     / "fixture_gen.py"
 )

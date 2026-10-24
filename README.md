@@ -745,13 +745,13 @@ python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py
 
 # 真实 dLLM 权重执行平面（四臂 fixture 冒烟 + s13 服务器协议）
 # 权重获取 / PRESETS 核实 / 环境登记 / S1-S3 判定 / 结果落档模板见 EXPERIMENTS.md
-python specs/changes/AR018-real-dllm-weights/serve_arm.py --help
+python specs/archive/AR018-real-dllm-weights/serve_arm.py --help
 ```
 
 ### 实测数据（v3.20.0，2026-10-24，Windows / CPU）
 
 真实 dLLM 权重执行平面——结构 / 加载 / 数值正确性口径（fixture =
-`specs/changes/AR018-real-dllm-weights/fixture_gen.py` 生成的 tiny 真实格式
+`specs/archive/AR018-real-dllm-weights/fixture_gen.py` 生成的 tiny 真实格式
 checkpoint，与真实权重走同一加载与生成代码路径，设计 D12；全部证据来自
 `tests/test_diffusion_llama.py` 90 用例与四臂 CLI 冒烟）：
 
@@ -1383,8 +1383,8 @@ pytest
 - **建模层与数值对照**：RMSNorm / RoPE（标准 rotate-half 分半配对，HF Llama/Qwen 训练口径）/ SwiGLU / GQA（`repeat_kv`，KV 头原生 `[B, num_kv_heads, T, D]` post-RoPE 口径）/ 三态 mask（全双向 / 段因果复用 `segment_causal_mask` / 块行条件）；手写参考实现 golden 对照矩阵（全双向/段因果 × GQA/MHA × RoPE 位置偏移）；两级锚点 KV relL2 <= 1e-5（D7 tier (i)「逐位」被 MKL microkernel 切换底噪实证否证，修订为登记容差，erratum 7.1）+ logits relL2 <= 1e-6 + argmax 逐位。
 - **generate 纯函数化与协议解耦**：`PyTorchModelBackend.generate` 编排体抽取为 `execution/blockwise_generate.py::blockwise_generate` 纯函数（cut-paste 唯一 delta = GQA KV 头装配 `getattr(model, "num_kv_heads", model.num_heads)`，PagedKVStore 公开 API 与页布局零改动），backend 薄委托保持 `_last_generate_stores` 语义；`BlockwiseModel` TYPE_CHECKING 协议兼容两模型（运行时零开销鸭子类型）；SimpleDiffusionLLM **1214 基线逐位回归零改动通过**。
 - **remasking 基线臂**：`execution/remasking.py::remasking_generate`——dLLM 原生生成语义（每轮全序列双向重算 → softmax 置信度 → confidence/random 策略解掩 `min(u, 剩余)` 位，未选中位保持原状）；独立 fail-fast（无整除约束）与独立统计四键（`passes_used` / `unmasked_per_pass` / `final_confidences` / `mask_residuals`），与 17 键契约集合级不相交。
-- **s13 服务器协议**：`configs/experiments/s13_real_dllm_gpu.yaml`（四臂：baseline / mask-init / draft-verify / remasking；真实权重无随机回落）+ `specs/changes/AR018-real-dllm-weights/serve_arm.py`（`--model` 真实 checkpoint 路径，四臂 CLI，fixture 冒烟 4/4 exit 0）+ **EXPERIMENTS.md**（权重获取 / PRESETS 核实 / 环境登记 / 四臂命令 / 取证 / S1-S3 判定 / 落档模板 / 诚实纪律）；AR017 悬置的 S1（>= 1.5x）/ S2（>= 2x）/ S3（>= 0.90）场地断言移交 s13 判定，本机零性能主张，实测数据回填前 README 不出现 s13 性能数字。
-- **复现资产**：`specs/changes/AR018-real-dllm-weights/`（srs / design / tasks / fixture_gen / serve_arm，验收后归档至 `specs/archive/`）；1304 passed / 1 skipped，覆盖率 85.14%。
+- **s13 服务器协议**：`configs/experiments/s13_real_dllm_gpu.yaml`（四臂：baseline / mask-init / draft-verify / remasking；真实权重无随机回落）+ `specs/archive/AR018-real-dllm-weights/serve_arm.py`（`--model` 真实 checkpoint 路径，四臂 CLI，fixture 冒烟 4/4 exit 0）+ **EXPERIMENTS.md**（权重获取 / PRESETS 核实 / 环境登记 / 四臂命令 / 取证 / S1-S3 判定 / 落档模板 / 诚实纪律）；AR017 悬置的 S1（>= 1.5x）/ S2（>= 2x）/ S3（>= 0.90）场地断言移交 s13 判定，本机零性能主张，实测数据回填前 README 不出现 s13 性能数字。
+- **复现资产**：`specs/archive/AR018-real-dllm-weights/`（srs / design / st-cases / fixture_gen / serve_arm / gates），`configs/experiments/s13_real_dllm_gpu.yaml`；1304 passed / 1 skipped，覆盖率 85.14%。
 
 ### v3.19.0（2026-10）
 

@@ -11,7 +11,7 @@
 model_weights: null
 #
 # Arms (one run per seed 0/1/2; run via
-# specs/changes/AR018-real-dllm-weights/serve_arm.py --arm <value>):
+# specs/archive/AR018-real-dllm-weights/serve_arm.py --arm <value>):
 #   baseline      blockwise_generate_baseline, full recompute per round
 #                 under the block-causal mask (AR016 exactness
 #                 reference)
@@ -37,7 +37,7 @@ model_weights: null
 # capture, judgment, archive template): EXPERIMENTS.md
 #
 # Usage (server, CUDA; bash):
-#   python specs/changes/AR018-real-dllm-weights/serve_arm.py \
+#   python specs/archive/AR018-real-dllm-weights/serve_arm.py \
 #     --config configs/experiments/s13_real_dllm_gpu.yaml \
 #     --model /data/weights/Dream-7B \
 #     --arm draft-verify --seed 0 \

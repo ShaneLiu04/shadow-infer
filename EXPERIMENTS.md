@@ -88,7 +88,7 @@ ssh <user>@<server> "tar -xzf /data/weights/dream-7b.tar.gz -C /data/weights"
 | rope_theta / rms_norm_eps | 1e6 / 1e-6 | 5e5 / 1e-5 |
 | attention_bias / tie_word_embeddings | true / false | false / false |
 
-任何出入：**在 `specs/changes/AR018-real-dllm-weights/design.md` 落 erratum 并
+任何出入：**在 `specs/archive/AR018-real-dllm-weights/design.md` 落 erratum 并
 修订 PRESETS**，然后重跑加载冒烟；代码路径本身 config 驱动、不受影响。
 `serve_arm.py` 会在 `execution.mask_token_id` 显式给出且与 checkpoint 不符时
 拒绝运行（fail-fast）。
@@ -123,7 +123,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv   # 待回填
    import importlib.util, tempfile
    spec = importlib.util.spec_from_file_location(
        "fixture_gen",
-       "specs/changes/AR018-real-dllm-weights/fixture_gen.py")
+       "specs/archive/AR018-real-dllm-weights/fixture_gen.py")
    fg = importlib.util.module_from_spec(spec); spec.loader.exec_module(fg)
    d = tempfile.mkdtemp(prefix="ar018_smoke_")
    fg.generate_fixture(d, style="llama", num_layers=2, num_heads=8,
@@ -133,7 +133,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv   # 待回填
    PY
    # 四臂冒烟（<fixture_dir> 替换为上一步打印的目录）：
    for ARM in baseline mask-init draft-verify remasking; do
-     python specs/changes/AR018-real-dllm-weights/serve_arm.py \
+     python specs/archive/AR018-real-dllm-weights/serve_arm.py \
        --config configs/experiments/s13_real_dllm_gpu.yaml \
        --model <fixture_dir> --arm $ARM --seed 0 --device cpu \
        --dtype float32 --prompt-len 64 --gen-len 128 \
@@ -167,7 +167,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv   # 待回填
 cd <repo_root>
 for SEED in 0 1 2; do
   for ARM in baseline mask-init draft-verify remasking; do
-    python specs/changes/AR018-real-dllm-weights/serve_arm.py \
+    python specs/archive/AR018-real-dllm-weights/serve_arm.py \
       --config configs/experiments/s13_real_dllm_gpu.yaml \
       --model /data/weights/Dream-7B \
       --arm $ARM --seed $SEED --device cuda \

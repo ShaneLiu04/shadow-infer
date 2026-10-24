@@ -46,7 +46,7 @@ __all__ = [
 # this machine: the corporate gateway blocks huggingface.co / arxiv /
 # github, so these follow the published initialization-lineage claims
 # documented in design.md 4.2.2). Must stay field-by-field identical to
-# specs/changes/AR018-real-dllm-weights/fixture_gen.py PRESET_TEMPLATES;
+# specs/archive/AR018-real-dllm-weights/fixture_gen.py PRESET_TEMPLATES;
 # verify against the real config.json on the GPU server (s13) and record
 # any mismatch as a design erratum.
 PRESETS: Dict[str, Dict[str, Any]] = {
