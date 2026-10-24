@@ -30,7 +30,7 @@
 | 编号 | 状态 | 提交 |
 |---|---|---|
 | T001 | passing | 2026-10-24 完成（验收自验 36/36：确定性/双 style/双布局/GQA/MHA/tie/bf16/预设一致性/异常路径） |
-| T002 | pending | - |
+| T002 | passing | 2026-10-24 完成（34/34：P1 加载器 29 + P5 fixture/预设 5；全量回归 1248 passed / 1 skipped / 84.87%） |
 | T003 | pending | - |
 | T004 | pending | - |
 | T005 | pending | - |
@@ -47,3 +47,11 @@
 - 修改文件：specs/changes/AR018-real-dllm-weights/{srs.md, tasks.md, design.md, fixture_gen.py}
 - T001 验收：固定种子两次生成 bitwise 一致；llama/qwen 双 style（attention_bias 差异真实落盘）；单片/分片双布局（index 覆盖完备）；GQA/MHA 均可生成；tie 省略 lm_head；bf16 dtype；PRESET_TEMPLATES 与 design 4.2.2 文献口径表逐字段一致且内部自洽；异常路径 9 项 ValueError 全部命中
 - 备注：PRESETS 为文献口径（本机网关拦截 HF/arXiv/GitHub，无法核实），s13 服务器核实后如有出入落 erratum；fixture 正式 pytest 用例随 T002 Red 阶段交付（design 6.1 P5 分区）
+
+### 2026-10-24 会话记录（T002，标准 TDD）
+
+- 完成阶段：T002 Red（子代理写 tests/test_diffusion_llama.py，P1+P5 分区）+ T002 Green（主代理实现 shadowinfer/models/diffusion_llama.py）
+- 修改文件：tests/test_diffusion_llama.py（Red）、shadowinfer/models/diffusion_llama.py（Green）、shadowinfer/models/__init__.py（导出）
+- 实现要点：fail-fast 校验全前置于模块构造（路径→config 字段→维度→mask 范围→dtype 参数→文件存在→index 一致性→权重集合→形状）；期望权重名集合由 config 推导（D9 单一映射，非硬编码）；meta 设备构造 + `torch.utils.swap_tensors` 绑定真实权重（swap_tensors 连 Python 类型一起交换，替换张量须先包 nn.Parameter）；tie 时 lm_head 共享 embed_tokens 参数；inv_freq 为非持久 buffer（不出现在 named_parameters）；错误路径零部分加载（所有 ValueError 携带定位字段/张量/文件名）
+- T002 验收：34/34（加载器 29 + fixture/预设 5）；权重保真以 safetensors 原始回读多重集逐张量 torch.equal 断言（单片/分片跨布局 bitwise 一致、bf16→fp32 无损、auto 保 dtype）；全量回归 1248 passed / 1 skipped / 84.87%，五门禁全绿（black/isort/flake8 0 issue，mypy 76 files 0 issue）
+- 备注：forward_step/forward_block 为 NotImplementedError 占位（签名对齐 design 4.3），T003 实现建模层
