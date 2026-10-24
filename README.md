@@ -16,7 +16,7 @@
 
 | 版本 | 测试 | 覆盖率 | 质量门禁 | 许可证 |
 |------|------|--------|----------|--------|
-| v3.18.0 | 1128 passed / 1 skipped | 84.56% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
+| v3.20.0 | 1304 passed / 1 skipped | 85.14% | black / isort / flake8 / mypy / pytest 全绿 | MIT |
 
 ShadowInfer 通过 **ShadowKV 决策平面**、**Q-drift 步感知调度**、**FFN 动态通道剪枝** 与多 Agent 协作架构，为 Diffusion LLM 的端侧 / 车端 GPU 部署提供从性能分析、策略优化到生产部署的完整链路。
 
@@ -73,6 +73,7 @@ ShadowInfer 将这些优化机会封装为四个核心 Agent，由统一编排�
 | **收敛感知宏块 KV 模式控制（v3.17.0）** | `MacroModeState` 将序列按宏块（`macro_block_size`，默认 32）分类为 SKIP / DELTA / REFRESH 三态：漂移低于 `skip_threshold` 的行冻结（残差回放），活跃比例超 `delta_min_active_ratio` 的块整块重算，warmup 与 `force_refresh_every` 强制全刷作精度保险；活跃行输出与全量前向 relL2 <= 1e-6（K/V 组装逐位相等），分类全程向量化。`PagedKVStore.rewrite_tokens` 提供行级覆写（校验全先于变异、驱逐行拒写、未覆写行逐位不变），SKIP 块零页写。模型侧行粒度分段前向 + 后端三态写回分派（全 REFRESH 走 clear+append 快路径），任一失败自动降级 dense 重算并 reset。`mode_control_enabled`（paged+replace 显式 opt-in，与 step reuse 互斥），执行统计新增 `mode_control`/`macro_block_size`/`skip_blocks`/`delta_blocks`/`refresh_blocks`/`skipped_rows`/`rewritten_rows`/`projected_rows` 键，默认关闭逐位回归。**诚实结论（CPU 玩具负载，机制说明口径）**：端到端无加速收益（f2 保险臂 0.64-1.04x，f0 默认臂 0.49-1.06x；行粒度重组开销 ~ 所省计算 35-60%，冻结行误差随陈旧深度线性累积），交付物为正确性（1016 UT）、误差有界语义（f2 保险臂全步 relL2 <= 2.65%）、漂移门自愈与 SKIP 零页写；三轮预注册历史（含两次断言失败与不可行性证明）完整落档，GPU/真实负载按 `s10_mode_control_gpu.yaml` 复现。 |
 | **置信度感知块式并行解码（v3.18.0）** | 新增 `shadowinfer/execution/block_decoding.py`：`BlockDecodingConfig`（冻结校验）+ `schedule_round` 向量化调度（置信度过阈位置并行解掩、无过阈时保底 top-1、argmax 并列取最小位、`max_rounds` 保底完成）；`SimpleDiffusionLLM.forward_block` 尾块活跃前向（仅算 W 个块行、prefix_kv 条件 attention、块内双向）+ `attention_mask` 三层透传；**段因果掩码 `segment_causal_mask`**（`seg(i)<seg(j) -> -inf`，保证前缀 KV 时间不变，多块场景替代会自相矛盾的块因果公式，开发期 erratum 落档）。`PyTorchModelBackend.generate` 生成管线：预填充 append -> 逐块「gather -> 活跃前向 -> 调度解掩」轮循环 -> 保底完成 -> sealing 前向固化块 KV -> append，**轮间零页写**（每层 fresh `PagedKVStore`，fp32/fp16/int8 页精度平面，fail-fast 校验无副作用）；`blockwise_generate_baseline` 全量重算参考环路（golden）；统计 14 键（含逐块耗时/逐轮解掩位置/兜底标记/置信度区间/`rows_saved_vs_baseline` 闭式）。**实测（CPU 玩具负载，B=2 单线程，3 seeds 中位）**：fp32 臂 vs 全量重算 **2.29x / 3.68x / 7.08x**（S=256/512/1024），token 序列与逐轮 logits 全逐位一致（relL2 <= 3.25e-7），计算行缩减 4.9/8.4/15.4x，KV 行恰写一次零重写零逐出（== P+G，27/27 点）；fp16 页 relL2 <= 1.26e-5 全逐位；int8 页 token 一致率 >= 0.996（轨迹对齐点 relL2 3.6e-4；阈值边缘调度置换/近并列翻转机理与 A6 判据三轮修订完整落档）；**S=256 加速 2.29x 低于 3x 如实标注**（gather 与 sealing 固定开销占比高）；阈值校准史（设计值 0.9 在玩具模型机制退化 -> 注册 0.005）与敏感性扫描落档。7B/GPU 按 `s11_blockwise_decoding_gpu.yaml` 在服务器复现。 |
 | **块级 MTP 草拟-验证并行解码（v3.19.0）** | `block_decoding.py` 新增 `draft_round`（round-0 全 MASK 条件前向全位 argmax 并行草拟，块内恒无 MASK 的结构性进度保证）/`verify_round`（逐位 `argmax==当前 token` 自一致校验，不匹配位原地单调替换，无重掩码）纯函数与 `BlockDecodingConfig.draft_mode`（默认 False）；`generate` 与 `blockwise_generate_baseline` 两臂 draft_mode 分支（Fast-dLLM MTP + Jacobi 式不动点迭代对标）；**定点 KV 复用**：定点确认轮前向的 block_kv 直接封存 append（零额外封存前向），forced 块（max_rounds 耗尽）补一次封存前向；统计扩至 17 键（+`draft_acceptance_rate`/`rounds_to_fixpoint`/`changed_per_round`，两模式键集一致，mask-init 新键 None）。**实测（CPU 玩具负载，四臂 x 3 规模 x 3 seeds，注册断言 v2 全过）**：draft-verify paged vs 全量重算参考臂 token 序列**逐位一致 + 调度统计整表相等（9/9 点）**，KV 行恰写一次（== P+G，27/27 项），`computed_rows == Σ W×(调度前向+封存前向)` 闭式确定性成立；**诚实负结果**：随机权重玩具上 draft-verify 与 mask-init 端到端持平（中位比 0.997-1.039x，轮数无削减）——纯 Jacobi 无稳定 argmax 不动点（changed 震荡平台 0.672-1.0 不衰减，W/cap 扫描均不定点），自一致校验正确拒收低质草稿（acceptance 0.042-0.065）；预注册 v1（1.5x/2x/90%）→ v2 修订史落档，**性能主张转 s12 GPU 协议服务器场地断言**（需 AR018 真实 dLLM 权重）。 |
+| **真实 dLLM 权重执行平面（v3.20.0）** | 新增 `shadowinfer/models/diffusion_llama.py`：`load_diffusion_llama` 直接加载真实 LLaDA-8B / Dream-7B HF 格式 checkpoint（config.json 驱动：Llama/Qwen 双命名、单片/分片 safetensors、tie_word_embeddings、dtype 可配；校验全前置 fail-fast 零部分加载，meta 设备构造 + `swap_tensors` 绑定真实权重）；建模层 RMSNorm / RoPE（标准 rotate-half 分半配对）/ SwiGLU / GQA（KV 头原生 `[B, num_kv_heads, T, D]` post-RoPE 口径，7-8B 下省 4-8x 页内存）/ 三态 mask（全双向 / 段因果 / 块行条件），手写参考实现 golden 对照（KV relL2 <= 1e-5、logits <= 1e-6、argmax 逐位）；`generate` 编排抽取为 `execution/blockwise_generate.py` 纯函数（backend 薄委托，调度/统计/页布局零语义改动，SimpleDiffusionLLM 1214 基线逐位回归）+ `BlockwiseModel` 协议化解耦（两模型零开销鸭子类型）；新增 dLLM 原生 `remasking_generate` 基线臂（全序列双向重算 + 低置信解掩，独立统计四键，与 17 键契约不相交）；s13 服务器四臂协议（`configs/experiments/s13_real_dllm_gpu.yaml` + `serve_arm.py --model` + **[EXPERIMENTS.md](EXPERIMENTS.md)**：权重获取 / PRESETS 核实 / 命令 / S1-S3 判定 / 落档模板）。**本机零性能主张**：S1（>= 1.5x）/ S2（>= 2x）/ S3（>= 0.90）为服务器场地断言，实测后回填 EXPERIMENTS.md 与基准表；块式臂为全双向 dLLM 的半 AR 近似，一致率为近似质量度量，不伪称等价。 |
 | **FFN 热路径与逐层状态（v3.6.0）** | 精度计划指纹在打包时缓存（热路径 O(1)，同批对照下比值 0.001-0.004x）；quantization_info 按层缓存一次（热路径零迭代）；unpack/混合精度量化分组向量化（同批实测约 20x，参考实现保留 golden）；权重/量化态/重要性/mask/统计按 layer_id 隔离（修复 FFN-P1）；修复 mixed 路径 down 投影列掩码形状错误。微基准与复现脚本见 `specs/archive/AR004-ffn-hotpath/`。 |
 | **FFN 动态通道剪枝** | 运行时按通道重要性或激活能量剪枝 FFN 中间通道，降低 FLOPs 与访存。 |
 | **模型后端抽象** | 内置 `SimpleDiffusionLLM`、`PyTorchModelBackend`、`HuggingFaceModelBackend`，支持 entry-point 插件扩展。 |
@@ -741,7 +742,41 @@ python specs/archive/AR016-blockwise-parallel-decoding/ar016_bench.py
 
 # 块级 MTP 草拟-验证基准（四臂 × 3 规模 × 3 seeds + 阈值敏感性，内置注册断言 v2）
 python specs/archive/AR017-mtp-draft-verify-decoding/ar017_bench.py
+
+# 真实 dLLM 权重执行平面（四臂 fixture 冒烟 + s13 服务器协议）
+# 权重获取 / PRESETS 核实 / 环境登记 / S1-S3 判定 / 结果落档模板见 EXPERIMENTS.md
+python specs/changes/AR018-real-dllm-weights/serve_arm.py --help
 ```
+
+### 实测数据（v3.20.0，2026-10-24，Windows / CPU）
+
+真实 dLLM 权重执行平面——结构 / 加载 / 数值正确性口径（fixture =
+`specs/changes/AR018-real-dllm-weights/fixture_gen.py` 生成的 tiny 真实格式
+checkpoint，与真实权重走同一加载与生成代码路径，设计 D12；全部证据来自
+`tests/test_diffusion_llama.py` 90 用例与四臂 CLI 冒烟）：
+
+- **加载保真**：单片/分片跨布局逐张量 `torch.equal`、bf16→fp32 无损、
+  `dtype=auto` 保盘上 dtype、tie_word_embeddings 共享参数、meta 构造 +
+  `swap_tensors` 绑定；缺字段/缺权重/坏索引/形状不符/词表外 mask 等 fail-fast
+  全命中且零部分加载。
+- **数值锚点（手写参考实现 golden 对照矩阵：全双向/段因果 × GQA/MHA × RoPE
+  偏移）**：KV 层 relL2 <= 1e-5（登记容差——KV 投影 GEMM 的 MKL microkernel
+  切换底噪 1e-6 级，与语义错误 O(1) 有 100 倍分离度，erratum 7.1 落档）；
+  logits relL2 <= 1e-6（实测 6.6e-7）；argmax 逐位不变；段因果分解两级锚点
+  （KV 容差层 + logits 层 + argmax 层）。
+- **管线接入**：DiffusionLlama 跑通 mask-init / draft-verify 两模式（17 键统计
+  完整、页驻留不变量 `appended == P+G`、`rewritten == 0`、GQA store 2 KV 头、
+  gather `[B, 2, P+G, D]`）；`generate` 纯函数化重构后 SimpleDiffusionLLM
+  **1214 基线逐位回归零改动通过**。
+- **remasking 基线臂**：闭式收敛（`passes_used == G//u`、`mask_residuals == 0`）、
+  random 策略同种子两跑逐位复现、max_passes 耗尽诚实记账、与块式臂同 prompt
+  一致率指标可计算（随机 fixture 权重无语义主张，不设数值门槛）。
+- **四臂 CLI 冒烟**：fixture 权重 4/4 exit 0（baseline / mask-init /
+  draft-verify / remasking 同一代码路径，服务器换真实权重目录即同形命令）。
+- **本机零性能主张**：S1（draft-verify vs mask-init >= 1.5x）/ S2（轮数削减
+  >= 2x）/ S3（vs remasking 一致率 >= 0.90）为 **s13 服务器场地断言**，判定
+  口径与结果落档模板见 [EXPERIMENTS.md](EXPERIMENTS.md)（待服务器实测回填；
+  回填前本表与 README 任何位置不出现 s13 性能数字）。
 
 ### 实测数据（v3.19.0，2026-10-23，Windows / CPU）
 
@@ -1341,6 +1376,15 @@ pytest
 ---
 
 ## 版本历史
+
+### v3.20.0（2026-10）
+
+- **真实 checkpoint 加载器**：新增 `shadowinfer/models/diffusion_llama.py`；`load_diffusion_llama(path, dtype, device)` 以 config.json 驱动加载 LLaDA-8B / Dream-7B HF 格式 checkpoint（Llama/Qwen 双命名、mask_token_id、rope_theta、单片/分片 safetensors、tie_word_embeddings、dtype float32/auto 可配）；全部校验前置于构造（缺字段/缺权重/坏索引/形状不符/词表外 mask 均字段定位 fail-fast，零部分加载），meta 设备构造 + `torch.utils.swap_tensors` 绑定真实权重（7-8B 无随机初始化开销）；`PRESETS` 登记 Dream-7B / LLaDA-8B 文献口径（服务器以真实 config.json 核实，出入落 erratum；代码 config 驱动不受影响）。
+- **建模层与数值对照**：RMSNorm / RoPE（标准 rotate-half 分半配对，HF Llama/Qwen 训练口径）/ SwiGLU / GQA（`repeat_kv`，KV 头原生 `[B, num_kv_heads, T, D]` post-RoPE 口径）/ 三态 mask（全双向 / 段因果复用 `segment_causal_mask` / 块行条件）；手写参考实现 golden 对照矩阵（全双向/段因果 × GQA/MHA × RoPE 位置偏移）；两级锚点 KV relL2 <= 1e-5（D7 tier (i)「逐位」被 MKL microkernel 切换底噪实证否证，修订为登记容差，erratum 7.1）+ logits relL2 <= 1e-6 + argmax 逐位。
+- **generate 纯函数化与协议解耦**：`PyTorchModelBackend.generate` 编排体抽取为 `execution/blockwise_generate.py::blockwise_generate` 纯函数（cut-paste 唯一 delta = GQA KV 头装配 `getattr(model, "num_kv_heads", model.num_heads)`，PagedKVStore 公开 API 与页布局零改动），backend 薄委托保持 `_last_generate_stores` 语义；`BlockwiseModel` TYPE_CHECKING 协议兼容两模型（运行时零开销鸭子类型）；SimpleDiffusionLLM **1214 基线逐位回归零改动通过**。
+- **remasking 基线臂**：`execution/remasking.py::remasking_generate`——dLLM 原生生成语义（每轮全序列双向重算 → softmax 置信度 → confidence/random 策略解掩 `min(u, 剩余)` 位，未选中位保持原状）；独立 fail-fast（无整除约束）与独立统计四键（`passes_used` / `unmasked_per_pass` / `final_confidences` / `mask_residuals`），与 17 键契约集合级不相交。
+- **s13 服务器协议**：`configs/experiments/s13_real_dllm_gpu.yaml`（四臂：baseline / mask-init / draft-verify / remasking；真实权重无随机回落）+ `specs/changes/AR018-real-dllm-weights/serve_arm.py`（`--model` 真实 checkpoint 路径，四臂 CLI，fixture 冒烟 4/4 exit 0）+ **EXPERIMENTS.md**（权重获取 / PRESETS 核实 / 环境登记 / 四臂命令 / 取证 / S1-S3 判定 / 落档模板 / 诚实纪律）；AR017 悬置的 S1（>= 1.5x）/ S2（>= 2x）/ S3（>= 0.90）场地断言移交 s13 判定，本机零性能主张，实测数据回填前 README 不出现 s13 性能数字。
+- **复现资产**：`specs/changes/AR018-real-dllm-weights/`（srs / design / tasks / fixture_gen / serve_arm，验收后归档至 `specs/archive/`）；1304 passed / 1 skipped，覆盖率 85.14%。
 
 ### v3.19.0（2026-10）
 

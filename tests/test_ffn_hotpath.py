@@ -570,7 +570,7 @@ def test_ut17_version_strings_consistent():
 
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == shadowinfer.__version__ == "3.19.0"
+    assert pyproject["project"]["version"] == shadowinfer.__version__ == "3.20.0"
     assert cli.__version__ == shadowinfer.__version__
 
 
