@@ -370,3 +370,12 @@ specs/changes/AR018-real-dllm-weights/
 
 - s13 yaml + EXPERIMENTS.md + serve_arm.py 的完备性以「文档可独立复现」验收（环境/权重获取/命令/取证/S1-S3 判定标准/落档模板/诚实纪律）；
 - S1（draft-verify vs mask-init 端到端 >= 1.5x）/ S2（轮数削减 >= 2x）/ S3（vs remasking 基线 token 一致率 >= 0.90）为服务器场地断言；实测数据回填 EXPERIMENTS.md 与 README 基准表后才允许出现性能主张（本机 README 零性能数字，回填占位标注）。
+
+# 7 Erratum（设计期后修订档案）
+
+## 7.1 D7 tier (i) KV 逐位修订为登记容差（2026-10-24，T003 Green 期实证否证）
+
+- **原口径**：D7 tier (i) 断言段因果分解的 KV 投影「row-local 计算，跨形状逐位成立（torch.equal），沿 test_block_decoding.py 既有先例」。
+- **实证否证**：KV 投影自身是 GEMM 输出。本机（torch 2.5.1 CPU/MKL）实测：`[12,256]@[256,64]` 与 `[4,256]@[256,64]` 的共享行**不逐位**（max-abs 2.4e-7~1e-6，rel-L2 最高 ~7e-7）——M 维变化触发不同 microkernel 的 K 累加顺序；而 `[9,256]` vs `[4,256]` 恰同 kernel 逐位。既有 FB 先例（SimpleDiffusionLLM，hidden=128）通过属其形状的 kernel 幸运，非可泛化契约。同源现象即 D7 自己引用的「attention score matmul 形状差异引入归约顺序噪声」——该论证对 KV 投影同样成立，原 tier (i) 的「免疫」判断过于乐观。另：test 内联手写参考的向量 SLEEF cos 与标量 libm cos 存在 ~1 ulp 差，跨实现逐位同样不可行。
+- **修订后口径**：tier (i) 改为**登记容差 KV_TOL = 1e-5（rel-L2，逐层逐张量）**；tier (ii) logits rel-L2 <= 1e-6 与 tier (iii) argmax 逐位**不变**（实测 logits rel-L2 6.6e-7 通过）。语义错误（错行/错 RoPE 偏移）产生 O(1) 偏差，与 1e-5 容差有 100 倍以上分离度；生产侧无可行修复（forward_block 无法复用全前向的 GEMM M 维）。
+- **影响面**：tests/test_diffusion_llama.py 三处 KV 断言（golden block / 段因果锚点 / RoPE 分解）；D7 其余两级锚点与全部其他决策不受影响。

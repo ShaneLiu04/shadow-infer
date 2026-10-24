@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from shadowinfer.execution.block_decoding import segment_causal_mask
 from shadowinfer.models.diffusion_llama import (
     PRESETS,
     DiffusionLlama,
@@ -573,3 +575,456 @@ class TestFixtureGenAndPresets:
             assert kv_heads <= heads, name
             assert 0 <= preset["mask_token_id"] < preset["vocab_size"], name
             assert preset["num_hidden_layers"] >= 1, name
+
+
+# ---------------------------------------------------------------------------
+# P2: modeling-layer numeric comparison (AR018 T003, FR18.2)
+#
+# A hand-written INDEPENDENT reference implementation (test-inline golden,
+# explicit per-operator slow version, no production internals) compared
+# against forward_step/forward_block on real fixture weights (zero-mock).
+# The production modeling layer is currently NotImplementedError stubs;
+# every test below is expected to FAIL with NotImplementedError (Red).
+# ---------------------------------------------------------------------------
+
+# Registered golden tolerance (srs FR18.2 acceptance 1: fp32 logits vs the
+# hand-written reference, explicitly registered atol/rtol).
+GOLD_TOL_ATOL = 1e-5
+GOLD_TOL_RTOL = 1e-5
+
+# Registered rel-L2 tolerance for decomposition anchors (design D7 tier
+# (ii); mirrors the FB_TOL = 1e-6 precedent in tests/test_block_decoding.py).
+FB_TOL2 = 1e-6
+
+# Registered rel-L2 tolerance for the KV tier of decomposition anchors
+# (design D7 tier (i), revised by AR018 erratum: KV projections are
+# themselves GEMM outputs, so changing the GEMM M dimension (full
+# forward S rows vs block forward W rows) can switch the CPU
+# microkernel and its K-accumulator order -- measured 2e-7..1e-6
+# divergence for M=12 vs M=4, while M=9 vs M=4 stayed bitwise. The
+# same applies to the hand-written reference (vectorized SLEEF cos vs
+# scalar libm cos differ by ~1 ulp). Bitwise is kernel luck, not a
+# contract; a semantic decomposition error (wrong rows / wrong RoPE
+# offset) produces O(1) divergence, cleanly separated by this
+# tolerance).
+KV_TOL = 1e-5
+
+# Tiny fp tolerance for closed-form RoPE angle checks (cos/sin of the
+# per-pair inverse frequency).
+ROPE_ANGLE_TOL = 1e-6
+
+# Fixed P2 geometry: S = P + W + W2 (prompt / block under test / trailing
+# future segment that the segment-causal mask must genuinely hide).
+_P2_PREFIX = 5  # P
+_P2_WIDTH = 4  # W
+_P2_TAIL = 3  # W2 (future segment hidden from block rows)
+_P2_SEQ = _P2_PREFIX + _P2_WIDTH + _P2_TAIL  # S = 12
+
+# Fixed seeds for deterministic inputs (torch.manual_seed discipline).
+_P2_SEED = 4303
+_P2_BLOCK_SEED = 4307
+_P2_ANCHOR_SEED = 4311
+_P2_ROPE_VEC_SEED = 4313
+_P2_ROPE_FWD_SEED = 4317
+
+# Golden matrix head configurations: GQA (kv 2 < q 8) and MHA (kv 8 == q 8),
+# both as _TINY overrides.
+_P2_KV_HEADS = [2, 8]
+
+
+def _p2_model(tmp_path: Path, name: str, **overrides: Any) -> DiffusionLlama:
+    """Generate a real fixture and load it (zero-mock, D12)."""
+    manifest = _gen_fixture(tmp_path / name, **overrides)
+    return load_diffusion_llama(manifest["out_dir"])
+
+
+def _p2_ids(model: DiffusionLlama, seq_len: int, seed: int) -> torch.Tensor:
+    """Deterministic [1, seq_len] token ids in [0, vocab_size)."""
+    torch.manual_seed(seed)
+    return torch.randint(0, model.vocab_size, (1, seq_len))
+
+
+def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Relative L2 distance (mirrors tests/test_block_decoding.py)."""
+    return float((a - b).norm() / b.norm().clamp_min(1e-12))
+
+
+# --- hand-written reference implementation (no production internals) ---
+
+
+def _ref_inv_freq(theta: float, head_dim: int) -> torch.Tensor:
+    """inv_freq = theta ** (-arange(0, D, 2) / D) (design D6)."""
+    return theta ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+
+
+def _ref_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """x / sqrt(mean(x^2) + eps) * weight."""
+    variance = x.pow(2).mean(-1, keepdim=True)
+    return x / torch.sqrt(variance + eps) * weight
+
+
+def _ref_rope(x: torch.Tensor, inv_freq: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
+    """HF-style rotate-half RoPE (design D6), explicit per-pair loop.
+
+    x: [B, H, T, D]; pair j couples (x[..., j], x[..., j + D/2]) and
+    rotates by angle (position_offset + t) * inv_freq[j]:
+    out[..., j] = x0*cos - x1*sin, out[..., j + D/2] = x0*sin + x1*cos.
+    This is the standard cat(freqs, freqs) rotate-half pairing used by
+    HF Llama/Qwen (and thus by the real LLaDA-8B / Dream-7B training
+    code); the pairing is part of the convention and must match the
+    production implementation for real-checkpoint fidelity.
+    """
+    batch, heads, seq_len, head_dim = x.shape
+    half = head_dim // 2
+    out = torch.empty_like(x)
+    for t in range(seq_len):
+        pos = position_offset + t
+        for j in range(half):
+            angle = pos * inv_freq[j]
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            x0 = x[:, :, t, j]
+            x1 = x[:, :, t, j + half]
+            out[:, :, t, j] = x0 * cos_a - x1 * sin_a
+            out[:, :, t, j + half] = x0 * sin_a + x1 * cos_a
+    return out
+
+
+def _ref_repeat_kv(t: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """GQA expand [B, H_kv, T, D] -> [B, H_kv*n_rep, T, D]: each kv head is
+    repeated n_rep consecutive times (identity when n_rep == 1)."""
+    if n_rep == 1:
+        return t
+    heads = []
+    for h in range(t.shape[1]):
+        for _ in range(n_rep):
+            heads.append(t[:, h : h + 1])
+    return torch.cat(heads, dim=1)
+
+
+def _ref_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """softmax(q @ k^T / sqrt(D) + mask) @ v per head, explicit head loop.
+
+    q: [B, H, Tq, D]; k/v: [B, H, Tk, D] (already GQA-expanded); mask:
+    additive [Tq, Tk] (0 keep / -inf hide, mirroring segment_causal_mask)
+    or None for fully bidirectional attention.
+    """
+    batch, heads, tgt_len, head_dim = q.shape
+    out = torch.empty(batch, heads, tgt_len, head_dim)
+    scale = math.sqrt(head_dim)
+    for b in range(batch):
+        for h in range(heads):
+            scores = q[b, h] @ k[b, h].t() / scale
+            if mask is not None:
+                scores = scores + mask
+            probs = torch.softmax(scores, dim=-1)
+            out[b, h] = probs @ v[b, h]
+    return out
+
+
+def _ref_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """y = x @ W^T (no bias; fixtures in the P2 matrix are bias-free)."""
+    return x @ weight.t()
+
+
+def _ref_silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU = x * sigmoid(x)."""
+    return x * torch.sigmoid(x)
+
+
+def _ref_forward(
+    model: DiffusionLlama,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    prefix_kv: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    prefix_len: int = 0,
+) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+    """Hand-written golden forward (design 6.1 P2; NOT production code).
+
+    Modes:
+      - prefix_kv None: full-sequence forward over input_ids [B, S] with
+        attention_mask None (D5(a) bidirectional) or an additive [S, S]
+        mask (D5(b) segment-causal).
+      - prefix_kv given: D5(c) block-rows conditional forward over
+        input_ids [B, W]; rows sit at absolute positions
+        [prefix_len, prefix_len + W) and attend to cat(prefix, block)
+        with no mask.
+
+    Returns (logits [B, T, V], kv {layer: (k, v)}) where k/v are this
+    call's own rows, KV-head-native [B, num_kv_heads, T, D] (design D2).
+    """
+    params = dict(model.named_parameters())
+    cfg = model.config
+    num_heads = model.num_heads
+    num_kv_heads = model.num_kv_heads
+    head_dim = model.head_dim
+    n_rep = num_heads // num_kv_heads
+    eps = cfg.rms_norm_eps
+    inv_freq = _ref_inv_freq(cfg.rope_theta, head_dim)
+
+    h = params["model.embed_tokens.weight"][input_ids]
+    batch, seq_len, _ = h.shape
+    offset = prefix_len if prefix_kv is not None else 0
+    mask = None if prefix_kv is not None else attention_mask
+
+    kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer in range(model.num_layers):
+        prefix = f"model.layers.{layer}"
+        normed = _ref_rmsnorm(h, params[f"{prefix}.input_layernorm.weight"], eps)
+        q = _ref_linear(normed, params[f"{prefix}.self_attn.q_proj.weight"])
+        k = _ref_linear(normed, params[f"{prefix}.self_attn.k_proj.weight"])
+        v = _ref_linear(normed, params[f"{prefix}.self_attn.v_proj.weight"])
+        q = q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        q = _ref_rope(q, inv_freq, offset)
+        k = _ref_rope(k, inv_freq, offset)
+        if prefix_kv is not None:
+            past_k, past_v = prefix_kv[layer]
+            k_all = torch.cat([past_k, k], dim=2)
+            v_all = torch.cat([past_v, v], dim=2)
+        else:
+            k_all, v_all = k, v
+        attn = _ref_attention(q, _ref_repeat_kv(k_all, n_rep), _ref_repeat_kv(v_all, n_rep), mask)
+        attn = attn.transpose(1, 2).reshape(batch, seq_len, num_heads * head_dim)
+        h = h + _ref_linear(attn, params[f"{prefix}.self_attn.o_proj.weight"])
+        normed_post = _ref_rmsnorm(h, params[f"{prefix}.post_attention_layernorm.weight"], eps)
+        gate = _ref_linear(normed_post, params[f"{prefix}.mlp.gate_proj.weight"])
+        up = _ref_linear(normed_post, params[f"{prefix}.mlp.up_proj.weight"])
+        h = h + _ref_linear(_ref_silu(gate) * up, params[f"{prefix}.mlp.down_proj.weight"])
+        kv[layer] = (k, v)
+
+    h = _ref_rmsnorm(h, params["model.norm.weight"], eps)
+    logits = _ref_linear(h, params["lm_head.weight"])
+    return logits, kv
+
+
+class TestModelingGoldenComparison:
+    """P2 golden matrix (design 6.1 P2, srs FR18.2 acceptance 1):
+    {mask state (a)/(b)} x {GQA, MHA} x {RoPE offset 0 via full forward,
+    nonzero via mode (c) block positions} against the hand-written
+    reference, on real fixture weights."""
+
+    @pytest.mark.parametrize("mask_state", ["bidirectional", "segment-causal"])
+    @pytest.mark.parametrize("num_kv_heads", _P2_KV_HEADS, ids=["gqa-kv2", "mha-kv8"])
+    def test_golden_full_forward(self, tmp_path, num_kv_heads, mask_state):
+        model = _p2_model(tmp_path, "fx_golden_full", num_kv_heads=num_kv_heads)
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+        if mask_state == "bidirectional":
+            mask = None  # D5(a): fully bidirectional, no mask.
+        else:
+            # D5(b): the repo's segment-causal additive mask, zero-change
+            # reuse; prompt / block / trailing-future segment split.
+            mask = segment_causal_mask(_P2_SEQ, _P2_PREFIX, _P2_WIDTH, torch.device("cpu"))
+
+        logits, kv, third = model.forward_step(ids, 0, 0, attention_mask=mask)
+        ref_logits, _ = _ref_forward(model, ids, attention_mask=mask)
+
+        assert third is None
+        assert logits.shape == (1, _P2_SEQ, model.vocab_size)
+        assert torch.allclose(logits, ref_logits, atol=GOLD_TOL_ATOL, rtol=GOLD_TOL_RTOL)
+        # KV contract: KV-head-native width (design D2), one entry per layer.
+        assert set(kv) == set(range(model.num_layers))
+        for layer in range(model.num_layers):
+            k, v = kv[layer]
+            assert k.shape == (1, model.num_kv_heads, _P2_SEQ, model.head_dim)
+            assert v.shape == (1, model.num_kv_heads, _P2_SEQ, model.head_dim)
+
+    @pytest.mark.parametrize("num_kv_heads", _P2_KV_HEADS, ids=["gqa-kv2", "mha-kv8"])
+    def test_golden_block_conditional(self, tmp_path, num_kv_heads):
+        model = _p2_model(tmp_path, "fx_golden_block", num_kv_heads=num_kv_heads)
+        seq = _P2_PREFIX + _P2_WIDTH
+        ids = _p2_ids(model, seq, _P2_BLOCK_SEED)
+        prompt_ids = ids[:, :_P2_PREFIX]
+        block_ids = ids[:, _P2_PREFIX:]
+
+        # Model path: bidirectional prefill (D5(a)) feeds the model's own
+        # kv contract into forward_block (D5(c)).
+        _, prefix_kv, _ = model.forward_step(prompt_ids, 0, 0)
+        block_logits, block_kv = model.forward_block(
+            block_ids, prefix_kv=prefix_kv, prefix_len=_P2_PREFIX
+        )
+
+        # Reference path: its own bidirectional prefix forward, then only
+        # the block rows at absolute positions [P, P+W) with no mask.
+        _, ref_prefix_kv = _ref_forward(model, prompt_ids)
+        ref_block_logits, ref_block_kv = _ref_forward(
+            model, block_ids, prefix_kv=ref_prefix_kv, prefix_len=_P2_PREFIX
+        )
+
+        assert block_logits.shape == (1, _P2_WIDTH, model.vocab_size)
+        assert torch.allclose(
+            block_logits, ref_block_logits, atol=GOLD_TOL_ATOL, rtol=GOLD_TOL_RTOL
+        )
+        assert set(block_kv) == set(range(model.num_layers))
+        for layer in range(model.num_layers):
+            ref_k, ref_v = ref_block_kv[layer]
+            block_k, block_v = block_kv[layer]
+            assert block_k.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)
+            # KV tier (D7 tier (i), tolerance-revised per erratum): the
+            # block k/v must match the reference's block-row k/v
+            # projections within the registered rounding-noise tolerance.
+            assert _rel_l2(block_k, ref_k) <= KV_TOL
+            assert _rel_l2(block_v, ref_v) <= KV_TOL
+
+
+class TestSegmentCausalDecompositionAnchor:
+    """D7 two-tier anchor (srs FR18.2 acceptance 2): segment-causal full
+    forward block rows vs bidirectional prefill + forward_block, with a
+    trailing future segment W2 the mask genuinely hides."""
+
+    @pytest.mark.parametrize("num_kv_heads", _P2_KV_HEADS, ids=["gqa-kv2", "mha-kv8"])
+    def test_two_tier_anchor(self, tmp_path, num_kv_heads):
+        model = _p2_model(tmp_path, "fx_anchor", num_kv_heads=num_kv_heads)
+        full_ids = _p2_ids(model, _P2_SEQ, _P2_ANCHOR_SEED)
+        prompt_ids = full_ids[:, :_P2_PREFIX]
+        block_ids = full_ids[:, _P2_PREFIX : _P2_PREFIX + _P2_WIDTH]
+        # Block-1 rows see prompt + block 0 + block 1 but NOT block 2.
+        mask = segment_causal_mask(_P2_SEQ, _P2_PREFIX, _P2_WIDTH, torch.device("cpu"))
+
+        # (i) masked full-sequence forward; (ii) bidirectional prefill;
+        # (iii) block-rows conditional forward.
+        full_logits, full_kv, _ = model.forward_step(full_ids, 0, 0, attention_mask=mask)
+        _, prefix_kv, _ = model.forward_step(prompt_ids, 0, 0)
+        block_logits, block_kv = model.forward_block(
+            block_ids, prefix_kv=prefix_kv, prefix_len=_P2_PREFIX
+        )
+
+        assert full_logits.shape == (1, _P2_SEQ, model.vocab_size)
+        assert block_logits.shape == (1, _P2_WIDTH, model.vocab_size)
+        assert set(block_kv) == set(range(model.num_layers))
+
+        # KV tier (D7 (i), tolerance-revised per erratum): KV projections
+        # are mask-independent row-local computations up to GEMM kernel
+        # selection, so rows [P, P+W) of the full forward's kv match
+        # block_kv within the registered rounding-noise tolerance.
+        for layer in range(model.num_layers):
+            full_k, full_v = full_kv[layer]
+            block_k, block_v = block_kv[layer]
+            assert block_k.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)
+            assert _rel_l2(full_k[:, :, _P2_PREFIX : _P2_PREFIX + _P2_WIDTH, :], block_k) <= KV_TOL
+            assert _rel_l2(full_v[:, :, _P2_PREFIX : _P2_PREFIX + _P2_WIDTH, :], block_v) <= KV_TOL
+
+        # Logits tier (D7 (ii)): rel-L2 within the registered tolerance
+        # (not bitwise: attention matmul shape difference, repo fp32
+        # precedent "not bitwise").
+        full_rows = full_logits[:, _P2_PREFIX : _P2_PREFIX + _P2_WIDTH, :]
+        assert _rel_l2(full_rows, block_logits) <= FB_TOL2
+        # Argmax tier: per-position decoding decisions identical.
+        assert torch.equal(full_rows.argmax(-1), block_logits.argmax(-1))
+
+
+class TestRopeMathProperties:
+    """RoPE math properties (design D6): the inv_freq formula, the
+    adjacent-position rotation angle increment, and absolute-position
+    offset correctness via the model's own decomposition."""
+
+    @pytest.mark.parametrize("rope_theta", [10000.0, 500000.0])
+    def test_rope_properties(self, tmp_path, rope_theta):
+        model = _p2_model(tmp_path, "fx_rope", rope_theta=rope_theta)
+        head_dim = model.head_dim
+        expected = _ref_inv_freq(rope_theta, head_dim)
+
+        # (1) The public inv_freq buffer matches theta ** (-2i/d).
+        assert model.inv_freq.shape == (head_dim // 2,)
+        assert torch.allclose(model.inv_freq, expected, rtol=ROPE_ANGLE_TOL, atol=1e-12)
+
+        # (2) Adjacent positions differ by exactly the per-pair angle:
+        # rotating a fixed vector at position p vs p+1 turns each (even,
+        # odd) pair by exactly inv_freq[i] = theta^(-2i/d).
+        torch.manual_seed(_P2_ROPE_VEC_SEED)
+        vec = torch.randn(head_dim)
+        half = head_dim // 2
+        for pos in (0, 3, _P2_PREFIX):
+            rot_p = _ref_rope(vec.view(1, 1, 1, head_dim), expected, pos)[0, 0, 0]
+            rot_p1 = _ref_rope(vec.view(1, 1, 1, head_dim), expected, pos + 1)[0, 0, 0]
+            for j in range(half):
+                # Rotate-half pairs couple (j, j + D/2) (HF Llama/Qwen
+                # convention, design D6); treat each pair as a complex
+                # number and check the adjacent-position angle increment.
+                z_p = torch.complex(rot_p[j], rot_p[j + half])
+                z_p1 = torch.complex(rot_p1[j], rot_p1[j + half])
+                angle_diff = torch.angle(z_p1 * torch.conj(z_p))
+                assert abs(float(angle_diff) - float(expected[j])) <= ROPE_ANGLE_TOL
+
+        # (3) Position-offset correctness: with no mask anywhere and the
+        # block as the tail (S = P + W), the full bidirectional forward's
+        # block rows have exactly the receptive field of prefix + block
+        # conditional rows, so the decomposition must match within the
+        # registered rel-L2 tiers, agree on argmax, and match KV rows
+        # within the registered KV tolerance (RoPE at absolute positions
+        # [P, P+W) makes the KV rows match up to kernel rounding; a wrong
+        # offset produces O(1) divergence, far above KV_TOL).
+        # The prefix kv is taken from the full bidirectional forward's own
+        # prefix rows so both paths condition on identical prefix keys.
+        seq = _P2_PREFIX + _P2_WIDTH
+        torch.manual_seed(_P2_ROPE_FWD_SEED)
+        ids = torch.randint(0, model.vocab_size, (1, seq))
+        full_logits, full_kv, _ = model.forward_step(ids, 0, 0)
+        prefix_kv = {
+            layer: (k[:, :, :_P2_PREFIX, :], v[:, :, :_P2_PREFIX, :])
+            for layer, (k, v) in full_kv.items()
+        }
+        block_logits, block_kv = model.forward_block(
+            ids[:, _P2_PREFIX:], prefix_kv=prefix_kv, prefix_len=_P2_PREFIX
+        )
+
+        full_rows = full_logits[:, _P2_PREFIX:, :]
+        assert _rel_l2(full_rows, block_logits) <= FB_TOL2
+        assert torch.equal(full_rows.argmax(-1), block_logits.argmax(-1))
+        for layer in range(model.num_layers):
+            full_k, full_v = full_kv[layer]
+            block_k, block_v = block_kv[layer]
+            assert _rel_l2(full_k[:, :, _P2_PREFIX:, :], block_k) <= KV_TOL
+            assert _rel_l2(full_v[:, :, _P2_PREFIX:, :], block_v) <= KV_TOL
+
+
+class TestMhaZeroSpecialCase:
+    """FR18.2 acceptance 3: MHA (num_kv_heads == num_heads) loads and
+    forwards through the golden comparison path with zero special-casing
+    (GQA repeat factor 1); independent of SimpleDiffusionLLM."""
+
+    def test_mha_golden_forward_step_and_forward_block(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_mha", num_kv_heads=8)
+        assert model.num_kv_heads == model.num_heads
+
+        # Full-sequence bidirectional golden.
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+        logits, kv, _ = model.forward_step(ids, 0, 0)
+        ref_logits, _ = _ref_forward(model, ids)
+
+        assert logits.shape == (1, _P2_SEQ, model.vocab_size)
+        assert torch.allclose(logits, ref_logits, atol=GOLD_TOL_ATOL, rtol=GOLD_TOL_RTOL)
+        for layer in range(model.num_layers):
+            k, v = kv[layer]
+            assert k.shape == (1, model.num_kv_heads, _P2_SEQ, model.head_dim)
+            assert v.shape == (1, model.num_kv_heads, _P2_SEQ, model.head_dim)
+
+        # Block-rows conditional golden (repeat factor 1).
+        seq = _P2_PREFIX + _P2_WIDTH
+        ids_block = _p2_ids(model, seq, _P2_BLOCK_SEED)
+        _, prefix_kv, _ = model.forward_step(ids_block[:, :_P2_PREFIX], 0, 0)
+        block_logits, block_kv = model.forward_block(
+            ids_block[:, _P2_PREFIX:], prefix_kv=prefix_kv, prefix_len=_P2_PREFIX
+        )
+        _, ref_prefix_kv = _ref_forward(model, ids_block[:, :_P2_PREFIX])
+        ref_block_logits, _ = _ref_forward(
+            model,
+            ids_block[:, _P2_PREFIX:],
+            prefix_kv=ref_prefix_kv,
+            prefix_len=_P2_PREFIX,
+        )
+
+        assert block_logits.shape == (1, _P2_WIDTH, model.vocab_size)
+        assert torch.allclose(
+            block_logits, ref_block_logits, atol=GOLD_TOL_ATOL, rtol=GOLD_TOL_RTOL
+        )
+        for layer in range(model.num_layers):
+            block_k, block_v = block_kv[layer]
+            assert block_k.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)
+            assert block_v.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)

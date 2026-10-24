@@ -31,7 +31,7 @@
 |---|---|---|
 | T001 | passing | 2026-10-24 完成（验收自验 36/36：确定性/双 style/双布局/GQA/MHA/tie/bf16/预设一致性/异常路径） |
 | T002 | passing | 2026-10-24 完成（34/34：P1 加载器 29 + P5 fixture/预设 5；全量回归 1248 passed / 1 skipped / 84.87%） |
-| T003 | pending | - |
+| T003 | passing | 2026-10-24 完成（11/11 P2 用例；全量回归 1259 passed / 1 skipped / 84.94%；D7 erratum 7.1 落档） |
 | T004 | pending | - |
 | T005 | pending | - |
 | T006 | pending | - |
@@ -55,3 +55,14 @@
 - 实现要点：fail-fast 校验全前置于模块构造（路径→config 字段→维度→mask 范围→dtype 参数→文件存在→index 一致性→权重集合→形状）；期望权重名集合由 config 推导（D9 单一映射，非硬编码）；meta 设备构造 + `torch.utils.swap_tensors` 绑定真实权重（swap_tensors 连 Python 类型一起交换，替换张量须先包 nn.Parameter）；tie 时 lm_head 共享 embed_tokens 参数；inv_freq 为非持久 buffer（不出现在 named_parameters）；错误路径零部分加载（所有 ValueError 携带定位字段/张量/文件名）
 - T002 验收：34/34（加载器 29 + fixture/预设 5）；权重保真以 safetensors 原始回读多重集逐张量 torch.equal 断言（单片/分片跨布局 bitwise 一致、bf16→fp32 无损、auto 保 dtype）；全量回归 1248 passed / 1 skipped / 84.87%，五门禁全绿（black/isort/flake8 0 issue，mypy 76 files 0 issue）
 - 备注：forward_step/forward_block 为 NotImplementedError 占位（签名对齐 design 4.3），T003 实现建模层
+
+### 2026-10-24 会话记录（T003，标准 TDD）
+
+- 完成阶段：T003 Red（子代理写 P2 建模层数值对照测试 11 用例 4 类）+ T003 Green（主代理实现 diffusion_llama.py 建模层）
+- 修改文件：tests/test_diffusion_llama.py（P2 追加 + 两处 Red 期修正）、shadowinfer/models/diffusion_llama.py（建模层）、design.md（Erratum 7.1）
+- Red 期测试内容：手写参考实现（_ref_forward：RMSNorm/RoPE/SwiGLU/repeat_kv attention 显式逐算子）golden 对照（登记 atol=rtol=1e-5）× {全双向/段因果} × {GQA kv2/MHA kv8} × {偏移 0/块行偏移}；段因果分解两级锚点（KV 层 + logits rel-L2 层 + argmax 层）；RoPE 数学性质（inv_freq 公式 + 相邻位置旋转角差 + 位置偏移分解）；MHA 零特判独立路径
+- Red 期两处主代理修正（子代理偏离，均已落测试内注释）：①参考实现 RoPE 配对从交错式 (x[2i],x[2i+1])（GPT-J 风格）改为分半式 (x[j],x[j+D/2))——D6「标准 rotate-half」= HF Llama/Qwen 的 cat(freqs,freqs) 配对，真实 LLaDA/Dream checkpoint 训练口径，交错式将在 s13 产生错误 logits；RoPE 角度断言同步改分半配对
+- **Green 期实证否证与 Erratum 7.1**：D7 tier (i)「KV 投影跨形状逐位」被实测否证——KV 投影自身是 GEMM 输出，M 维变化切换 MKL microkernel（[12,256] vs [4,256] 共享行差 2.4e-7~1e-6；[9,256] vs [4,256] 恰同 kernel 逐位；FB 先例通过属形状幸运）；跨实现逐位亦不可行（SLEEF 向量化 cos vs 标量 libm cos ~1 ulp）。修订：KV 层改登记容差 KV_TOL=1e-5（rel-L2），logits 层（FB_TOL2=1e-6，实测 6.6e-7）与 argmax 层不变；语义错误 O(1) 与容差有 100 倍分离度。三处测试断言同步修订
+- 实现要点：单层计算序严格同构参考（embedding→[rmsnorm→qkv proj→rope→repeat_kv→scores=q@k^T/sqrt(d)+mask→softmax→@v→o_proj→残差→rmsnorm→SwiGLU→残差]→norm→lm_head）；KV 为 post-RoPE KV-head 原生口径 [B,H_kv,T,D]（D2）；forward_step 校验 kv_cache 拒绝（D11）/ids 2-D 整型/超长/mask [S,S]|[1,1,S,S] 广播；forward_block 校验镜像 SimpleDiffusionLLM 口径（prefix_len>=0/prefix_kv 缺层/形状 [B,H_kv,L,D]）；cos/sin 以 inv_freq float32 计算后 cast 参数 dtype（bf16 兼容）；meta 构造路径复用 T002 加载器
+- T003 验收：11/11 P2；全量回归 1259 passed / 1 skipped / 84.94%；五门禁全绿
+- 备注：Gold 期发现的 `[9,256]` vs `[4,256]` 逐位属 kernel 幸运，RoPE 分解测试已同步改容差口径避免脆弱断言

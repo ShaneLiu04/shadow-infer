@@ -24,11 +24,13 @@ path is fully config-driven (design D13).
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch import nn
 from torch.utils import swap_tensors
@@ -285,6 +287,27 @@ def _compute_inv_freq(config: DiffusionLlamaConfig, head_dim: int) -> torch.Tens
     return 1.0 / (config.rope_theta**exponents)
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Standard rotate-half helper: [-x2, x1] over the two halves."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """GQA expand [B, H_kv, T, D] -> [B, H_kv * n_rep, T, D].
+
+    Each KV head is repeated ``n_rep`` consecutive times so query head h
+    attends to KV head h // n_rep; identity when ``n_rep == 1`` (MHA,
+    zero special-casing, design D2).
+    """
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    expanded = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+    return expanded.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
 class DiffusionLlamaRMSNorm(nn.Module):
     """RMSNorm with a single ``weight`` parameter (Llama/Qwen naming)."""
 
@@ -294,7 +317,8 @@ class DiffusionLlamaRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("RMSNorm forward lands in AR018 T003")
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        return hidden_states / torch.sqrt(variance + self.eps) * self.weight
 
 
 class DiffusionLlamaMLP(nn.Module):
@@ -307,14 +331,22 @@ class DiffusionLlamaMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("MLP forward lands in AR018 T003")
+        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 class DiffusionLlamaAttention(nn.Module):
-    """GQA attention: q/k/v/o projections (qkv biases per config)."""
+    """GQA attention: q/k/v/o projections (qkv biases per config).
+
+    Returns, alongside the attention output, this call's own KV
+    projections at KV-head-native width [B, num_kv_heads, T, D] AFTER
+    RoPE (design D2: the pipeline consumes post-RoPE KV).
+    """
 
     def __init__(self, config: DiffusionLlamaConfig, head_dim: int) -> None:
         super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = head_dim
         qkv_out = config.num_attention_heads * head_dim
         kv_out = config.num_key_value_heads * head_dim
         self.q_proj = nn.Linear(config.hidden_size, qkv_out, bias=config.attention_bias)
@@ -322,8 +354,43 @@ class DiffusionLlamaAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, kv_out, bias=config.attention_bias)
         self.o_proj = nn.Linear(qkv_out, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Attention forward lands in AR018 T003")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, seq_len, _ = hidden_states.shape
+        n_rep = self.num_heads // self.num_kv_heads
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        q = q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k_all = torch.cat((past_k, k), dim=2)
+            v_all = torch.cat((past_v, v), dim=2)
+        else:
+            k_all, v_all = k, v
+
+        k_exp = _repeat_kv(k_all, n_rep)
+        v_exp = _repeat_kv(v_all, n_rep)
+        scores = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        probs = torch.softmax(scores, dim=-1)
+        attn = torch.matmul(probs, v_exp)
+        attn = attn.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
+        return self.o_proj(attn), k, v
 
 
 class DiffusionLlamaDecoderLayer(nn.Module):
@@ -338,8 +405,20 @@ class DiffusionLlamaDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Decoder layer forward lands in AR018 T003")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        normed = self.input_layernorm(hidden_states)
+        attn_out, k, v = self.self_attn(normed, cos, sin, attention_mask, past_kv)
+        hidden_states = hidden_states + attn_out
+        normed = self.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + self.mlp(normed)
+        return hidden_states, k, v
 
 
 class DiffusionLlamaModel(nn.Module):
@@ -353,8 +432,22 @@ class DiffusionLlamaModel(nn.Module):
         )
         self.norm = DiffusionLlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Model forward lands in AR018 T003")
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        prefix_kv: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+        hidden_states = self.embed_tokens(input_ids)
+        kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer_id, layer in enumerate(self.layers):
+            past_kv = prefix_kv.get(layer_id) if prefix_kv is not None else None
+            hidden_states, k, v = layer(hidden_states, cos, sin, attention_mask, past_kv)
+            kv[layer_id] = (k, v)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, kv
 
 
 class DiffusionLlama(nn.Module):
@@ -411,6 +504,34 @@ class DiffusionLlama(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def _cos_sin(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin tables for absolute ``positions`` (rotate-half, D6).
+
+        Computed in float32 (the inv_freq buffer dtype), then cast to the
+        parameter dtype so bf16 checkpoints keep bf16 activations.
+        """
+        freqs = torch.outer(positions.to(self.inv_freq.dtype), self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        param_dtype = self.model.embed_tokens.weight.dtype
+        return emb.cos().to(param_dtype), emb.sin().to(param_dtype)
+
+    def _validate_input_ids(self, x: torch.Tensor, name: str) -> Tuple[int, int]:
+        """Validate [B, S] integer token ids; return (batch, seq_len)."""
+        if x.dim() != 2:
+            raise ValueError(
+                f"{name} must be [batch, seq_len] integer token ids, " f"got dim={x.dim()}"
+            )
+        if x.dtype not in (torch.long, torch.int):
+            raise ValueError(
+                f"{name} must be an integer tensor of token ids, " f"got dtype={x.dtype}"
+            )
+        seq_len = x.shape[1]
+        if seq_len < 1:
+            raise ValueError(f"{name} seq_len must be >= 1, got {seq_len}")
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"{name} seq_len ({seq_len}) exceeds max_seq_len ({self.max_seq_len})")
+        return x.shape[0], seq_len
+
     def forward_step(
         self,
         x: torch.Tensor,
@@ -421,12 +542,55 @@ class DiffusionLlama(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], None]:
         """Full-sequence forward (prefill / full recompute / remasking arm).
 
-        Returns ``(logits [B,S,V], kv {layer: (k, v) [B, num_kv_heads, S,
-        D]}, None)``. ``step_t``/``total_steps`` are accepted but ignored
-        (dLLMs carry no timestep semantics). ``kv_cache`` must be None
-        (design D11: AR-style incremental KV serving is rejected).
+        Args:
+            x: [B, S] integer token ids.
+            step_t/total_steps: Accepted but ignored (dLLMs carry no
+                timestep semantics; pipeline-compat placeholders).
+            kv_cache: Must be None. dLLM blockwise serving rejects
+                AR-style incremental KV semantics (design D11).
+            attention_mask: Optional additive mask, [S, S] or
+                [1, 1, S, S]; None = fully bidirectional (design D5(a)).
+
+        Returns:
+            ``(logits [B, S, V], kv, None)`` where ``kv`` maps every layer
+            to its post-RoPE (k, v) at KV-head-native width
+            ``[B, num_kv_heads, S, head_dim]`` (design D2).
+
+        Raises:
+            ValueError: If ``kv_cache`` is not None, ``x`` is not [B, S]
+                integer ids within max_seq_len, or ``attention_mask`` is
+                not [S, S] / [1, 1, S, S].
         """
-        raise NotImplementedError("forward_step lands in AR018 T003")
+        if kv_cache is not None:
+            raise ValueError(
+                "DiffusionLlama.forward_step does not accept kv_cache: "
+                "dLLM blockwise serving rejects AR-style incremental KV "
+                "semantics (design D11); use forward_block with prefix_kv"
+            )
+        _, seq_len = self._validate_input_ids(x, "x")
+
+        mask4: Optional[torch.Tensor] = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                mask4 = attention_mask[None, None, :, :]
+            elif attention_mask.dim() == 4:
+                mask4 = attention_mask
+            else:
+                raise ValueError(
+                    f"attention_mask must be [S, S] or [1, 1, S, S], got "
+                    f"shape {tuple(attention_mask.shape)}"
+                )
+            if tuple(mask4.shape[-2:]) != (seq_len, seq_len):
+                raise ValueError(
+                    f"attention_mask must cover [S, S] = "
+                    f"({seq_len}, {seq_len}), got {tuple(mask4.shape[-2:])}"
+                )
+
+        positions = torch.arange(seq_len, device=self.device)
+        cos, sin = self._cos_sin(positions)
+        hidden_states, kv = self.model(x, cos, sin, mask4, None)
+        logits = self.lm_head(hidden_states)
+        return logits, kv, None
 
     def forward_block(
         self,
@@ -439,10 +603,57 @@ class DiffusionLlama(nn.Module):
         """Block-rows conditional forward (design D5(c)): compute only the
         tail W rows conditioned on the frozen ``prefix_kv``.
 
-        Returns ``(logits [B,W,V], block_kv {layer: (k, v) [B,
-        num_kv_heads, W, D]})``.
+        Active rows sit at absolute positions ``[prefix_len, prefix_len +
+        W)`` (RoPE offset, design D6) and attend to ``cat(prefix, block)``
+        with no mask (the frozen prefix is the condition, not a peer).
+
+        Args:
+            x_block: [B, W] integer token ids for the active rows.
+            prefix_kv: Per-layer post-RoPE (k, v) at KV-head-native width
+                ``[B, num_kv_heads, prefix_len, head_dim]``; may be None
+                only when ``prefix_len == 0``.
+            prefix_len: Number of frozen prefix rows (>= 0).
+            step_t/total_steps: Accepted but ignored.
+
+        Returns:
+            ``(logits [B, W, V], block_kv)`` where ``block_kv`` maps every
+            layer to this call's own post-RoPE (k, v) rows at
+            ``[B, num_kv_heads, W, head_dim]``.
+
+        Raises:
+            ValueError: If ``x_block`` is not [B, W] integer ids within
+                max_seq_len, ``prefix_len`` is negative, ``prefix_kv`` is
+                missing while ``prefix_len > 0``, its layer set is
+                incomplete, or any k/v shape deviates from
+                ``[B, num_kv_heads, prefix_len, head_dim]``.
         """
-        raise NotImplementedError("forward_block lands in AR018 T003")
+        if prefix_len < 0:
+            raise ValueError(f"prefix_len must be >= 0, got {prefix_len}")
+        batch, width = self._validate_input_ids(x_block, "x_block")
+
+        if prefix_kv is None:
+            if prefix_len != 0:
+                raise ValueError(f"prefix_kv is required when prefix_len={prefix_len} > 0")
+        else:
+            expected_layers = set(range(self.num_layers))
+            if set(prefix_kv.keys()) != expected_layers:
+                raise ValueError(
+                    f"prefix_kv must cover exactly layers {sorted(expected_layers)}, "
+                    f"got {sorted(prefix_kv.keys())}"
+                )
+            expected_shape = (batch, self.num_kv_heads, prefix_len, self.head_dim)
+            for layer_id, (past_k, past_v) in prefix_kv.items():
+                if tuple(past_k.shape) != expected_shape or tuple(past_v.shape) != expected_shape:
+                    raise ValueError(
+                        f"prefix_kv[{layer_id}] must have shape {expected_shape}, "
+                        f"got k={tuple(past_k.shape)}, v={tuple(past_v.shape)}"
+                    )
+
+        positions = torch.arange(prefix_len, prefix_len + width, device=self.device)
+        cos, sin = self._cos_sin(positions)
+        hidden_states, block_kv = self.model(x_block, cos, sin, None, prefix_kv)
+        logits = self.lm_head(hidden_states)
+        return logits, block_kv
 
 
 def load_diffusion_llama(
