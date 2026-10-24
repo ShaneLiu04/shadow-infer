@@ -217,6 +217,16 @@ configs/experiments/
 - **T004 e2e 行为**（FR17.1/17.2 验收）：**draft-verify paged vs baseline draft-verify 逐位一致**（fp32，段因果时间不变性锚点，多块两规模）；构造两轮收敛轨迹核验 rounds_to_fixpoint==2；永不收敛轨迹 + max_rounds 强制收尾（forced_completions 计数 + 封存前向回代）；batch 元素不同收敛轮数独立；max_rounds=1 退化（仅草拟，forced 记账）。
 - **T005 基准接口冒烟**：ar017_bench.py 探针模式可跑（小规模单 seed），断言机制存在。
 
+**§6.1 erratum（2026-10-23，Review D4 Minor）**：第五分区「T005 基准接口冒烟」未以
+pytest 用例交付（tests/test_draft_verify_decoding.py 实含 T001-T004 四分区，86 用例），
+改为由以下实跑资产替代覆盖（用户确认 erratum 处置）：(1) T005 探针冒烟实跑
+（`ar017_bench.py --probe --gen 192 --seed 0`，G=192 全四臂通过，tasks.md T005 会话
+记录落档）；(2) T006 注册配置全量实跑（9 点 × 4 臂 × 注册断言 v2 内置判定
+45/45 PASS，bench-results.md §3 逐 seed 落档——覆盖深度远超冒烟级别）；(3)
+server-experiment.md §3 提供归档后可复跑命令。理由：基准脚本冒烟的验证目标是
+「脚本可跑、断言机制存在」，pytest 内 subprocess 包装重复验证且引入子进程环境
+脆弱性与 ~5-8s 测试时长，实跑 + 落档已满足该目标。
+
 ## 6.2 接口测试
 
 `draft_round`/`verify_round` 签名与返回契约（形状/dtype）；`BlockDecodingConfig.draft_mode` 默认 False 与校验消息；`generate`/`blockwise_generate_baseline` 对 `draft_mode` 的分支等价性（同输入两实现调度决策一致）；`execution/__init__` 导出名可达。
