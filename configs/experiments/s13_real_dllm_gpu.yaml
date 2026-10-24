@@ -1,0 +1,92 @@
+# AR018: real diffusion-LLM weights four-arm protocol (s13). Runs the
+# AR016/AR017 blockwise pipeline and the AR018 remasking baseline on a
+# REAL pretrained dLLM checkpoint (Dream-7B primary, LLaDA-8B secondary;
+# HF format config.json + safetensors, single or sharded) loaded via
+# shadowinfer.models.diffusion_llama.load_diffusion_llama.
+#
+# model_weights: local checkpoint directory (config.json +
+# safetensors). null means "pass --model to serve_arm.py"; the runner
+# fails fast if neither is set. This protocol has NO random-weight
+# fallback -- S1-S3 are real-weight venue assertions by definition.
+model_weights: null
+#
+# Arms (one run per seed 0/1/2; run via
+# specs/changes/AR018-real-dllm-weights/serve_arm.py --arm <value>):
+#   baseline      blockwise_generate_baseline, full recompute per round
+#                 under the block-causal mask (AR016 exactness
+#                 reference)
+#   mask-init     blockwise_generate, paged KV, draft_mode=False
+#   draft-verify  blockwise_generate, paged KV, draft_mode=True
+#                 (measured arm; page_precision=fp32 keeps S1/S2 a
+#                 scheduling comparison, not a precision comparison)
+#   remasking     remasking_generate, dLLM-native full bidirectional
+#                 recompute + confidence unmasking (LLaDA/Dream
+#                 official semantics; the true baseline arm)
+#
+# Server-venue assertions (real pretrained weights only):
+#   S1: draft-verify vs mask-init end-to-end >= 1.5x
+#       (median over seeds of stats total_time_ms ratio)
+#   S2: draft-verify vs mask-init per-block round reduction >= 2x
+#       (rounds_per_block vs rounds_to_fixpoint distributions)
+#   S3: draft-verify vs remasking token agreement >= 0.90
+#       (response region, artifacts.pt sequences; the blockwise arms
+#       are a HALF-AR approximation of the full bidirectional dLLM --
+#       early blocks never see later blocks -- so agreement < 1 is the
+#       expected geometry, never reported as equivalence)
+# Full protocol (weight acquisition, environment, commands, evidence
+# capture, judgment, archive template): EXPERIMENTS.md
+#
+# Usage (server, CUDA; bash):
+#   python specs/changes/AR018-real-dllm-weights/serve_arm.py \
+#     --config configs/experiments/s13_real_dllm_gpu.yaml \
+#     --model /data/weights/Dream-7B \
+#     --arm draft-verify --seed 0 \
+#     --out results/ar018_s13_dv_seed0
+log_level: ERROR
+latency_budget_ms: 3000.0
+memory_budget_mb: 24576.0
+
+execution:
+  # dtype: "auto" keeps each tensor's on-disk dtype (bf16 on GPU, the
+  # s13 venue default per design D10); "float32" casts all weights (the
+  # numerical anchor convention; roughly doubles weight memory).
+  dtype: auto
+  block_decoding_enabled: true
+  block_size: 32
+  confidence_threshold: 0.9
+  # mask_token_id: null = take from the checkpoint config.json (per
+  # PRESETS: Dream-7B 151669 / LLaDA-8B 126336; literature values, to
+  # be verified against the real config.json on the server). An
+  # explicit value must match the checkpoint; the runner fails fast on
+  # any mismatch.
+  mask_token_id: null
+  max_rounds: 8
+  page_size: 32
+  # page_precision stays fp32 on purpose: S1/S2 compare scheduling
+  # (draft-verify vs mask-init), not page precision (that axis is the
+  # AR016/s11 protocol).
+  page_precision: fp32
+  prompt_len: 256
+  gen_len: 512
+
+remasking:
+  # RemaskingConfig (design D8). unmask_per_pass=32 matches block_size
+  # so the remasking arm and the blockwise arms schedule the same
+  # number of unmask steps over the response (512/32 = 16 passes);
+  # max_passes=32 leaves headroom -- exhaustion residuals are recorded
+  # honestly in stats mask_residuals, never silently retried.
+  unmask_per_pass: 32
+  max_passes: 32
+  strategy: confidence
+
+constraints:
+  # S1-S3 are venue assertions judgable ONLY on real pretrained weights
+  # (EXPERIMENTS.md). The registered runner additionally exposes the
+  # weights-independent exactness anchor from AR017: on equal
+  # trajectories the draft-verify paged arm stays decision-equivalent
+  # to a full-recompute reference (CPU evidence 9/9, AR017
+  # bench-results.md section 3; the baseline arm re-enables that
+  # comparison on real weights).
+  max_accuracy_drop: 0.01
+  max_latency_ms: 3000
+  max_memory_mb: 24576

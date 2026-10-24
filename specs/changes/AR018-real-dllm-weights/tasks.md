@@ -34,7 +34,7 @@
 | T003 | passing | 2026-10-24 完成（11/11 P2 用例；全量回归 1259 passed / 1 skipped / 84.94%；D7 erratum 7.1 落档） |
 | T004 | passing | 2026-10-24 完成（26 用例 P3；全量 1285 passed / 1 skipped / 85.06%；1214 MHA 基线逐位回归零改动通过） |
 | T005 | passing | 2026-10-24 完成（19 用例 P4；全量 1304 passed / 1 skipped / 85.14%） |
-| T006 | pending | - |
+| T006 | passing | 2026-10-24 完成（四臂 fixture CLI 冒烟 4/4 + 不变量核验通过；归档 serve_arm.py 零改动） |
 | T007 | pending | - |
 | T008 | pending | - |
 
@@ -83,3 +83,13 @@
 - 实现要点：RemaskingConfig frozen dataclass（mask_token_id/unmask_per_pass/max_passes/strategy）；remasking_generate 每轮全序列双向 forward_step（无 mask，D5(a)）→ softmax 置信度 → 已解掩排除 → 按 confidence（top-k）或 random（seeded Generator randperm）解掩 min(u, 剩余) 位 → 未选中位保持原状；独立 fail-fast 九项（共享口径沿 validate_generate_inputs 措辞 + gen_len>=1 无整除约束）；独立统计四键 passes_used/unmasked_per_pass/final_confidences/mask_residuals（与 17 键契约集合级断言不相交）
 - T005 验收：19/19 P4（有限步全解掩闭式 passes_used==G//u 与 unmasked_per_pass 逐轮记账、前缀运行单调性、random 种子逐位复现、max_passes 耗尽 residual 闭式（batch 1/2）、fail-fast 九项、与块式臂同 prompt 一致率指标可计算无数值门槛）；全量回归 1304 passed / 1 skipped / 85.14%；五门禁全绿（mypy 78 files）
 - 备注：Green 一次通过（Red 契约清晰）；本机 fixture 一致率仅结构口径，S3 >= 0.90 为 s13 服务器场地断言
+
+### 2026-10-24 会话记录（T006，主代理直做）
+
+- 完成任务：T006 s13 协议 + EXPERIMENTS.md + serve_arm 新建
+- 修改文件：configs/experiments/s13_real_dllm_gpu.yaml（新建）、EXPERIMENTS.md（仓库根新建）、specs/changes/AR018-real-dllm-weights/serve_arm.py（新建，复制扩展 AR017 归档版；归档文件零改动）
+- 实现要点：serve_arm 四臂（baseline=blockwise_generate_baseline / mask-init / draft-verify=blockwise_generate 两模式 / remasking=remasking_generate），--model 指向真实 checkpoint 目录（缺省回落 yaml model_weights，均无则 fail-fast——本协议零随机权重回落）；--dtype {float32,auto} 默认 auto（D10 GPU 口径）；mask_token_id 解析：yaml 显式值与 checkpoint 不符拒绝运行，null 则取 config.json；prompt 以 2026+seed 派生并规避 mask token；--capture-block-logits 默认关（真实词表下逐轮块 logits GB 级，S1-S3 只需 sequences/stats）；块式臂落 PagedKVStore 四计数器取证，runner 级 wall_time_ms 与 stats.total_time_ms 并记（S1 以后者为准）
+- s13 yaml：四臂注释 + model_weights: null + execution（dtype/block 32/max_rounds 8/page 32 fp32/prompt 256/gen 512）+ remasking 节（unmask_per_pass 32 对齐块宽、max_passes 32 余量）+ S1-S3 判定口径注释；复现命令指向 specs/changes/AR018-real-dllm-weights/serve_arm.py
+- EXPERIMENTS.md（9 节）：目的与四臂口径（半 AR 近似显式声明）、权重获取（HF id 文献口径待核实 + 离线传输 + PRESETS 对照表与 erratum 程序）、环境登记、fixture 冒烟命令（签名与 fixture_gen.py 实际一致）、正式四臂命令（2 模型 x 4 臂 x 3 seed）、取证（stats.json/artifacts.pt/nvidia-smi/页计数器预期值）、S1-S3 判定（中位口径 + S3 可直接运行的计算脚本）、结果落档模板（全「待回填」占位）、诚实纪律（中位+区间/不达标如实/设备口径/等价性口径/回填纪律）
+- T006 验收：四臂 fixture CLI 冒烟 4/4 exit 0；不变量核验全过（remasking mask_residuals==0 且 passes_used==G/u==4、块式臂每层 appended_tokens==P+G==192/rewritten==0、baseline kv_write_rows_total==0）；S3 脚本可运行（随机权重一致率 0.0 属预期，无语义主张）；serve_arm.py black/isort/flake8/mypy 全绿
+- 备注：两处 Green 期修正（model_dims 属性名、total_time 打印变量名）均为冒烟发现即改；EXPERIMENTS.md 结果小节全部「待回填」，本机零性能主张
