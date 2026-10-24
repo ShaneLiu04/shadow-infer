@@ -1028,3 +1028,510 @@ class TestMhaZeroSpecialCase:
             block_k, block_v = block_kv[layer]
             assert block_k.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)
             assert block_v.shape == (1, model.num_kv_heads, _P2_WIDTH, model.head_dim)
+
+
+# ---------------------------------------------------------------------------
+# P3: blockwise pipeline contract + generate integration (AR018 T004, FR18.3)
+#
+# Red-phase tests for ``shadowinfer.execution.blockwise_generate`` (the
+# D3 extraction target) plus T003 forward-contract error pins. The pure
+# function does not exist yet (Green creates the module), so every import
+# of it happens INSIDE test bodies: collection of the 45 existing tests
+# must keep working, and the blockwise_generate tests fail with
+# ModuleNotFoundError in Red. Tests pinning already-implemented T003
+# behavior (forward_step/forward_block contracts) may pass in Red.
+# ---------------------------------------------------------------------------
+
+# Fixed P3 geometry: tiny GQA fixture (num_kv_heads=2 < num_heads=8 from
+# _TINY), prompt P=5, gen G=8 as two blocks of width W=4.
+_P3_PROMPT = 5  # P
+_P3_WIDTH = 4  # W
+_P3_GEN = 8  # G = 2 * W
+_P3_SEED = 4403
+_P3_MASK_TOKEN = _TINY["mask_token_id"]  # 999 (< vocab_size 1000)
+
+# MHA delegation-regression geometry (SimpleDiffusionLLM; mirrors the
+# GP_* constants and backend idiom in tests/test_block_decoding.py).
+_TD_LAYERS = 2
+_TD_HEADS = 2
+_TD_HEAD_DIM = 16
+_TD_HIDDEN = 32
+_TD_VOCAB = 64
+_TD_MAX_SEQ = 64
+_TD_BATCH = 2
+_TD_PROMPT = 6  # P
+_TD_WIDTH = 4  # W
+_TD_GEN = 8  # G = 2 * W
+_TD_SEED = 4503
+
+# The exact 17-key stats contract assembled by
+# PyTorchModelBackend.generate (pytorch_backend.py) and preserved
+# verbatim by the D3 cut-paste extraction. All 17 keys are always
+# present; "draft_acceptance_rate" / "rounds_to_fixpoint" /
+# "changed_per_round" carry None outside draft_mode. An 18th key
+# "block_logits_per_round" appears only when capture_block_logits=True.
+_GENERATE_STATS_KEYS = frozenset(
+    {
+        "blocks",
+        "total_rounds",
+        "computed_rows_total",
+        "kv_write_rows_total",
+        "forced_completions",
+        "total_time_ms",
+        "page_precision",
+        "rounds_per_block",
+        "unmasked_per_round",
+        "fallback_per_round",
+        "mean_confidence_per_round",
+        "rows_saved_vs_baseline",
+        "unmask_positions_per_round",
+        "block_time_ms",
+        "draft_acceptance_rate",
+        "rounds_to_fixpoint",
+        "changed_per_round",
+    }
+)
+_DRAFT_ONLY_STATS_KEYS = ("draft_acceptance_rate", "rounds_to_fixpoint", "changed_per_round")
+
+# Wall-clock keys: identical logic still produces different timings per
+# call, so per-key equality is only asserted off the timing keys.
+_TIMING_STATS_KEYS = frozenset({"total_time_ms", "block_time_ms"})
+
+
+def _import_blockwise_generate():
+    """Lazily import the AR018 T004 pure function (Green-phase module).
+
+    Never called at module import time: the module does not exist in
+    Red, and the 45 pre-existing tests must keep collecting.
+    """
+    from shadowinfer.execution.blockwise_generate import blockwise_generate
+
+    return blockwise_generate
+
+
+def _p3_config(draft_mode: bool = False, **overrides: Any):
+    """Small BlockDecodingConfig matching the P3 geometry."""
+    from shadowinfer.execution.block_decoding import BlockDecodingConfig
+
+    settings = dict(
+        block_size=_P3_WIDTH,
+        max_rounds=8,
+        confidence_threshold=0.9,
+        mask_token_id=_P3_MASK_TOKEN,
+        page_size=_P3_WIDTH,
+        page_precision="fp32",
+        draft_mode=draft_mode,
+    )
+    settings.update(overrides)
+    return BlockDecodingConfig(**settings)
+
+
+def _p3_prompt(model: DiffusionLlama, seed: int, batch: int = 1) -> torch.Tensor:
+    """Deterministic [batch, P] ids in [0, vocab_size - 1): never the
+    mask token 999 (excluded via the exclusive upper bound)."""
+    torch.manual_seed(seed)
+    return torch.randint(0, model.vocab_size - 1, (batch, _P3_PROMPT))
+
+
+def _td_model_config() -> Dict[str, Any]:
+    return {
+        "num_layers": _TD_LAYERS,
+        "num_heads": _TD_HEADS,
+        "head_dim": _TD_HEAD_DIM,
+        "hidden_dim": _TD_HIDDEN,
+        "vocab_size": _TD_VOCAB,
+        "max_seq_len": _TD_MAX_SEQ,
+    }
+
+
+def _td_backend(seed: int):
+    """Backend built exactly like tests/test_block_decoding.py::_gp_backend."""
+    from shadowinfer.core.backends.pytorch_backend import PyTorchModelBackend
+
+    backend = PyTorchModelBackend(model_config=_td_model_config(), seed=seed)
+    backend.load(model_name="ar018-td", device="cpu")
+    return backend
+
+
+def _td_config(draft_mode: bool = False, **overrides: Any):
+    from shadowinfer.execution.block_decoding import BlockDecodingConfig
+
+    settings = dict(
+        block_size=_TD_WIDTH,
+        max_rounds=8,
+        confidence_threshold=0.9,
+        mask_token_id=0,
+        page_size=_TD_WIDTH,
+        page_precision="fp32",
+        draft_mode=draft_mode,
+    )
+    settings.update(overrides)
+    return BlockDecodingConfig(**settings)
+
+
+def _td_prompt(seed: int, batch: int = _TD_BATCH) -> torch.Tensor:
+    """Random prompt ids in [1, vocab): never the mask token id 0."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(1, _TD_VOCAB, (batch, _TD_PROMPT), generator=gen)
+
+
+def _assert_stats_values_equal(key: str, left: Any, right: Any) -> None:
+    """Recursive per-key stats equality: torch.equal for tensors,
+    element-wise for lists, == for scalars (ints/floats/bools/None)."""
+    if isinstance(left, torch.Tensor):
+        assert isinstance(right, torch.Tensor), f"stats[{key!r}]: tensor vs {type(right)}"
+        assert torch.equal(left, right), f"stats[{key!r}]: tensors differ"
+    elif isinstance(left, list):
+        assert isinstance(right, list), f"stats[{key!r}]: list vs {type(right)}"
+        assert len(left) == len(right), f"stats[{key!r}]: lengths {len(left)} != {len(right)}"
+        for idx, (item_l, item_r) in enumerate(zip(left, right)):
+            _assert_stats_values_equal(f"{key}[{idx}]", item_l, item_r)
+    else:
+        assert left == right, f"stats[{key!r}]: {left!r} != {right!r}"
+
+
+class TestForwardContractErrors:
+    """T003 forward-contract error pins (already implemented; may pass in
+    Red). Message fragments are copied from the production messages in
+    shadowinfer/models/diffusion_llama.py."""
+
+    def test_forward_step_rejects_kv_cache(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_kvcache")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+
+        with pytest.raises(ValueError, match="does not accept kv_cache"):
+            model.forward_step(ids, 0, 0, kv_cache={0: "dummy"})
+        with pytest.raises(ValueError, match="does not accept kv_cache"):
+            model.forward_step(ids, 0, 0, kv_cache=torch.zeros(1))
+
+    def test_forward_step_rejects_1d_x(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_1d")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+
+        with pytest.raises(ValueError, match=r"x must be \[batch, seq_len\]"):
+            model.forward_step(ids[0], 0, 0)
+
+    def test_forward_step_rejects_float_dtype_x(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_float")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+
+        with pytest.raises(ValueError, match="must be an integer tensor of token ids"):
+            model.forward_step(ids.float(), 0, 0)
+
+    def test_forward_step_rejects_empty_seq(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_empty")
+        empty = torch.zeros(1, 0, dtype=torch.long)
+
+        with pytest.raises(ValueError, match="seq_len must be >= 1"):
+            model.forward_step(empty, 0, 0)
+
+    def test_attention_mask_2d_and_4d_forms_bitwise_identical(self, tmp_path):
+        """[S, S] and [1, 1, S, S] are the same additive mask up to
+        broadcast; both accepted forms must produce bitwise-identical
+        logits on the same fixture and ids."""
+        model = _p2_model(tmp_path, "fx_p3_mask_forms")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+        mask2 = segment_causal_mask(_P2_SEQ, _P2_PREFIX, _P2_WIDTH, torch.device("cpu"))
+
+        logits_2d, _, _ = model.forward_step(ids, 0, 0, attention_mask=mask2)
+        logits_4d, _, _ = model.forward_step(ids, 0, 0, attention_mask=mask2[None, None])
+
+        assert logits_2d.shape == (1, _P2_SEQ, model.vocab_size)
+        assert torch.equal(logits_2d, logits_4d)
+
+    def test_attention_mask_wrong_last_dims_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_mask_cover")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+        bad = torch.zeros(_P2_SEQ, _P2_SEQ + 1)
+
+        with pytest.raises(ValueError, match="attention_mask must cover"):
+            model.forward_step(ids, 0, 0, attention_mask=bad)
+
+    def test_attention_mask_3d_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_mask_3d")
+        ids = _p2_ids(model, _P2_SEQ, _P2_SEED)
+        bad = torch.zeros(1, _P2_SEQ, _P2_SEQ)
+
+        with pytest.raises(ValueError, match=r"attention_mask must be \[S, S\] or \[1, 1, S, S\]"):
+            model.forward_step(ids, 0, 0, attention_mask=bad)
+
+    def test_forward_block_negative_prefix_len_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_neglen")
+        ids = _p2_ids(model, _P2_PREFIX + _P2_WIDTH, _P2_SEED)
+        _, prefix_kv, _ = model.forward_step(ids[:, :_P2_PREFIX], 0, 0)
+
+        with pytest.raises(ValueError, match="prefix_len must be >= 0"):
+            model.forward_block(ids[:, _P2_PREFIX:], prefix_kv, -1)
+
+    def test_forward_block_missing_prefix_kv_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_noprefix")
+        ids = _p2_ids(model, _P2_PREFIX + _P2_WIDTH, _P2_SEED)
+
+        with pytest.raises(ValueError, match="prefix_kv is required when prefix_len"):
+            model.forward_block(ids[:, _P2_PREFIX:], None, _P2_PREFIX)
+
+    def test_forward_block_incomplete_layer_set_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_layerset")
+        ids = _p2_ids(model, _P2_PREFIX + _P2_WIDTH, _P2_SEED)
+        _, prefix_kv, _ = model.forward_step(ids[:, :_P2_PREFIX], 0, 0)
+        missing = {layer: kv for layer, kv in prefix_kv.items() if layer != 0}
+
+        with pytest.raises(ValueError, match="prefix_kv must cover exactly layers"):
+            model.forward_block(ids[:, _P2_PREFIX:], missing, _P2_PREFIX)
+
+    def test_forward_block_wrong_shape_k_raises(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_badshape")
+        ids = _p2_ids(model, _P2_PREFIX + _P2_WIDTH, _P2_SEED)
+        _, prefix_kv, _ = model.forward_step(ids[:, :_P2_PREFIX], 0, 0)
+        k, v = prefix_kv[0]
+
+        transposed = dict(prefix_kv)
+        transposed[0] = (k.transpose(1, 2).contiguous(), v)
+        with pytest.raises(ValueError, match="must have shape"):
+            model.forward_block(ids[:, _P2_PREFIX:], transposed, _P2_PREFIX)
+
+        truncated = dict(prefix_kv)
+        truncated[0] = (k[:, :, :-1, :], v[:, :, :-1, :])
+        with pytest.raises(ValueError, match="must have shape"):
+            model.forward_block(ids[:, _P2_PREFIX:], truncated, _P2_PREFIX)
+
+
+class TestBlockwiseGenerateDiffusionLlama:
+    """Core D3/D4 behavior: blockwise_generate on a GQA DiffusionLlama
+    fixture in both modes. Fails in Red with ModuleNotFoundError."""
+
+    @pytest.mark.parametrize("batch", [1, 2], ids=["batch1", "batch2"])
+    @pytest.mark.parametrize("draft_mode", [False, True], ids=["mask-init", "draft-verify"])
+    def test_generate_contract_both_modes(self, tmp_path, draft_mode, batch):
+        blockwise_generate = _import_blockwise_generate()
+        from shadowinfer.execution.block_decoding import GenerateResult
+        from shadowinfer.shadowkv.paged_kv_store import PagedKVStore
+
+        model = _p2_model(tmp_path, "fx_p3_main")
+        assert model.num_kv_heads < model.num_heads  # genuine GQA fixture
+        prompt = _p3_prompt(model, _P3_SEED, batch=batch)
+        config = _p3_config(draft_mode=draft_mode)
+
+        result, stores = blockwise_generate(model, prompt, _P3_GEN, config)
+
+        # Return contract: (GenerateResult, per-layer store dict).
+        assert isinstance(result, GenerateResult)
+        assert isinstance(stores, dict)
+
+        # Sequences contract: [B, P + G] long, prompt bit-for-bit.
+        assert result.sequences.shape == (batch, _P3_PROMPT + _P3_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :_P3_PROMPT], prompt)
+        generated = result.sequences[:, _P3_PROMPT:]
+        assert bool(((generated >= 0) & (generated < model.vocab_size)).all())
+
+        # Stats contract: the exact 17-key set, nothing more.
+        assert set(result.stats) == _GENERATE_STATS_KEYS
+        blocks = _P3_GEN // _P3_WIDTH
+        assert result.stats["blocks"] == blocks
+        assert result.stats["kv_write_rows_total"] == _P3_PROMPT + _P3_GEN
+        assert result.stats["page_precision"] == "fp32"
+
+        rounds = result.stats["rounds_per_block"]
+        assert isinstance(rounds, list) and len(rounds) == blocks
+        for rounds_j in rounds:
+            assert isinstance(rounds_j, int) and rounds_j >= 1
+        for key in (
+            "unmasked_per_round",
+            "fallback_per_round",
+            "mean_confidence_per_round",
+            "unmask_positions_per_round",
+        ):
+            per_block = result.stats[key]
+            assert isinstance(per_block, list) and len(per_block) == blocks
+            for j, per_round in enumerate(per_block):
+                assert isinstance(per_round, list) and len(per_round) == rounds[j]
+        assert isinstance(result.stats["block_time_ms"], list)
+        assert len(result.stats["block_time_ms"]) == blocks
+
+        # Draft-mode-specific keys: populated lists/float in draft mode,
+        # None outside it (mirroring the current backend assembly).
+        if draft_mode:
+            assert isinstance(result.stats["draft_acceptance_rate"], float)
+            assert isinstance(result.stats["rounds_to_fixpoint"], list)
+            assert len(result.stats["rounds_to_fixpoint"]) == blocks
+            assert isinstance(result.stats["changed_per_round"], list)
+            assert len(result.stats["changed_per_round"]) == blocks
+        else:
+            for key in _DRAFT_ONLY_STATS_KEYS:
+                assert result.stats[key] is None
+
+        # Page residency: append exactly twice per row lifetime
+        # (prefill P + one seal W per block = P + G); rounds only gather.
+        assert set(stores) == set(range(model.num_layers))
+        for layer_id in range(model.num_layers):
+            store = stores[layer_id]
+            assert isinstance(store, PagedKVStore)
+            assert store.appended_tokens == _P3_PROMPT + _P3_GEN
+            assert store.rewritten_tokens == 0
+            assert store.page_evictions == 0
+            assert store.max_seq == _P3_PROMPT + _P3_GEN
+            # GQA-native construction (D4/D1): KV-head count, not Q heads.
+            assert store.num_heads == model.num_kv_heads
+            assert store.batch_size == batch
+            assert store.head_dim == model.head_dim
+            store.validate_against(batch, model.num_kv_heads, model.head_dim)
+            k_all, v_all = store.gather()
+            assert k_all.shape == (batch, model.num_kv_heads, _P3_PROMPT + _P3_GEN, model.head_dim)
+            assert v_all.shape == (batch, model.num_kv_heads, _P3_PROMPT + _P3_GEN, model.head_dim)
+
+        # Store width ties to the model's own KV-native forward width.
+        _, prefill_kv, _ = model.forward_step(prompt, 0, 0)
+        k0, _ = prefill_kv[0]
+        assert k0.shape[1] == stores[0].num_heads
+
+
+class TestBlockwiseGenerateFailFast:
+    """D3 fail-fast reproduction (same messages, same order as
+    validate_generate_inputs). Fails in Red with ModuleNotFoundError."""
+
+    def test_over_length_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_overlen")
+        prompt = _p3_prompt(model, _P3_SEED)
+        gen_len = model.max_seq_len  # P + max_seq_len > max_seq_len; % W == 0
+
+        with pytest.raises(ValueError, match="exceeds model max_seq_len"):
+            blockwise_generate(model, prompt, gen_len, _p3_config())
+
+    def test_prompt_contains_mask_token_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_maskin")
+        prompt = _p3_prompt(model, _P3_SEED)
+        prompt[0, 2] = _P3_MASK_TOKEN
+
+        with pytest.raises(ValueError, match="must not contain mask_token_id"):
+            blockwise_generate(model, prompt, _P3_GEN, _p3_config())
+
+    def test_mask_token_id_out_of_vocab_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_maskrange")
+        prompt = _p3_prompt(model, _P3_SEED)
+
+        with pytest.raises(ValueError, match="must be within the model vocabulary"):
+            blockwise_generate(model, prompt, _P3_GEN, _p3_config(mask_token_id=model.vocab_size))
+
+    def test_gen_len_not_multiple_of_block_size_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_divis")
+        prompt = _p3_prompt(model, _P3_SEED)
+
+        with pytest.raises(ValueError, match="must be a multiple of block_size"):
+            blockwise_generate(model, prompt, _P3_GEN + 2, _p3_config())
+
+    def test_prompt_1d_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_p1d")
+        prompt = _p3_prompt(model, _P3_SEED)[0]  # [P]: not 2-D
+
+        with pytest.raises(ValueError, match="prompt_ids must be 2-D"):
+            blockwise_generate(model, prompt, _P3_GEN, _p3_config())
+
+    def test_prompt_float_dtype_raises(self, tmp_path):
+        blockwise_generate = _import_blockwise_generate()
+        model = _p2_model(tmp_path, "fx_p3_pfloat")
+        prompt = _p3_prompt(model, _P3_SEED).float()
+
+        with pytest.raises(ValueError, match="prompt_ids must be integer token ids"):
+            blockwise_generate(model, prompt, _P3_GEN, _p3_config())
+
+
+class TestThinDelegationMhaRegression:
+    """D3 refactoring anchor: backend.generate must stay bitwise-equal to
+    the pure function on SimpleDiffusionLLM (MHA, getattr-default path),
+    with _last_generate_stores semantics unchanged. The delegation tests
+    fail in Red on import; the fail-fast stores test pins existing
+    behavior and may pass."""
+
+    @pytest.mark.parametrize("draft_mode", [False, True], ids=["mask-init", "draft-verify"])
+    def test_backend_generate_equals_pure_function(self, draft_mode):
+        blockwise_generate = _import_blockwise_generate()
+
+        backend = _td_backend(_TD_SEED)
+        prompt = _td_prompt(_TD_SEED + 1)
+        config = _td_config(draft_mode=draft_mode)
+
+        backend_result = backend.generate(prompt, _TD_GEN, config)
+        pure_result, stores = blockwise_generate(backend._model, prompt, _TD_GEN, config)
+
+        # Sequences bitwise-identical (identical model instance + logic).
+        assert torch.equal(backend_result.sequences, pure_result.sequences)
+        assert pure_result.sequences.shape == (_TD_BATCH, _TD_PROMPT + _TD_GEN)
+        assert torch.equal(pure_result.sequences[:, :_TD_PROMPT], prompt)
+
+        # Stats: same key set; per-key equality off the timing keys.
+        assert set(backend_result.stats) == _GENERATE_STATS_KEYS
+        assert set(pure_result.stats) == _GENERATE_STATS_KEYS
+        for key in backend_result.stats:
+            if key in _TIMING_STATS_KEYS:
+                continue
+            _assert_stats_values_equal(key, backend_result.stats[key], pure_result.stats[key])
+
+        # _last_generate_stores semantics: populated, all layers, MHA
+        # getattr-default width (num_kv_heads absent -> num_heads).
+        assert set(stores) == set(range(_TD_LAYERS))
+        for store in stores.values():
+            assert store.num_heads == _TD_HEADS
+        backend_stores = backend.last_generate_stores
+        assert backend_stores is not None
+        assert set(backend_stores) == set(range(_TD_LAYERS))
+
+    def test_failed_generate_leaves_stores_none(self):
+        """Fail-fast validation creates no stores: a failed generate on a
+        fresh backend leaves last_generate_stores None (semantics the
+        thin delegation must preserve)."""
+        backend = _td_backend(_TD_SEED + 10)
+        assert backend.last_generate_stores is None
+
+        prompt = _td_prompt(_TD_SEED + 11)
+        prompt[0, 2] = 0  # == config.mask_token_id
+        with pytest.raises(ValueError, match="must not contain mask_token_id"):
+            backend.generate(prompt, _TD_GEN, _td_config())
+        assert backend.last_generate_stores is None
+
+
+class TestBlockwiseModelProtocol:
+    """D4 BlockwiseModel protocol surface (structural; no import of the
+    Green-phase module, so these pass in Red)."""
+
+    def test_diffusion_llama_satisfies_protocol_surface(self, tmp_path):
+        model = _p2_model(tmp_path, "fx_p3_protocol")
+        for attr in (
+            "num_layers",
+            "num_heads",
+            "num_kv_heads",
+            "head_dim",
+            "max_seq_len",
+            "vocab_size",
+            "device",
+            "mask_token_id",
+            "config",
+        ):
+            assert hasattr(model, attr), f"missing protocol attribute {attr!r}"
+        assert callable(model.forward_step)
+        assert callable(model.forward_block)
+
+    def test_simple_diffusion_llm_has_no_num_kv_heads(self):
+        """D4 getattr-default premise: SimpleDiffusionLLM exposes no
+        num_kv_heads attribute, so store assembly falls back to
+        num_heads (MHA zero-diff)."""
+        from shadowinfer.models.simple_diffusion_llm import SimpleDiffusionLLM
+
+        torch.manual_seed(_TD_SEED + 30)
+        model = SimpleDiffusionLLM(
+            num_layers=1,
+            num_heads=2,
+            head_dim=8,
+            hidden_dim=16,
+            vocab_size=32,
+            max_seq_len=32,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert not hasattr(model, "num_kv_heads")
+        assert model.num_heads == 2

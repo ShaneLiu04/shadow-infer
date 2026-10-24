@@ -1,4 +1,4 @@
-"""Executable inference paths for ShadowInfer (AR013, AR015, AR016, AR017)."""
+"""Executable inference paths for ShadowInfer (AR013, AR015, AR016, AR017, AR018)."""
 
 from shadowinfer.execution.block_decoding import (
     BlockDecodingConfig,
@@ -9,6 +9,7 @@ from shadowinfer.execution.block_decoding import (
     segment_causal_mask,
     verify_round,
 )
+from shadowinfer.execution.blockwise_generate import blockwise_generate
 from shadowinfer.execution.macro_mode import MacroBlockEntry, MacroModeConfig, MacroModeState
 from shadowinfer.execution.step_reuse import LayerReuseEntry, StepReuseConfig, StepReuseState
 
@@ -23,6 +24,7 @@ __all__ = [
     "StepReuseConfig",
     "StepReuseState",
     "block_causal_mask",
+    "blockwise_generate",
     "draft_round",
     "segment_causal_mask",
     "verify_round",

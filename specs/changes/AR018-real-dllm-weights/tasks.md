@@ -32,7 +32,7 @@
 | T001 | passing | 2026-10-24 完成（验收自验 36/36：确定性/双 style/双布局/GQA/MHA/tie/bf16/预设一致性/异常路径） |
 | T002 | passing | 2026-10-24 完成（34/34：P1 加载器 29 + P5 fixture/预设 5；全量回归 1248 passed / 1 skipped / 84.87%） |
 | T003 | passing | 2026-10-24 完成（11/11 P2 用例；全量回归 1259 passed / 1 skipped / 84.94%；D7 erratum 7.1 落档） |
-| T004 | pending | - |
+| T004 | passing | 2026-10-24 完成（26 用例 P3；全量 1285 passed / 1 skipped / 85.06%；1214 MHA 基线逐位回归零改动通过） |
 | T005 | pending | - |
 | T006 | pending | - |
 | T007 | pending | - |
@@ -66,3 +66,12 @@
 - 实现要点：单层计算序严格同构参考（embedding→[rmsnorm→qkv proj→rope→repeat_kv→scores=q@k^T/sqrt(d)+mask→softmax→@v→o_proj→残差→rmsnorm→SwiGLU→残差]→norm→lm_head）；KV 为 post-RoPE KV-head 原生口径 [B,H_kv,T,D]（D2）；forward_step 校验 kv_cache 拒绝（D11）/ids 2-D 整型/超长/mask [S,S]|[1,1,S,S] 广播；forward_block 校验镜像 SimpleDiffusionLLM 口径（prefix_len>=0/prefix_kv 缺层/形状 [B,H_kv,L,D]）；cos/sin 以 inv_freq float32 计算后 cast 参数 dtype（bf16 兼容）；meta 构造路径复用 T002 加载器
 - T003 验收：11/11 P2；全量回归 1259 passed / 1 skipped / 84.94%；五门禁全绿
 - 备注：Gold 期发现的 `[9,256]` vs `[4,256]` 逐位属 kernel 幸运，RoPE 分解测试已同步改容差口径避免脆弱断言
+
+### 2026-10-24 会话记录（T004，标准 TDD）
+
+- 完成阶段：T004 Red（子代理写 P3 契约与管线测试 20 函数/26 用例 5 类）+ T004 Green（主代理实现 D3 抽取 + D4 协议化 + D1 GQA 装配）
+- 修改文件：tests/test_diffusion_llama.py（P3 追加）、shadowinfer/execution/blockwise_generate.py（新建）、shadowinfer/execution/__init__.py（导出）、shadowinfer/execution/block_decoding.py（BlockwiseModel 协议 + 两处注解放宽 + baseline docstring 更新）、shadowinfer/core/backends/pytorch_backend.py（generate 薄委托 -202 行 +10 行）
+- Red 期 17 键统计契约提取（pytorch_backend.py:964-986 程序化核对）：blocks/total_rounds/computed_rows_total/kv_write_rows_total/forced_completions/total_time_ms/page_precision/rounds_per_block/unmasked_per_round/fallback_per_round/mean_confidence_per_round/rows_saved_vs_baseline/unmask_positions_per_round/block_time_ms/draft_acceptance_rate/rounds_to_fixpoint/changed_per_round（draft_mode 三键非 draft 为 None；capture_block_logits 时第 18 键 block_logits_per_round）
+- Green 实现要点：blockwise_generate 纯函数 = generate 体 cut-paste（唯一 delta：`self._model`→参数 + store 以 `getattr(model, "num_kv_heads", model.num_heads)` 构造）；backend.generate 保留 no-model RuntimeError 后薄委托，`_last_generate_stores` 语义逐字保持；BlockwiseModel 为 TYPE_CHECKING Protocol（forward_step 第三返回元素 Optional[Tensor] 兼容两模型），运行时零开销鸭子类型；backend 清理 4 个失效 import + time + List
+- T004 验收：26 用例 = 契约 pin 11 + DiffusionLlama 两模式 generate（17 键/页驻留 appended_tokens==P+G/rewritten==0/GQA store num_heads==2/gather [B,2,P+G,D]）4 + fail-fast 6 + 薄委托 MHA 逐位回归 3 + 协议面 2；全量回归 1285 passed / 1 skipped / 85.06%（SimpleDiffusionLLM 1214 基线含内部逐位锚点零改动通过）；五门禁全绿（mypy 77 files）
+- 备注：P3 中 14 用例 Red 期即过（pin T003 行为/后端语义/协议面），12 用例因 blockwise_generate 缺失失败——符合预期 Red 分布

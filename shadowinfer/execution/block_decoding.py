@@ -14,12 +14,52 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
 if TYPE_CHECKING:
-    from shadowinfer.models.simple_diffusion_llm import SimpleDiffusionLLM
+    from typing import Protocol
+
+    class BlockwiseModel(Protocol):
+        """Structural protocol for blockwise-pipeline models (AR018 D4).
+
+        SimpleDiffusionLLM and DiffusionLlama both satisfy this at
+        runtime via plain duck typing (zero overhead); the protocol
+        exists only for static typing. GQA models additionally expose
+        ``num_kv_heads`` (accessed via getattr with a num_heads default
+        by the store assembly, design D1/D4).
+        """
+
+        num_layers: int
+        num_heads: int
+        head_dim: int
+        max_seq_len: int
+        vocab_size: int
+        device: torch.device
+
+        def forward_step(
+            self,
+            x: torch.Tensor,
+            step_t: int,
+            total_steps: int,
+            kv_cache: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+        ) -> Tuple[
+            torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]
+        ]:
+            ...  # noqa: E501
+
+        def forward_block(
+            self,
+            x_block: torch.Tensor,
+            prefix_kv: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None,
+            prefix_len: int = 0,
+            step_t: int = 0,
+            total_steps: int = 0,
+        ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+            ...
+
 
 PAGE_PRECISIONS = ("fp32", "fp16", "int8")
 
@@ -308,7 +348,7 @@ def segment_causal_mask(
 
 
 def validate_generate_inputs(
-    model: SimpleDiffusionLLM,
+    model: "BlockwiseModel",
     prompt_ids: torch.Tensor,
     gen_len: int,
     config: BlockDecodingConfig,
@@ -343,7 +383,7 @@ def validate_generate_inputs(
 
 
 def blockwise_generate_baseline(
-    model: SimpleDiffusionLLM,
+    model: "BlockwiseModel",
     prompt_ids: torch.Tensor,
     gen_len: int,
     config: BlockDecodingConfig,
@@ -351,7 +391,7 @@ def blockwise_generate_baseline(
 ) -> GenerateResult:
     """Full-recompute reference loop for blockwise decoding (AR016, FR16.3).
 
-    Mirror image of ``PyTorchModelBackend.generate`` sharing the same
+    Mirror image of ``blockwise_generate`` sharing the same
     ``BlockDecodingConfig`` and ``schedule_round`` (decision-equivalent
     arms): every round recomputes the full [B, L_j + W] context through
     ``model.forward_step`` under the block-causal mask, so no prefix KV
@@ -359,7 +399,7 @@ def blockwise_generate_baseline(
     for unit tests and the baseline arm for benchmarks.
 
     Args:
-        model: SimpleDiffusionLLM instance (eval mode recommended).
+        model: BlockwiseModel protocol instance (eval mode recommended).
         prompt_ids: [B, P] integer prompt token ids.
         gen_len: Tokens to generate; multiple of ``config.block_size``.
         config: BlockDecodingConfig (threshold/block/round settings).
