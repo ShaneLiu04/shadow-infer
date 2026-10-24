@@ -33,7 +33,7 @@
 | T002 | passing | 2026-10-24 完成（34/34：P1 加载器 29 + P5 fixture/预设 5；全量回归 1248 passed / 1 skipped / 84.87%） |
 | T003 | passing | 2026-10-24 完成（11/11 P2 用例；全量回归 1259 passed / 1 skipped / 84.94%；D7 erratum 7.1 落档） |
 | T004 | passing | 2026-10-24 完成（26 用例 P3；全量 1285 passed / 1 skipped / 85.06%；1214 MHA 基线逐位回归零改动通过） |
-| T005 | pending | - |
+| T005 | passing | 2026-10-24 完成（19 用例 P4；全量 1304 passed / 1 skipped / 85.14%） |
 | T006 | pending | - |
 | T007 | pending | - |
 | T008 | pending | - |
@@ -75,3 +75,11 @@
 - Green 实现要点：blockwise_generate 纯函数 = generate 体 cut-paste（唯一 delta：`self._model`→参数 + store 以 `getattr(model, "num_kv_heads", model.num_heads)` 构造）；backend.generate 保留 no-model RuntimeError 后薄委托，`_last_generate_stores` 语义逐字保持；BlockwiseModel 为 TYPE_CHECKING Protocol（forward_step 第三返回元素 Optional[Tensor] 兼容两模型），运行时零开销鸭子类型；backend 清理 4 个失效 import + time + List
 - T004 验收：26 用例 = 契约 pin 11 + DiffusionLlama 两模式 generate（17 键/页驻留 appended_tokens==P+G/rewritten==0/GQA store num_heads==2/gather [B,2,P+G,D]）4 + fail-fast 6 + 薄委托 MHA 逐位回归 3 + 协议面 2；全量回归 1285 passed / 1 skipped / 85.06%（SimpleDiffusionLLM 1214 基线含内部逐位锚点零改动通过）；五门禁全绿（mypy 77 files）
 - 备注：P3 中 14 用例 Red 期即过（pin T003 行为/后端语义/协议面），12 用例因 blockwise_generate 缺失失败——符合预期 Red 分布
+
+### 2026-10-24 会话记录（T005，标准 TDD）
+
+- 完成阶段：T005 Red（子代理写 P4 remasking 测试 18 函数/19 用例 5 类）+ T005 Green（主代理实现 execution/remasking.py）
+- 修改文件：tests/test_diffusion_llama.py（P4 追加）、shadowinfer/execution/remasking.py（新建）、shadowinfer/execution/__init__.py（导出 RemaskingConfig/remasking_generate）
+- 实现要点：RemaskingConfig frozen dataclass（mask_token_id/unmask_per_pass/max_passes/strategy）；remasking_generate 每轮全序列双向 forward_step（无 mask，D5(a)）→ softmax 置信度 → 已解掩排除 → 按 confidence（top-k）或 random（seeded Generator randperm）解掩 min(u, 剩余) 位 → 未选中位保持原状；独立 fail-fast 九项（共享口径沿 validate_generate_inputs 措辞 + gen_len>=1 无整除约束）；独立统计四键 passes_used/unmasked_per_pass/final_confidences/mask_residuals（与 17 键契约集合级断言不相交）
+- T005 验收：19/19 P4（有限步全解掩闭式 passes_used==G//u 与 unmasked_per_pass 逐轮记账、前缀运行单调性、random 种子逐位复现、max_passes 耗尽 residual 闭式（batch 1/2）、fail-fast 九项、与块式臂同 prompt 一致率指标可计算无数值门槛）；全量回归 1304 passed / 1 skipped / 85.14%；五门禁全绿（mypy 78 files）
+- 备注：Green 一次通过（Red 契约清晰）；本机 fixture 一致率仅结构口径，S3 >= 0.90 为 s13 服务器场地断言

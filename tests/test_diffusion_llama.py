@@ -1535,3 +1535,387 @@ class TestBlockwiseModelProtocol:
         )
         assert not hasattr(model, "num_kv_heads")
         assert model.num_heads == 2
+
+
+# ---------------------------------------------------------------------------
+# P4: remasking baseline arm (AR018 T005, FR18.4)
+#
+# Red-phase tests for ``shadowinfer.execution.remasking`` (design D8:
+# independent module, independent fail-fast, independent stats key set).
+# The module does not exist yet (Green creates it), so every import of
+# remasking_generate / RemaskingConfig happens INSIDE test bodies or
+# lazy helpers: collection of the 71 existing tests must keep working,
+# and every test below fails with ModuleNotFoundError in Red.
+# ---------------------------------------------------------------------------
+
+# P4 geometry reuses the P3 constants: prompt P=5, gen G=8, GQA fixture
+# (num_kv_heads=2 < num_heads=8 from _TINY), mask token 999 < vocab 1000.
+_P4_SEED = 4603
+_P4_RANDOM_SEED = 4607
+_P4_UNMASK_PER_PASS = 2
+_P4_MAX_PASSES = 8  # >= G / unmask_per_pass: never binding on happy paths
+
+# The exact four-key independent stats contract (design D8): explicitly
+# NOT the 17-key blockwise contract (_GENERATE_STATS_KEYS above).
+_REMASKING_STATS_KEYS = frozenset(
+    {"passes_used", "unmasked_per_pass", "final_confidences", "mask_residuals"}
+)
+
+
+def _import_remasking():
+    """Lazily import the AR018 T005 remasking arm (Green-phase module).
+
+    Never called at module import time: the module does not exist in
+    Red, and the 71 pre-existing tests must keep collecting.
+    """
+    from shadowinfer.execution.remasking import RemaskingConfig, remasking_generate
+
+    return RemaskingConfig, remasking_generate
+
+
+def _p4_config(**overrides: Any):
+    """Small RemaskingConfig matching the P4 geometry (lazy import)."""
+    RemaskingConfig = _import_remasking()[0]
+    settings = dict(
+        mask_token_id=_P3_MASK_TOKEN,
+        unmask_per_pass=_P4_UNMASK_PER_PASS,
+        max_passes=_P4_MAX_PASSES,
+        strategy="confidence",
+    )
+    settings.update(overrides)
+    return RemaskingConfig(**settings)
+
+
+class TestRemaskingConfidenceConvergence:
+    """confidence strategy: finite-pass full unmask with closed-form
+    per-pass bookkeeping, structural monotonicity, and the sequence
+    contract. Fails in Red with ModuleNotFoundError."""
+
+    def test_finite_pass_full_unmask_closed_form_stats(self, tmp_path):
+        remasking_generate = _import_remasking()[1]
+        from shadowinfer.execution.block_decoding import GenerateResult
+
+        model = _p2_model(tmp_path, "fx_p4_conv")
+        assert model.num_kv_heads < model.num_heads  # genuine GQA fixture
+        prompt = _p3_prompt(model, _P4_SEED)
+        gen_len = _P3_GEN
+        unmask = _P4_UNMASK_PER_PASS
+
+        result = remasking_generate(model, prompt, gen_len, _p4_config())
+
+        # Independent D8 stats key set: exactly the four keys, and none
+        # of them collides with the 17-key blockwise contract.
+        assert isinstance(result, GenerateResult)
+        assert set(result.stats) == _REMASKING_STATS_KEYS
+        assert not (_REMASKING_STATS_KEYS & _GENERATE_STATS_KEYS)
+
+        # Finite-pass full unmask: no mask token left in the response.
+        assert result.sequences.shape == (1, _P3_PROMPT + gen_len)
+        assert result.sequences.dtype == torch.long
+        response = result.sequences[:, _P3_PROMPT:]
+        assert not bool((response == _P3_MASK_TOKEN).any())
+        assert result.stats["mask_residuals"] == 0
+
+        # Closed forms (batch 1): pass count and per-pass unmask totals.
+        passes_used = gen_len // unmask
+        assert result.stats["passes_used"] == passes_used
+        assert result.stats["unmasked_per_pass"] == [
+            min(unmask, gen_len - i * unmask) for i in range(passes_used)
+        ]
+        confidences = result.stats["final_confidences"]
+        assert isinstance(confidences, list)
+        assert len(confidences) == passes_used
+        for entry in confidences:
+            assert isinstance(entry, float)
+            assert 0.0 <= entry <= 1.0
+
+    def test_monotonicity_already_unmasked_positions_never_change(self, tmp_path):
+        """Structural monotonicity via prefix runs: with the deterministic
+        confidence strategy and a deterministic model, the run with
+        max_passes=k follows the exact same trajectory as the first k
+        passes of the run with max_passes=k+1, so every position already
+        unmasked after k passes must keep its token after k+1 passes."""
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_mono")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        runs = {}
+        for max_passes in (1, 2, 3, 4):
+            runs[max_passes] = remasking_generate(
+                model, prompt, _P3_GEN, _p4_config(max_passes=max_passes)
+            )
+
+        for k in (1, 2, 3):
+            resp_k = runs[k].sequences[:, _P3_PROMPT:]
+            resp_k1 = runs[k + 1].sequences[:, _P3_PROMPT:]
+            unmasked_k = resp_k != _P3_MASK_TOKEN
+            # Run k unmasks exactly min(k * unmask_per_pass, G) positions.
+            assert int(unmasked_k.sum()) == min(k * _P4_UNMASK_PER_PASS, _P3_GEN)
+            # Monotonicity: those positions are bitwise identical in the
+            # (k+1)-pass run (already-unmasked positions never change).
+            assert torch.equal(resp_k[unmasked_k], resp_k1[unmasked_k])
+
+    @pytest.mark.parametrize("batch", [1, 2], ids=["batch1", "batch2"])
+    def test_sequence_contract_prompt_preserved(self, tmp_path, batch):
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, f"fx_p4_seq{batch}")
+        prompt = _p3_prompt(model, _P4_SEED, batch=batch)
+
+        result = remasking_generate(model, prompt, _P3_GEN, _p4_config())
+
+        assert result.sequences.shape == (batch, _P3_PROMPT + _P3_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :_P3_PROMPT], prompt)
+        assert result.stats["mask_residuals"] == 0
+        assert not bool((result.sequences[:, _P3_PROMPT:] == _P3_MASK_TOKEN).any())
+
+
+class TestRemaskingRandomStrategy:
+    """strategy="random": seeded-generator reproducibility and structural
+    validity. Fails in Red with ModuleNotFoundError."""
+
+    def test_seeded_generator_bitwise_reproducible(self, tmp_path):
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_rand")
+        prompt = _p3_prompt(model, _P4_SEED)
+        config = _p4_config(strategy="random")
+
+        gen_a = torch.Generator().manual_seed(_P4_RANDOM_SEED)
+        gen_b = torch.Generator().manual_seed(_P4_RANDOM_SEED)
+        result_a = remasking_generate(model, prompt, _P3_GEN, config, generator=gen_a)
+        result_b = remasking_generate(model, prompt, _P3_GEN, config, generator=gen_b)
+
+        # Identical seeds -> identical trajectories: bitwise-identical
+        # sequences and identical stats (exact equality, not a tolerance:
+        # both runs are the same deterministic computation).
+        assert torch.equal(result_a.sequences, result_b.sequences)
+        assert set(result_a.stats) == _REMASKING_STATS_KEYS
+        for key in sorted(_REMASKING_STATS_KEYS):
+            _assert_stats_values_equal(key, result_a.stats[key], result_b.stats[key])
+
+    def test_different_seed_still_structurally_valid(self, tmp_path):
+        """A different seed may pick different positions (not asserted:
+        it is a probabilistic outcome); the result must still be a fully
+        unmasked, structurally valid generation."""
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_rand2")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        result = remasking_generate(
+            model,
+            prompt,
+            _P3_GEN,
+            _p4_config(strategy="random"),
+            generator=torch.Generator().manual_seed(_P4_RANDOM_SEED + 1),
+        )
+
+        assert result.sequences.shape == (1, _P3_PROMPT + _P3_GEN)
+        assert result.sequences.dtype == torch.long
+        assert torch.equal(result.sequences[:, :_P3_PROMPT], prompt)
+        assert result.stats["mask_residuals"] == 0
+        assert not bool((result.sequences[:, _P3_PROMPT:] == _P3_MASK_TOKEN).any())
+
+    def test_no_generator_falls_back_to_global_rng(self, tmp_path):
+        """strategy="random" without a generator must still complete
+        (global RNG) and fully unmask."""
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_rand3")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        torch.manual_seed(_P4_RANDOM_SEED + 2)
+        result = remasking_generate(model, prompt, _P3_GEN, _p4_config(strategy="random"))
+
+        assert result.stats["mask_residuals"] == 0
+        assert not bool((result.sequences[:, _P3_PROMPT:] == _P3_MASK_TOKEN).any())
+
+
+class TestRemaskingMaxPassesExhaustion:
+    """max_passes exhaustion: honest residual bookkeeping, per element.
+    Fails in Red with ModuleNotFoundError."""
+
+    def test_exhaustion_residual_bookkeeping(self, tmp_path):
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_exhaust")
+        prompt = _p3_prompt(model, _P4_SEED)
+        gen_len = _P3_GEN
+        unmask = 1
+        max_passes = 3
+
+        result = remasking_generate(
+            model,
+            prompt,
+            gen_len,
+            _p4_config(unmask_per_pass=unmask, max_passes=max_passes),
+        )
+
+        response = result.sequences[:, _P3_PROMPT:]
+        masked = response == _P3_MASK_TOKEN
+
+        # Closed form (batch 1): the loop stops at max_passes with
+        # gen_len - max_passes * unmask_per_pass masks left, honestly
+        # reported rather than silently truncated.
+        assert result.stats["passes_used"] == max_passes
+        assert result.stats["mask_residuals"] == gen_len - max_passes * unmask
+        assert int(masked.sum()) == gen_len - max_passes * unmask
+        assert int((~masked).sum()) == max_passes * unmask
+        assert result.stats["unmasked_per_pass"] == [unmask] * max_passes
+        assert len(result.stats["final_confidences"]) == max_passes
+
+    def test_exhaustion_batch2_independent_elements(self, tmp_path):
+        """Batch 2, same config on both elements: each element follows
+        its own trajectory, unmasking exactly unmask_per_pass positions
+        per pass until max_passes; residuals sum across the batch."""
+        remasking_generate = _import_remasking()[1]
+
+        model = _p2_model(tmp_path, "fx_p4_exhaust2")
+        prompt = _p3_prompt(model, _P4_SEED, batch=2)
+        gen_len = _P3_GEN
+        unmask = 1
+        max_passes = 3
+
+        result = remasking_generate(
+            model,
+            prompt,
+            gen_len,
+            _p4_config(unmask_per_pass=unmask, max_passes=max_passes),
+        )
+
+        response = result.sequences[:, _P3_PROMPT:]
+        masked = response == _P3_MASK_TOKEN
+
+        assert result.stats["passes_used"] == max_passes
+        # Cross-batch closed form: 2 * (G - passes * unmask_per_pass).
+        assert result.stats["mask_residuals"] == 2 * (gen_len - max_passes * unmask)
+        assert int(masked.sum()) == 2 * (gen_len - max_passes * unmask)
+        # Per element: exactly max_passes * unmask_per_pass unmasked.
+        assert torch.equal(
+            (~masked).sum(dim=1), torch.full((2,), max_passes * unmask, dtype=torch.long)
+        )
+        # Prompt preserved bit-for-bit on both elements.
+        assert torch.equal(result.sequences[:, :_P3_PROMPT], prompt)
+
+
+class TestRemaskingFailFast:
+    """D8 independent fail-fast: shared checks mirror
+    validate_generate_inputs wording; remasking-only checks (no block
+    divisibility; instead gen_len / unmask_per_pass / max_passes /
+    strategy) follow the repo's "X must be >= 1" precedent. Configs are
+    built inside the raises block so validation living either in
+    RemaskingConfig or in remasking_generate satisfies the contract.
+    Fails in Red with ModuleNotFoundError."""
+
+    def test_prompt_1d_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_1d")
+        prompt = _p3_prompt(model, _P4_SEED)[0]  # [P]: not 2-D
+
+        with pytest.raises(ValueError, match="prompt_ids must be 2-D"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config())
+
+    def test_prompt_float_dtype_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_float")
+        prompt = _p3_prompt(model, _P4_SEED).float()
+
+        with pytest.raises(ValueError, match="prompt_ids must be integer token ids"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config())
+
+    def test_gen_len_zero_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_genlen")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="gen_len must be >= 1"):
+            remasking_generate(model, prompt, 0, _p4_config())
+
+    def test_over_length_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_overlen")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="exceeds model max_seq_len"):
+            remasking_generate(model, prompt, model.max_seq_len, _p4_config())
+
+    def test_mask_token_id_out_of_vocab_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_maskrange")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="must be within the model vocabulary"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config(mask_token_id=model.vocab_size))
+
+    def test_prompt_contains_mask_token_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_maskin")
+        prompt = _p3_prompt(model, _P4_SEED)
+        prompt[0, 2] = _P3_MASK_TOKEN
+
+        with pytest.raises(ValueError, match="must not contain mask_token_id"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config())
+
+    def test_unmask_per_pass_zero_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_upp")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="unmask_per_pass must be >= 1"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config(unmask_per_pass=0))
+
+    def test_max_passes_zero_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_mp")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="max_passes must be >= 1"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config(max_passes=0))
+
+    def test_bogus_strategy_raises(self, tmp_path):
+        _, remasking_generate = _import_remasking()
+        model = _p2_model(tmp_path, "fx_p4_ff_strategy")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        with pytest.raises(ValueError, match="strategy must be"):
+            remasking_generate(model, prompt, _P3_GEN, _p4_config(strategy="bogus"))
+
+
+class TestRemaskingVsBlockwiseComparability:
+    """srs FR18.4 acceptance 2: remasking (fully bidirectional, D5(a))
+    and the blockwise arm (segment-causal, D5(b)/(c)) both complete on
+    the same fixture + prompt and the cross-arm token agreement rate is
+    a computable metric. Fails in Red with ModuleNotFoundError (the
+    remasking import is in the test body)."""
+
+    def test_token_agreement_metric_computable_no_threshold(self, tmp_path):
+        remasking_generate = _import_remasking()[1]
+        blockwise_generate = _import_blockwise_generate()
+
+        model = _p2_model(tmp_path, "fx_p4_compare")
+        prompt = _p3_prompt(model, _P4_SEED)
+
+        # Remasking arm: confidence strategy, full bidirectional passes.
+        remasking_result = remasking_generate(model, prompt, _P3_GEN, _p4_config())
+        # Blockwise arm: mask-init mode, same mask token, block_size=4
+        # divides gen_len=8 (reuses the P3 config helper).
+        blockwise_result, _ = blockwise_generate(model, prompt, _P3_GEN, _p3_config())
+
+        remasking_resp = remasking_result.sequences[:, _P3_PROMPT:]
+        blockwise_resp = blockwise_result.sequences[:, _P3_PROMPT:]
+
+        # Both arms fully unmask on this finite geometry (blockwise via
+        # its forced completion; remasking by max_passes headroom).
+        assert not bool((remasking_resp == _P3_MASK_TOKEN).any())
+        assert not bool((blockwise_resp == _P3_MASK_TOKEN).any())
+
+        # The comparability metric is computable: a float in [0, 1].
+        # Random fixture weights carry no semantic claim, so there is
+        # deliberately NO numeric threshold on the agreement (the s13
+        # S3 threshold is a server-side assertion on real weights).
+        value = float((remasking_resp == blockwise_resp).float().mean())
+        assert isinstance(value, float)
+        assert 0.0 <= value <= 1.0

@@ -11,6 +11,7 @@ from shadowinfer.execution.block_decoding import (
 )
 from shadowinfer.execution.blockwise_generate import blockwise_generate
 from shadowinfer.execution.macro_mode import MacroBlockEntry, MacroModeConfig, MacroModeState
+from shadowinfer.execution.remasking import RemaskingConfig, remasking_generate
 from shadowinfer.execution.step_reuse import LayerReuseEntry, StepReuseConfig, StepReuseState
 
 __all__ = [
@@ -20,12 +21,14 @@ __all__ = [
     "MacroBlockEntry",
     "MacroModeConfig",
     "MacroModeState",
+    "RemaskingConfig",
     "ScheduleDecision",
     "StepReuseConfig",
     "StepReuseState",
     "block_causal_mask",
     "blockwise_generate",
     "draft_round",
+    "remasking_generate",
     "segment_causal_mask",
     "verify_round",
 ]
