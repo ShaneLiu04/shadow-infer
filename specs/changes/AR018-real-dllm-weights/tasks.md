@@ -35,8 +35,8 @@
 | T004 | passing | 2026-10-24 完成（26 用例 P3；全量 1285 passed / 1 skipped / 85.06%；1214 MHA 基线逐位回归零改动通过） |
 | T005 | passing | 2026-10-24 完成（19 用例 P4；全量 1304 passed / 1 skipped / 85.14%） |
 | T006 | passing | 2026-10-24 完成（四臂 fixture CLI 冒烟 4/4 + 不变量核验通过；归档 serve_arm.py 零改动） |
-| T007 | pending | - |
-| T008 | pending | - |
+| T007 | passing | 2026-10-24 完成（四检查点齐备；版本一致性 UT 通过；顶部状态表 AR017 遗留 v3.18.0 一并修正） |
+| T008 | passing | 2026-10-24 完成（五件套全绿：1304 passed / 1 skipped / 85.14%；gates.md 落档） |
 
 ## 进度记录
 
@@ -93,3 +93,13 @@
 - EXPERIMENTS.md（9 节）：目的与四臂口径（半 AR 近似显式声明）、权重获取（HF id 文献口径待核实 + 离线传输 + PRESETS 对照表与 erratum 程序）、环境登记、fixture 冒烟命令（签名与 fixture_gen.py 实际一致）、正式四臂命令（2 模型 x 4 臂 x 3 seed）、取证（stats.json/artifacts.pt/nvidia-smi/页计数器预期值）、S1-S3 判定（中位口径 + S3 可直接运行的计算脚本）、结果落档模板（全「待回填」占位）、诚实纪律（中位+区间/不达标如实/设备口径/等价性口径/回填纪律）
 - T006 验收：四臂 fixture CLI 冒烟 4/4 exit 0；不变量核验全过（remasking mask_residuals==0 且 passes_used==G/u==4、块式臂每层 appended_tokens==P+G==192/rewritten==0、baseline kv_write_rows_total==0）；S3 脚本可运行（随机权重一致率 0.0 属预期，无语义主张）；serve_arm.py black/isort/flake8/mypy 全绿
 - 备注：两处 Green 期修正（model_dims 属性名、total_time 打印变量名）均为冒烟发现即改；EXPERIMENTS.md 结果小节全部「待回填」，本机零性能主张
+
+### 2026-10-24 会话记录（T007 + T008，主代理直做）
+
+- 完成任务：T007 README 四检查点 + v3.20.0 四处同步；T008 五件套门禁统一取证
+- 修改文件：README.md、pyproject.toml、shadowinfer/__init__.py、shadowinfer/__main__.py、tests/test_ffn_hotpath.py（版本串）、specs/changes/AR018-real-dllm-weights/gates.md（新建门禁记录）、tasks.md
+- T007 四检查点：①特性表新增 v3.20.0 行（加载器/建模层/纯函数化/remasking/s13 协议 + EXPERIMENTS.md 链接 + 零性能主张与半 AR 近似声明）②版本历史新增 v3.20.0 小节（复现资产指向 changes 目录，归档时随惯例改 archive 路径）③基准节新增 v3.20.0 实测小节——只写结构/加载/数值正确性（加载保真/golden 锚点含 erratum 7.1 口径/1214 逐位回归/remasking 闭式/四臂冒烟 4/4），s13 占位显式「回填前不出现性能数字」④复现方式新增 serve_arm --help + EXPERIMENTS.md 指引行；TOC 零残留（未增删 H2）、全文无 emoji（程序化复检 NONE）
+- 版本同步：pyproject / __init__（docstring+__version__）/ __main__ / test_ffn_hotpath.py::test_ut17_version_strings_consistent 五处 3.19.0→3.20.0（.NET File API 全局替换避免 PS 5.1 GBK mojibake），版本一致性 UT 通过
+- 遗留修正：README 顶部状态表在 AR017 后未随 v3.19.0 更新（停留 v3.18.0/1128/84.56%），本次按规则 1「结构与口径」检查点一并修正为 v3.20.0/1304/85.14%
+- T008 验收：五件套全绿（black 143 files unchanged / isort 0 / flake8 0 / mypy 78 files 0 / pytest 1304 passed + 1 skipped + 85.14%，278.20s）；净增 +90 = P1 29+P5 5+P2 11+P3 26+P4 19；覆盖率 +0.43pp 不回退；实跑记录落档 gates.md（环境/命令/结果/净增核对四表）
+- 备注：T008 全量为 T007 就位后终验（同时覆盖 T005-T007 全部改动）；gates.md 为 tasks.md T008 产出要求的新落档文件（AR017 惯例无此文件，本 AR 验收口径明确要求）
