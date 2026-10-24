@@ -152,8 +152,7 @@ def _validate_params(params: Dict[str, Any]) -> None:
     vocab_size = int(params["vocab_size"])
     if not 0 <= mask_token_id < vocab_size:
         raise ValueError(
-            f"mask_token_id ({mask_token_id}) must be within "
-            f"[0, vocab_size={vocab_size})"
+            f"mask_token_id ({mask_token_id}) must be within " f"[0, vocab_size={vocab_size})"
         )
     if int(params["shard_size"]) < 1:
         raise ValueError(f"shard_size must be >= 1, got {params['shard_size']}")
@@ -343,7 +342,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", required=True, help="Output directory")
     parser.add_argument(
-        "--style", choices=["llama", "qwen"], default="qwen",
+        "--style",
+        choices=["llama", "qwen"],
+        default="qwen",
         help="Config style (weight naming is shared, design D9)",
     )
     parser.add_argument("--layers", type=int, default=4)
@@ -351,26 +352,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-heads", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=32)
     parser.add_argument("--vocab", type=int, default=1000)
-    parser.add_argument(
-        "--mask-token", type=int, default=999, help="Diffusion mask token id"
-    )
+    parser.add_argument("--mask-token", type=int, default=999, help="Diffusion mask token id")
     parser.add_argument("--max-position-embeddings", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=None)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
     parser.add_argument("--rms-norm-eps", type=float, default=1e-5)
     parser.add_argument(
-        "--attention-bias", action="store_true",
+        "--attention-bias",
+        action="store_true",
         help="Qwen-style qkv biases (requires --style qwen)",
     )
     parser.add_argument("--tie-embeddings", action="store_true")
     parser.add_argument("--sharded", action="store_true")
     parser.add_argument("--shard-size", type=int, default=8)
-    parser.add_argument(
-        "--dtype", choices=["float32", "bfloat16"], default="float32"
-    )
+    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--preset", choices=sorted(PRESET_TEMPLATES), default=None,
+        "--preset",
+        choices=sorted(PRESET_TEMPLATES),
+        default=None,
         help="Fill style-specific numeric fields (rope_theta, rms_norm_eps, "
         "attention_bias, tie_word_embeddings) from a literature-scope "
         "template; dimensions stay tiny unless overridden explicitly",

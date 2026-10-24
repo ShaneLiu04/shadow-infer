@@ -152,7 +152,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv   # 待回填
    python - <<'PY'
    from shadowinfer.models.diffusion_llama import load_diffusion_llama
    m = load_diffusion_llama("/data/weights/Dream-7B", dtype="auto", device="cuda")
-   print(m.config.num_layers, m.config.hidden_dim, m.mask_token_id)
+   print(m.num_layers, m.config.hidden_size, m.mask_token_id)
    PY
    ```
 

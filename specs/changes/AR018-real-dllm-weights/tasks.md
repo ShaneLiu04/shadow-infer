@@ -103,3 +103,14 @@
 - 遗留修正：README 顶部状态表在 AR017 后未随 v3.19.0 更新（停留 v3.18.0/1128/84.56%），本次按规则 1「结构与口径」检查点一并修正为 v3.20.0/1304/85.14%
 - T008 验收：五件套全绿（black 143 files unchanged / isort 0 / flake8 0 / mypy 78 files 0 / pytest 1304 passed + 1 skipped + 85.14%，278.20s）；净增 +90 = P1 29+P5 5+P2 11+P3 26+P4 19；覆盖率 +0.43pp 不回退；实跑记录落档 gates.md（环境/命令/结果/净增核对四表）
 - 备注：T008 全量为 T007 就位后终验（同时覆盖 T005-T007 全部改动）；gates.md 为 tasks.md T008 产出要求的新落档文件（AR017 惯例无此文件，本 AR 验收口径明确要求）
+
+### 2026-10-24 审查记录（独立子代理，12 维度）
+
+- 审查结果：PASS（第 1 轮；审查者独立重跑全量 1304 passed / 1 skipped 与 gates.md 逐字一致、mypy 78 files 0、black 143 unchanged、flake8/isort 0、emoji 扫描 NONE、90 用例收集实跑）
+- S 维度：S1-S5 全 YES（FR18.1-18.7 验收逐条对齐：P1 30 用例含 14 故障注入、golden 矩阵、两级分解锚点、17 键/四键契约、页驻留不变量、fixture 自洽、四臂 CLI 冒烟）；D 维度：D1-D4 全 YES（diff 逐行核证 D3 cut-paste 唯一 delta、Erratum 7.1 与实现一致、归档目录零改动）；C 维度：C1-C3 全 YES（既有 API 零改动、1214 基线零回退独立确认、分层保持、诚实纪律到位、版本四处同步）
+- 修复的问题（轮 1 即改即验）：
+  - **Medium（S1/FR18.6）**：EXPERIMENTS.md §4.2 真实权重加载冒烟片段使用不存在属性 `m.config.num_layers`/`m.config.hidden_dim`（serve_arm 同源笔误已修但文档未同步）——改为 `m.num_layers, m.config.hidden_size, m.mask_token_id`，fixture 上实跑核验通过（输出 `2 256 999`）
+  - **Low（C3）**：fixture_gen.py 补跑 black（隐式字符串拼接与参数换行重排），重排后 90/90 用例仍绿（确定性不受格式化影响）
+- 记录为待办的 Minor（不阻塞，结构性保证/已有取证口径）：
+  - Low（S5）：design 6.1「零部分加载（失败后无对象产生）」为函数式加载 + 校验全前置于构造的结构性保证，14 个错误测试均走 raise 路径隐式覆盖
+  - Low（S4）：baseline 臂在 DiffusionLlama 上无专项 pytest（blockwise_generate_baseline 为 AR016 golden 且经 MHA 逐位回归锚定），四臂同 prompt 对照由 T006 CLI 冒烟取证（4/4 exit 0）
